@@ -1,4 +1,6 @@
 require "json"
+require "base64"
+require "tmpdir"
 require "digest"
 require "fileutils"
 require "cfpropertylist"
@@ -8,7 +10,7 @@ opt_out_usage
 
 NAME = "Exo"
 MINIMUM_MACOS = "13.0"
-BUNDLE_ID = "build.miguel.Exo"
+BUNDLE_ID = "com.andrewbenson.Exo"
 ROOT = File.expand_path("..", __dir__)
 
 desc "Build Exo.app with ad hoc signing"
@@ -21,14 +23,23 @@ end
 
 desc "Build Exo.app and its disk image, sign both with the Developer ID certificate, and notarize them"
 lane :release do
-  app, version = bundle_exo
   tag = ENV["RELEASE_TAG"].to_s
+  UI.user_error!("Set EXO_GOOGLE_CLIENT_ID and EXO_GOOGLE_CLIENT_SECRET, so the release has a built-in sign-in client.") if
+    ENV["EXO_GOOGLE_CLIENT_ID"].to_s.empty? || ENV["EXO_GOOGLE_CLIENT_SECRET"].to_s.empty?
+  app, version = bundle_exo
   UI.user_error!("The release is tagged #{tag}, but exo is #{version}.") unless tag.empty? || tag == "v#{version}"
 
   setup_ci(force: true, keychain_name: "exo-release", timeout: 3600)
 
   begin
-    match(type: "developer_id", platform: "macos", readonly: true, skip_provisioning_profiles: true)
+    # The Developer ID Application certificate and its key, exported from Keychain Access as a
+    # .p12 and stored base64-encoded in the repository's Actions secrets.
+    certificate = File.join(Dir.tmpdir, "developer-id.p12")
+    File.binwrite(certificate, Base64.decode64(ENV.fetch("DEVELOPER_ID_P12_BASE64")))
+    import_certificate(certificate_path: certificate, certificate_password: ENV.fetch("DEVELOPER_ID_P12_PASSWORD"),
+                       keychain_name: "exo-release", keychain_password: "")
+    FileUtils.rm_f(certificate)
+
     sign(app, "Developer ID Application", hardened: true)
     app_store_connect_api_key
     notarize(package: app, print_log: true)
@@ -44,12 +55,6 @@ lane :release do
   ensure
     delete_keychain(name: "exo-release")
   end
-end
-
-desc "Make sure Exo's App ID and the Developer ID certificate releases are signed with exist"
-lane :generate_profiles_and_certificates do
-  produce(app_identifier: BUNDLE_ID, app_name: NAME, platform: "osx", skip_itc: true)
-  match(type: "developer_id", platform: "macos", readonly: false, skip_provisioning_profiles: true)
 end
 
 def bundle_exo

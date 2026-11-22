@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Cuts a release: sets Exo's version, commits it on main, tags it vX.Y.Z and pushes both. The tag
+# starts .github/workflows/release.yml, which builds, signs, notarizes and publishes it.
+#
+#   scripts/release 0.3.0
+set -euo pipefail
+
+version="${1:-}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "usage: scripts/release X.Y.Z" >&2; exit 64; }
+cd "$(git rev-parse --show-toplevel)"
+
+[[ "$(git branch --show-current)" == main ]] || { echo "Releases are cut from main." >&2; exit 1; }
+[[ -z "$(git status --porcelain)" ]] || { echo "Commit or stash your changes first." >&2; exit 1; }
+git fetch --quiet origin main --tags
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || { echo "main isn't in sync with origin/main." >&2; exit 1; }
+! git rev-parse -q --verify "refs/tags/v$version" >/dev/null || { echo "v$version already exists." >&2; exit 1; }
+
+current="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+newest="$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)"
+[[ "$version" != "$current" && "$newest" == "$version" ]] || { echo "v$version isn't newer than $current." >&2; exit 1; }
+
+# The workspace's version, which every crate inherits. Put the files back if anything fails
+# before the commit.
+trap 'git checkout -- Cargo.toml Cargo.lock' ERR
+sed -i '' "s/^version = \"$current\"$/version = \"$version\"/" Cargo.toml
+cargo update --workspace --offline --quiet
+
+git commit --quiet -am "release v$version"
+trap - ERR
+git tag -a "v$version" -m "Exo v$version"
+git push --quiet --atomic origin main "v$version"
+echo "Pushed v$version. Watch it: gh run watch \$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')"

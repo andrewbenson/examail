@@ -37,13 +37,13 @@ use crate::desktop::Launcher;
 use crate::notifications::Notifier;
 
 /// Where Exo's releases are, on GitHub.
-const REPOSITORY: &str = "m1guelpf/Exo";
+const REPOSITORY: &str = "andrewbenson/exo";
 
 /// Exo as its updates know it: its releases, its bundle, and the Apple silicon disk image a
 /// release carries.
 pub const CONFIG: UpdateConfig = UpdateConfig {
     macos: MacConfig {
-        bundle_ids: &["build.miguel.Exo"],
+        bundle_ids: &["com.andrewbenson.Exo"],
         executable_names: &["Exo"],
         legacy_bundle_names: &[],
     },

@@ -1,7 +1,9 @@
 //! Exo's OAuth client: Google's downloaded client JSON for a "Desktop app" client.
 //!
-//! Exo ships no client of its own. Everyone creates theirs in Google Cloud Console and puts the
-//! JSON where [`ClientConfig::load`] looks.
+//! A release build can carry a built-in client: CI sets `EXO_GOOGLE_CLIENT_ID` and
+//! `EXO_GOOGLE_CLIENT_SECRET` when compiling, so the secret lives in the repository's Actions
+//! secrets, never in git. A client file, where [`ClientConfig::load`] looks, still wins over it, so
+//! anyone can bring their own. A build compiled without them ships no client.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,15 @@ use crate::Error;
 pub(crate) const ENV: &str = "EXO_GOOGLE_OAUTH_CLIENT";
 /// The client file's name in Exo's config folder.
 pub(crate) const FILE_NAME: &str = "google-oauth-client.json";
+
+/// The client compiled in, when the build set both variables (and neither is empty).
+const BUILT_IN: Option<(&str, &str)> = match (
+    option_env!("EXO_GOOGLE_CLIENT_ID"),
+    option_env!("EXO_GOOGLE_CLIENT_SECRET"),
+) {
+    (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
+    _ => None,
+};
 
 /// Who Exo is to Google, and where Google is.
 #[derive(Clone)]
@@ -68,18 +79,31 @@ impl ClientConfig {
 
     /// Reads the client file named by `EXO_GOOGLE_OAUTH_CLIENT`, or else
     /// `google-oauth-client.json` in `config_dir` (Exo's config folder,
-    /// `~/Library/Application Support/Exo` on macOS). It talks to Google's production endpoints,
-    /// whatever URLs the file lists.
+    /// `~/Library/Application Support/Exo` on macOS), or else uses the built-in client, when this
+    /// build has one. It talks to Google's production endpoints, whatever URLs the file lists.
     ///
     /// # Errors
-    /// [`Error::MissingClient`] (whose message says where to put the file) when there's no file,
-    /// [`Error::InvalidClient`] when it can't be read or isn't a Desktop app client.
+    /// [`Error::MissingClient`] (whose message says where to put the file) when there's no file
+    /// and no built-in client, [`Error::InvalidClient`] when the file can't be read or isn't a
+    /// Desktop app client.
     pub fn load(config_dir: &Path) -> Result<Self, Error> {
+        Self::load_with(config_dir, BUILT_IN)
+    }
+
+    /// [`ClientConfig::load`], with `built_in` as the fallback.
+    fn load_with(config_dir: &Path, built_in: Option<(&str, &str)>) -> Result<Self, Error> {
         let (path, from_env) = locate(std::env::var_os(ENV), config_dir);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::MissingClient { path, from_env });
+                // A file the environment names must exist; only the config folder's may be
+                // missing in favor of the built-in client.
+                return match built_in {
+                    Some((id, secret)) if !from_env => {
+                        Ok(Self::new(id, secret, Endpoints::google()))
+                    }
+                    _ => Err(Error::MissingClient { path, from_env }),
+                };
             }
             Err(error) => {
                 return Err(Error::InvalidClient {
@@ -217,7 +241,7 @@ mod tests {
     #[test]
     fn missing_files_say_where_to_put_one() {
         let dir = tempfile::tempdir().unwrap();
-        let message = match ClientConfig::load(dir.path()) {
+        let message = match ClientConfig::load_with(dir.path(), None) {
             // Unless the environment names a file, which a developer's shell might.
             Err(
                 error @ Error::MissingClient {
@@ -235,6 +259,31 @@ mod tests {
             message.contains("Desktop app") && message.contains(ENV),
             "{message}"
         );
+    }
+
+    #[test]
+    fn the_built_in_client_fills_in_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        if std::env::var_os(ENV).is_some_and(|path| !path.is_empty()) {
+            return;
+        }
+        let built_in = Some(("built-in.apps.googleusercontent.com", "GOCSPX-built-in"));
+        let config = ClientConfig::load_with(dir.path(), built_in).unwrap();
+        assert_eq!(config.client_id(), "built-in.apps.googleusercontent.com");
+        assert_eq!(config.endpoints(), &Endpoints::google());
+        assert!(!format!("{config:?}").contains("GOCSPX"));
+    }
+
+    #[test]
+    fn a_client_file_wins_over_the_built_in_client() {
+        let dir = tempfile::tempdir().unwrap();
+        if std::env::var_os(ENV).is_some_and(|path| !path.is_empty()) {
+            return;
+        }
+        std::fs::write(dir.path().join(FILE_NAME), DESKTOP).unwrap();
+        let built_in = Some(("built-in.apps.googleusercontent.com", "GOCSPX-built-in"));
+        let config = ClientConfig::load_with(dir.path(), built_in).unwrap();
+        assert_eq!(config.client_id(), "123-abc.apps.googleusercontent.com");
     }
 
     /// Parses the real client file without printing it. That's the file `EXO_GOOGLE_OAUTH_CLIENT`

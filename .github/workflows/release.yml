@@ -1,8 +1,11 @@
 name: Release
 
+# Pushing a version tag (`scripts/release 0.3.0` does it) builds, signs and notarizes Exo, then
+# publishes a GitHub release with the disk image and its checksum. Installed copies of Exo find
+# it there and update themselves. Running it by hand builds the image without publishing.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -32,9 +35,11 @@ jobs:
 
       - name: Build, sign and notarize
         env:
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          EXO_GOOGLE_CLIENT_ID: ${{ secrets.EXO_GOOGLE_CLIENT_ID }}
+          EXO_GOOGLE_CLIENT_SECRET: ${{ secrets.EXO_GOOGLE_CLIENT_SECRET }}
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
           APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_KEY_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}
           APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -49,10 +54,10 @@ jobs:
             target/release/exo-v*-macos-arm64.dmg
             target/release/checksums.txt
 
-  attach:
-    name: Attach to the release
+  publish:
+    name: Publish the release
     needs: build
-    if: github.event_name == 'release'
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -63,9 +68,9 @@ jobs:
           name: Exo
           path: dist
 
-      - name: Attach Exo's disk image and checksums
+      - name: Publish Exo's disk image and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/*.dmg dist/checksums.txt
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/*.dmg dist/checksums.txt --verify-tag --generate-notes --title "Exo $TAG"

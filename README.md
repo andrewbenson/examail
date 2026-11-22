@@ -2,6 +2,8 @@
 
 A fast, local and native Gmail client for macOS, (heavily) inspired by Superhuman.
 
+> This is a fork of [m1guelpf/Exo](https://github.com/m1guelpf/Exo). Its releases are signed with its own Developer ID, update from this repository, and come with a built-in Google sign-in client, so you can skip "Setting up your Google client" below. A client file you add still wins over the built-in one.
+
 It talks to Gmail directly (no third-party servers!) and uses native technologies for maximum performance (written in Rust, no Electron or webview overhead).
 
 <picture>
@@ -11,7 +13,7 @@ It talks to Gmail directly (no third-party servers!) and uses native technologie
 
 ## Install
 
-1. Download the `.dmg` from the [latest release](https://github.com/m1guelpf/Exo/releases/latest).
+1. Download the `.dmg` from the [latest release](https://github.com/andrewbenson/exo/releases/latest).
 2. Open it and drag Exo into Applications.
 
 You'll need to create your own Google sign-in client to use Exo. See below on how to do that (it's free and takes only a few minutes).
@@ -54,6 +56,16 @@ A local build is signed ad hoc, so macOS might ask you for Keychain access after
 You can optionally set a signing identity with `EXO_SIGN_IDENTITY` to avoid that.
 
 Run `cargo test --workspace` to run the tests. They use a mock Gmail server (`crates/gmail-mock`), so they never hit Google's servers.
+
+## Releasing
+
+`scripts/release X.Y.Z` sets the version, commits it on `main`, and pushes the commit with a `vX.Y.Z` tag. The tag runs `.github/workflows/release.yml`, which builds, signs and notarizes Exo and publishes the release that installed copies update from. It needs these Actions secrets:
+
+| Secret | What it is |
+| --- | --- |
+| `EXO_GOOGLE_CLIENT_ID`, `EXO_GOOGLE_CLIENT_SECRET` | The built-in Google sign-in client (a Desktop app client) |
+| `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD` | The Developer ID Application certificate and key, exported as a .p12, base64-encoded |
+| `APP_STORE_CONNECT_API_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_API_KEY_CONTENT` | An App Store Connect API key, for notarization |
 
 ## Use of AI
 
