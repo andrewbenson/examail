@@ -64,7 +64,7 @@ async fn changes_made_elsewhere_are_applied() {
         .await
         .unwrap()
         .into_iter()
-        .find(|label| label.name == "Projects/Examail")
+        .find(|label| label.name == "Projects/Exo")
         .unwrap()
         .id;
     let gmail = harness.gmail.gmail();

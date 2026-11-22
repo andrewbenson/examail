@@ -230,7 +230,7 @@ fn label_palette() -> SubPalette<Action> {
         "Newsletters",
         "Projects",
         "Projects/Atlas Launch",
-        "Projects/Examail",
+        "Projects/Exo",
         "Read later",
     ];
     let rows = labels
