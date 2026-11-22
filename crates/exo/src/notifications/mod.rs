@@ -136,7 +136,7 @@ impl Notifier {
         launcher: Launcher,
     ) -> Result<Self, fastframe_notifications::Error> {
         let client = fastframe_notifications::Client::new(fastframe_notifications::App::new(
-            bundle_id, "Exo",
+            bundle_id, "Examail",
         ))?;
         Ok(Self::with(Some(client), launcher))
     }
@@ -393,7 +393,7 @@ mod tests {
         let shown = format!("{:?}", update_notification("0.2.0"));
         for part in [
             r#"title: "Update ready!""#,
-            r#"body: "Restart to start using Exo 0.2.0.""#,
+            r#"body: "Restart to start using Examail 0.2.0.""#,
             r#""install", "Install and Restart""#,
             r#""later", "Not now""#,
         ] {

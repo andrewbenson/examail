@@ -5,7 +5,7 @@
 use super::Stage;
 
 /// The alerts' title.
-pub const ALERT_TITLE: &str = "Update Exo";
+pub const ALERT_TITLE: &str = "Update Examail";
 /// The ready update's button that installs it.
 pub const INSTALL_AND_RESTART: &str = "Install and Restart";
 /// The ready update's button that leaves it for later.
@@ -46,10 +46,10 @@ impl Alert {
     pub fn text(self) -> String {
         match self {
             Self::Checking => "Checking for updates…".to_owned(),
-            Self::Latest => "You are on the latest version of Exo!".to_owned(),
-            Self::Offline => "Exo needs to connect to the internet to update. Please check your connection and try again.".to_owned(),
+            Self::Latest => "You are on the latest version of Examail!".to_owned(),
+            Self::Offline => "Examail needs to connect to the internet to update. Please check your connection and try again.".to_owned(),
             Self::Installing(percent) => format!("Installing the latest update: {percent}%"),
-            Self::Failed => "Exo could not complete the update. Please check your connection and try again.".to_owned(),
+            Self::Failed => "Examail could not complete the update. Please check your connection and try again.".to_owned(),
         }
     }
 
@@ -82,7 +82,7 @@ impl Dialog {
     pub fn title(&self) -> &'static str {
         match self {
             Self::Available(_) => "Update available!",
-            Self::UpToDate => "Exo is up to date",
+            Self::UpToDate => "Examail is up to date",
             Self::Ready(_) => "Update ready!",
             Self::Failed(_) => "Failed to update",
         }
@@ -91,9 +91,9 @@ impl Dialog {
     /// The text under the message.
     pub fn body(&self) -> String {
         match self {
-            Self::Available(version) => format!("Ready to download Exo {version}."),
+            Self::Available(version) => format!("Ready to download Examail {version}."),
             Self::UpToDate => "You're using the latest and greatest!".to_owned(),
-            Self::Ready(version) => format!("Restart to start using Exo {version}."),
+            Self::Ready(version) => format!("Restart to start using Examail {version}."),
             Self::Failed(Some(Connection::Unreachable)) => {
                 "Could not connect to the update server.".to_owned()
             }
@@ -188,13 +188,13 @@ mod tests {
             (ready.title(), ready.body().as_str(), ready.buttons()),
             (
                 "Update ready!",
-                "Restart to start using Exo 0.2.0.",
+                "Restart to start using Examail 0.2.0.",
                 &["Install and Restart", "Not now"][..]
             )
         );
         assert_eq!(
             Dialog::Available("0.2.0".into()).body(),
-            "Ready to download Exo 0.2.0."
+            "Ready to download Examail 0.2.0."
         );
         assert_eq!(
             Dialog::Failed(Some(Connection::Lost)).body(),

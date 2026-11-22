@@ -146,7 +146,7 @@ impl Default for Tabs {
         Self {
             tabs: vec![Tab {
                 pill: Pill {
-                    title: "Exo".to_owned(),
+                    title: "Examail".to_owned(),
                     ..Pill::default()
                 },
                 parked: None,
@@ -348,7 +348,7 @@ impl Tabs {
                 let parked = tab.route.clone().map_or(Parked::SignIn, Parked::Route);
                 Tab {
                     pill: Pill {
-                        title: "Exo".to_owned(),
+                        title: "Examail".to_owned(),
                         email: tab.route.as_ref().map(|route| route.email.clone()),
                         login_screen: tab.route.is_none(),
                         ..Pill::default()
@@ -696,7 +696,7 @@ impl crate::Mail {
         let who = if self.accounts.len() > 1 {
             self.account.email()
         } else {
-            "Exo"
+            "Examail"
         };
         let count = if self.search.is_some() {
             None
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn what_is_saved_comes_back() {
         let mut tabs = tabs(&["a", "b"]);
-        tabs.push(pill("Exo"), Parked::SignIn);
+        tabs.push(pill("Examail"), Parked::SignIn);
         let week = Route {
             view: View::Week(Date::new(2026, 11, 20).expect("a day")),
             ..Route::home("c".into())

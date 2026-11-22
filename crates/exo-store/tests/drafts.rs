@@ -140,7 +140,7 @@ async fn a_saved_draft_becomes_a_gmail_draft_and_updates_in_place() {
     let thread = stored.thread.clone().expect("Gmail gave it a thread");
     assert!(
         harness.ids(&ListId::Inbox).await.contains(thread.as_str()),
-        "a new message Exo wrote sits in the Inbox"
+        "a new message Examail wrote sits in the Inbox"
     );
 
     harness
@@ -490,7 +490,7 @@ async fn a_reply_draft_joins_its_thread() {
         .summary(&ListId::Inbox, &thread)
         .await
         .expect("still listed");
-    assert_eq!(summary.drafts, 1, "the row shows Exo's reply draft");
+    assert_eq!(summary.drafts, 1, "the row shows Examail's reply draft");
 }
 
 #[tokio::test]
@@ -760,7 +760,7 @@ async fn a_draft_sent_deleted_or_rewritten_elsewhere_leaves_exos_drafts() {
     for id in ids {
         harness
             .store
-            .save_draft(draft(id, "Elsewhere", "Written in Exo"))
+            .save_draft(draft(id, "Elsewhere", "Written in Examail"))
             .await
             .expect("saves");
     }
@@ -873,7 +873,7 @@ async fn a_draft_taken_over_from_gmail_web_updates_that_draft_once_it_can_be_fou
     let before = gmail_drafts(&harness).await.len();
     let taken = Draft {
         adopted: Some(message.clone()),
-        ..draft("draft00000000000031", "Taken over", "Finished in Exo")
+        ..draft("draft00000000000031", "Taken over", "Finished in Examail")
     };
     harness.store.save_draft(taken).await.expect("saves");
     assert_eq!(
@@ -1409,7 +1409,7 @@ async fn an_offline_search_finds_what_was_typed_in_a_draft() {
     assert_eq!(
         found_offline(&harness, "zanzibar").await,
         std::slice::from_ref(&thread),
-        "in Gmail, which Exo stores without its body"
+        "in Gmail, which Examail stores without its body"
     );
 
     let mut edited = typed;

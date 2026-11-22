@@ -31,7 +31,7 @@ pub(crate) fn paint(ui: &mut Ui, backdrop: &Backdrop, alert: exo_ui::Alert<'_>) 
     chrome::show(
         ui,
         chrome::Tab {
-            title: "Exo",
+            title: "Examail",
             email: None,
             login_screen: false,
             account_color: None,
@@ -87,11 +87,11 @@ impl Reason {
     pub fn alert(self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::Corrupt => (
-                "The Exo cache is corrupted.\nTo fix this please clear your cache and restart the app.",
+                "The Examail cache is corrupted.\nTo fix this please clear your cache and restart the app.",
                 &[CLEAR_CACHE],
             ),
             Self::DiskFull => (
-                "Your disk is full. To fix this, please free up some disk space and restart Exo.",
+                "Your disk is full. To fix this, please free up some disk space and restart Examail.",
                 &[],
             ),
             Self::Locked => ("Please reload this page to continue.", &[RELOAD]),

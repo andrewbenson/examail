@@ -1286,7 +1286,7 @@ impl Mail {
                 self.pickers.alert = Some(Alert {
                     title: "Sorry!".into(),
                     // The offline alert.
-                    text: "We're working hard to make Exo fully function offline. In the meantime, please check your internet connection and try again.".into(),
+                    text: "We're working hard to make Examail fully function offline. In the meantime, please check your internet connection and try again.".into(),
                     actions: vec!["OK"],
                     selected: 0,
                     keys: None,

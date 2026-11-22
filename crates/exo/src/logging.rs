@@ -18,11 +18,11 @@ use fastframe_log::redact;
 
 /// The name in the start line and the panic log, and the start line's target, which [`FILTER`]
 /// keeps.
-const APP: &str = "Exo";
+const APP: &str = "Examail";
 
 /// The filter without `RUST_LOG`: Exo's own warnings (why a download, a sync or a send failed),
 /// every crate's errors, and the start line. Other crates' warnings (wgpu's, winit's) are noise.
-const FILTER: &str = "error,Exo=info,exo=warn,exo_auth=warn,exo_commands=warn,exo_editor=warn,exo_mail=warn,exo_store=warn,exo_ui=warn,gmail=warn";
+const FILTER: &str = "error,Examail=info,exo=warn,exo_auth=warn,exo_commands=warn,exo_editor=warn,exo_mail=warn,exo_store=warn,exo_ui=warn,gmail=warn";
 
 /// The most `Exo.log` grows to before it starts afresh, so the two files hold twice this at most.
 const MAX_LOG: u64 = 10 << 20;
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn addresses_paths_and_links_stay_out_of_the_log() {
-        let error = "opening: applying 0003_x.sql to /Users/me/Library/Application Support/Exo/accounts/maya@brightmoor.co.sqlite3 failed";
+        let error = "opening: applying 0003_x.sql to /Users/me/Library/Application Support/Examail/accounts/maya@brightmoor.co.sqlite3 failed";
         assert!(private(error));
         assert_eq!(
             redacted(error),
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn past_its_cap_the_log_starts_afresh_and_keeps_what_it_had() {
         let folder = std::env::temp_dir().join(format!("exo-log-cap-{}", std::process::id()));
-        let path = folder.join("Exo.log");
+        let path = folder.join("Examail.log");
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).expect("a folder");
         std::fs::write(&path, "the last run\n").expect("writes");
@@ -230,7 +230,7 @@ mod tests {
         };
         assert!(
             enabled(log::Level::Info, APP),
-            "fastframe-log's `Starting Exo …` line"
+            "fastframe-log's `Starting Examail …` line"
         );
         assert!(enabled(log::Level::Warn, "exo::account"));
         assert!(!enabled(log::Level::Info, "exo::account"));

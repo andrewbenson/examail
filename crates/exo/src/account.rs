@@ -90,13 +90,21 @@ const PRERENDER_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Where the Gmail parts of `email` are kept: `~/Library/Caches/Exo/<account>/parts`. macOS may
 /// empty this cache, and signing out and Clear Cache delete it.
 pub(crate) fn parts_cache(email: &str) -> Option<PathBuf> {
-    std::env::home_dir().map(|home| home.join("Library/Caches/Exo").join(email).join("parts"))
+    std::env::home_dir().map(|home| {
+        home.join("Library/Caches/Examail")
+            .join(email)
+            .join("parts")
+    })
 }
 
 /// Where the photos of `email`'s contacts are kept: `~/Library/Caches/Exo/<account>/photos`,
 /// which signing out and Clear Cache delete with the parts.
 pub(crate) fn photos_cache(email: &str) -> Option<PathBuf> {
-    std::env::home_dir().map(|home| home.join("Library/Caches/Exo").join(email).join("photos"))
+    std::env::home_dir().map(|home| {
+        home.join("Library/Caches/Examail")
+            .join(email)
+            .join("photos")
+    })
 }
 
 /// Who an account is and how to reach its mail. Sign-in builds these from the account's grant, and

@@ -62,7 +62,7 @@ impl Context {
                 Text("to search"),
                 Dot,
                 Keys(&["⌘", "K"]),
-                Text("for Exo Command"),
+                Text("for Examail Command"),
             ],
             Self::Snippets => &[
                 Text("Hit"),
@@ -123,7 +123,7 @@ impl Context {
                 Text("to reply all"),
                 Dot,
                 Keys(&["⌘", "K"]),
-                Text("for Exo Command"),
+                Text("for Examail Command"),
             ],
             Self::SentReply => &[
                 Text("Hit"),

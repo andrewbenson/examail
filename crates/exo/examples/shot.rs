@@ -632,7 +632,7 @@ fn main() -> anyhow::Result<()> {
                 let path = std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_default()
-                    .join("Library/Application Support/Exo/google-oauth-client.json");
+                    .join("Library/Application Support/Examail/google-oauth-client.json");
                 return Err(exo_auth::Error::MissingClient {
                     path,
                     from_env: false,
@@ -813,7 +813,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(url) = name.strip_prefix("link:") {
             // One of Exo's links macOS handed over, in the account on screen.
             let link = exo::links::parse(&percent_decode(url))
-                .context("`link:URL` needs one of Exo's links")?;
+                .context("`link:URL` needs one of Examail's links")?;
             harness
                 .state_mut()
                 .mail_mut()

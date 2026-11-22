@@ -124,7 +124,7 @@ impl crate::Mail {
             self.calendar.signing_in = Some(purpose);
         } else {
             log::warn!(
-                "signing a calendar account in needs Exo's sign-in, which this session wasn't started with"
+                "signing a calendar account in needs Examail's sign-in, which this session wasn't started with"
             );
         }
     }

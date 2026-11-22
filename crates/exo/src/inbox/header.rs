@@ -405,7 +405,7 @@ pub(super) fn show(
                 None,
                 HeaderAction::Command,
                 KeyTooltip {
-                    text: "Exo Command",
+                    text: "Examail Command",
                     keys: &["⌘", "K"],
                 },
                 placement,

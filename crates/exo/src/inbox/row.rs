@@ -1107,7 +1107,7 @@ fn actions(
                 keys: &["H"],
             },
             _ => KeyTooltip {
-                text: "Exo Command",
+                text: "Examail Command",
                 keys: &["⌘", "K"],
             },
         };

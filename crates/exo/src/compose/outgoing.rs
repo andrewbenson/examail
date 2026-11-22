@@ -182,7 +182,7 @@ mod tests {
         assert!(raw.contains("multipart/alternative"), "{raw}");
         assert!(
             !raw.contains("X-Mailer") && !raw.contains("X-Superhuman"),
-            "no headers of Exo's own"
+            "no headers of Examail's own"
         );
         let html = html(&open(DraftAction::Reply), &aliases);
         assert!(

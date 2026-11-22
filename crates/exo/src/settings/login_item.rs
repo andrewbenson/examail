@@ -52,14 +52,14 @@ impl LoginItem {
         let (on, ctx) = (Arc::clone(&self.on), self.ctx.clone());
         std::thread::spawn(move || {
             // macOS goes by the bundle. The name is for other systems' entries.
-            let autostart = Autostart::new("exo", "Exo");
+            let autostart = Autostart::new("examail", "Examail");
             let state = call(&autostart).unwrap_or_else(|error| {
-                log::warn!("changing Exo's login item: {error}");
+                log::warn!("changing Examail's login item: {error}");
                 autostart.state()
             });
             if let State::NeedsApproval(_) = state {
                 log::warn!(
-                    "Exo's login item waits for approval in System Settings › General › Login Items"
+                    "Examail's login item waits for approval in System Settings › General › Login Items"
                 );
             }
             *on.lock().unwrap_or_else(PoisonError::into_inner) = shown(state);

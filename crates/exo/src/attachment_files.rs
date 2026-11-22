@@ -635,7 +635,7 @@ impl Target {
         let hint = if matches!(self, Self::Downloads(_))
             && error.kind() == ErrorKind::PermissionDenied
         {
-            "; check that the app Exo runs under may use the Downloads folder (System Settings › Privacy & Security › Files and Folders)"
+            "; check that the app Examail runs under may use the Downloads folder (System Settings › Privacy & Security › Files and Folders)"
         } else {
             ""
         };
@@ -787,7 +787,10 @@ fn quarantine(path: &Path) {
             ns_string!("LSQuarantineAgentName"),
             ns_string!("LSQuarantineType"),
         ],
-        &[ns_string!("Exo"), ns_string!("LSQuarantineTypeWebDownload")],
+        &[
+            ns_string!("Examail"),
+            ns_string!("LSQuarantineTypeWebDownload"),
+        ],
     );
     // SAFETY: the quarantine properties are a dictionary of strings, the type the key takes.
     if let Err(error) = unsafe {

@@ -159,7 +159,7 @@ mod macos {
                 // descriptor or nil.
                 let url: Option<Retained<NSAppleEventDescriptor>> = unsafe { msg_send![event, paramDescriptorForKeyword: DIRECT_OBJECT] };
                 if let Some(url) = url.and_then(|url| url.stringValue()) {
-                    log::debug!("macOS handed Exo a link");
+                    log::debug!("macOS handed Examail a link");
                     self.ivars().launcher.open_url(&url.to_string());
                 }
             }
@@ -224,7 +224,7 @@ mod macos {
             // SAFETY: the error is nil or valid for the block's call.
             if let Some(error) = unsafe { error.as_ref() } {
                 log::warn!(
-                    "making Exo the default email app: {}",
+                    "making Examail the default email app: {}",
                     error.localizedDescription()
                 );
             }

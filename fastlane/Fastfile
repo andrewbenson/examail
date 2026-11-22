@@ -8,12 +8,12 @@ require "cfpropertylist"
 skip_docs
 opt_out_usage
 
-NAME = "Exo"
+NAME = "Examail"
 MINIMUM_MACOS = "13.0"
-BUNDLE_ID = "com.andrewbenson.Exo"
+BUNDLE_ID = "com.andrewbenson.Examail"
 ROOT = File.expand_path("..", __dir__)
 
-desc "Build Exo.app with ad hoc signing"
+desc "Build Examail.app with ad hoc signing"
 lane :build do
   identity = ENV["EXO_SIGN_IDENTITY"].to_s
   app, version = bundle_exo
@@ -21,7 +21,7 @@ lane :build do
   UI.success("#{app} (#{version}, signed #{identity.empty? ? 'ad hoc' : "as #{identity}"})")
 end
 
-desc "Build Exo.app and its disk image, sign both with the Developer ID certificate, and notarize them"
+desc "Build Examail.app and its disk image, sign both with the Developer ID certificate, and notarize them"
 lane :release do
   tag = ENV["RELEASE_TAG"].to_s
   UI.user_error!("Set EXO_GOOGLE_CLIENT_ID and EXO_GOOGLE_CLIENT_SECRET, so the release has a built-in sign-in client.") if
@@ -120,16 +120,16 @@ def info_plist(version)
     "NSSupportsAutomaticGraphicsSwitching" => true,
     "NSPrefersDisplaySafeAreaCompatibilityMode" => false,
     "LSApplicationCategoryType" => "public.app-category.productivity",
-    "NSDownloadsFolderUsageDescription" => "Exo saves the attachments you download to your Downloads folder.",
+    "NSDownloadsFolderUsageDescription" => "Examail saves the attachments you download to your Downloads folder.",
     "CFBundleURLTypes" => [
-      { "CFBundleTypeRole" => "Viewer", "CFBundleURLName" => "Exo", "CFBundleURLSchemes" => ["exo"] },
+      { "CFBundleTypeRole" => "Viewer", "CFBundleURLName" => "Examail", "CFBundleURLSchemes" => ["examail", "exo"] },
       { "CFBundleTypeRole" => "Editor", "CFBundleURLName" => "Email", "CFBundleURLSchemes" => ["mailto"] },
     ]
   }.sort.to_h
 end
 
 def disk_image(app, version)
-  image = File.join(File.dirname(app), "exo-v#{version}-macos-arm64.dmg")
+  image = File.join(File.dirname(app), "examail-v#{version}-macos-arm64.dmg")
   contents = "#{image}.partial"
   FileUtils.rm_rf([contents, image])
   FileUtils.mkdir_p(contents)

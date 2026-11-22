@@ -1,39 +1,39 @@
-# Exo
+# Examail
 
 A fast, local and native Gmail client for macOS, (heavily) inspired by Superhuman.
 
-> This is a fork of [m1guelpf/Exo](https://github.com/m1guelpf/Exo). Its releases are signed with its own Developer ID, update from this repository, and come with a built-in Google sign-in client, so you can skip "Setting up your Google client" below. A client file you add still wins over the built-in one.
+> Examail is a fork of [m1guelpf/Exo](https://github.com/m1guelpf/Exo) by Miguel Piedrafita. Its releases are signed with its own Developer ID, update from this repository, and come with a built-in Google sign-in client, so you can skip "Setting up your Google client" below. A client file you add still wins over the built-in one.
 
 It talks to Gmail directly (no third-party servers!) and uses native technologies for maximum performance (written in Rust, no Electron or webview overhead).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/screenshot-dark.png">
-  <img alt="Exo's inbox" src=".github/screenshot-light.png">
+  <img alt="Examail's inbox" src=".github/screenshot-light.png">
 </picture>
 
 ## Install
 
-1. Download the `.dmg` from the [latest release](https://github.com/andrewbenson/exo/releases/latest).
-2. Open it and drag Exo into Applications.
+1. Download the `.dmg` from the [latest release](https://github.com/andrewbenson/examail/releases/latest).
+2. Open it and drag Examail into Applications.
 
-You'll need to create your own Google sign-in client to use Exo. See below on how to do that (it's free and takes only a few minutes).
+You'll need to create your own Google sign-in client to use Examail. See below on how to do that (it's free and takes only a few minutes).
 
 ### Setting up your Google client
 
 1. Create a project in the [Google Cloud console](https://console.cloud.google.com/projectcreate).
 2. Enable the [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com), the [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com) and the [People API](https://console.cloud.google.com/apis/library/people.googleapis.com) for that project.
-3. Open [Google Auth Platform](https://console.cloud.google.com/auth/overview) and click **Get started**. Name the app Exo, pick your address as the support email, choose **External** as the audience and finish.
+3. Open [Google Auth Platform](https://console.cloud.google.com/auth/overview) and click **Get started**. Name the app Examail, pick your address as the support email, choose **External** as the audience and finish.
 4. In [Branding](https://console.cloud.google.com/auth/branding), give your application a name, support email, homepage URL, and privacy policy URL. You can put whatever you want there, as you'll be the only one using the app.
 5. In [Audience](https://console.cloud.google.com/auth/audience), click **Publish app**. (You can keep it in Testing, but Google will sign you out every 7 days, which is annoying).
 6. In [Clients](https://console.cloud.google.com/auth/clients), click **Create client**, choose **Desktop app** as the application type and create it. Download its JSON file.
-7. Move the file into Exo's folder:
+7. Move the file into Examail's folder:
 
 ```sh
-mkdir -p ~/Library/Application\ Support/Exo
-mv ~/Downloads/client_secret_*.json ~/Library/Application\ Support/Exo/google-oauth-client.json
+mkdir -p ~/Library/Application\ Support/Examail
+mv ~/Downloads/client_secret_*.json ~/Library/Application\ Support/Examail/google-oauth-client.json
 ```
 
-8. Open Exo and sign in with Google. Google warns that it hasn't verified the app, which is expected for an app you made yourself. Click **Advanced**, then **Go to Exo (unsafe)**, and allow every permission Exo asks for. Exo asks Google for permission to:
+8. Open Examail and sign in with Google. Google warns that it hasn't verified the app, which is expected for an app you made yourself. Click **Advanced**, then **Go to Examail (unsafe)**, and allow every permission Examail asks for. Examail asks Google for permission to:
 
 - read, send and organize your mail
 - change mail settings, such as filters, signatures and the vacation responder
@@ -49,7 +49,7 @@ You'll need Rust 1.98 or later, Xcode 27 and Ruby 4.0 with Bundler.
 ```sh
 bundle install
 bundle exec fastlane build
-open target/release/Exo.app
+open target/release/Examail.app
 ```
 
 A local build is signed ad hoc, so macOS might ask you for Keychain access after each rebuild.
@@ -59,7 +59,7 @@ Run `cargo test --workspace` to run the tests. They use a mock Gmail server (`cr
 
 ## Releasing
 
-`scripts/release X.Y.Z` sets the version, commits it on `main`, and pushes the commit with a `vX.Y.Z` tag. The tag runs `.github/workflows/release.yml`, which builds, signs and notarizes Exo and publishes the release that installed copies update from. It needs these Actions secrets:
+`scripts/release X.Y.Z` sets the version, commits it on `main`, and pushes the commit with a `vX.Y.Z` tag. The tag runs `.github/workflows/release.yml`, which builds, signs and notarizes Examail and publishes the release that installed copies update from. It needs these Actions secrets:
 
 | Secret | What it is |
 | --- | --- |
@@ -69,9 +69,9 @@ Run `cargo test --workspace` to run the tests. They use a mock Gmail server (`cr
 
 ## Use of AI
 
-Exo was built almost entirely using automated code-generation tools, mainly _Claude Opus 5.5_. No human has reviewed the generated code for correctness or security. I have extensively tested the app and use it as my daily driver, but there might be issues that I haven't encountered yet.
+Examail was built almost entirely using automated code-generation tools, mainly _Claude Opus 5.5_. No human has reviewed the generated code for correctness or security. I have extensively tested the app and use it as my daily driver, but there might be issues that I haven't encountered yet.
 
 ## License
 
-Exo is released under the [MIT License](LICENSE).
+Examail is released under the [MIT License](LICENSE).
 The fonts, icons and photos it bundles, and the code it ports from other projects, are listed with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

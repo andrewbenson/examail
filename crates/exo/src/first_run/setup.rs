@@ -215,7 +215,7 @@ const EMPTY_IMPORTANT: &str = "No emails in your important Split Inbox. Direct, 
 const EMPTY_OTHER: &str = "No emails in your Other Split Inbox. Messages from marketing, social networks, and automatic updates will show up here.";
 const LOADING_HEADING: &str = "Tailoring your inbox to how you work";
 /// The loading screen's subtitle.
-const LOADING_SUBHEADING: &str = "Checking your recent email activity to customize Exo";
+const LOADING_SUBHEADING: &str = "Checking your recent email activity to customize Examail";
 const LOADING_PRIVATE: &str = "Analysis happens only on your device. Your data stays private.";
 
 /// A split the library could set up, before Exo knows how much of the inbox it would take.

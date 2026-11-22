@@ -26,7 +26,7 @@ struct Section {
 const SECTIONS: &[Section] = &[
     Section {
         title: "Actions",
-        rows: &[("Exo Command", "⌘ K"), ("Search", "/"), ("Undo", "Z")],
+        rows: &[("Examail Command", "⌘ K"), ("Search", "/"), ("Undo", "Z")],
     },
     Section {
         title: "Navigation",
@@ -43,7 +43,7 @@ const SECTIONS: &[Section] = &[
             ("Jump to Top", "⌘ ↑"),
             ("Jump to Bottom", "⌘ ↓"),
             ("Switch Accounts", "control 1-9"),
-            ("Exo Focus", "→ ← ↓ ↑"),
+            ("Examail Focus", "→ ← ↓ ↑"),
         ],
     },
     Section {

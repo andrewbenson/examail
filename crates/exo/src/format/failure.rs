@@ -33,7 +33,7 @@ pub fn information(reason: SendFailure) -> Information {
         ),
         SendFailure::LoggedOut => (
             "Send failed: logged out of Gmail",
-            "Exo was logged out of Gmail. Please click to edit and try again.",
+            "Examail was logged out of Gmail. Please click to edit and try again.",
             None,
             "Sorry! Message failed to send as you were logged out of Gmail",
         ),
@@ -106,7 +106,7 @@ mod tests {
         assert_eq!(logged_out.title, "Send failed: logged out of Gmail");
         assert_eq!(
             logged_out.description,
-            "Exo was logged out of Gmail. Please click to edit and try again."
+            "Examail was logged out of Gmail. Please click to edit and try again."
         );
         assert_eq!(
             alert(SendFailure::LoggedOut),

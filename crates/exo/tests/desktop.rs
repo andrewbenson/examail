@@ -68,7 +68,7 @@ fn closing_hides_the_window_and_the_dock_brings_it_back() {
     let asked = commands(&app);
     assert!(
         asked.contains(&ViewportCommand::CancelClose),
-        "Exo runs on: {asked:?}"
+        "Examail runs on: {asked:?}"
     );
     assert!(
         asked.contains(&ViewportCommand::Visible(false)),

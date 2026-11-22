@@ -1460,7 +1460,7 @@ fn rebuild(dir: &Path) {
     }
     let db = rusqlite::Connection::open(&copy).expect("opens the copy");
     db.execute_batch("PRAGMA auto_vacuum = NONE; VACUUM; PRAGMA journal_mode = WAL;")
-        .expect("makes it an older Exo's");
+        .expect("makes it an older Examail's");
     let size = std::fs::metadata(&copy).map_or(0, |metadata| metadata.len());
     let clock = Instant::now();
     db.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")

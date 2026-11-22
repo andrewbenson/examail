@@ -22,8 +22,10 @@ use crate::{
     tabs::{Route, View},
 };
 
-/// Exo's URL scheme.
-pub const SCHEME: &str = "exo:";
+/// Examail's URL scheme, which the links it makes use.
+pub const SCHEME: &str = "examail:";
+/// Every scheme Examail opens: its own, and upstream Exo's, so `exo:` links keep working.
+pub const SCHEMES: [&str; 2] = [SCHEME, "exo:"];
 
 /// A link, parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,10 +81,11 @@ impl To {
 /// `url` as one of Exo's links, if it's on Exo's scheme, which is `exo:` followed by `//`, the
 /// path (percent-decoded) and its query.
 pub fn parse(url: &str) -> Option<Link> {
-    let rest = url
-        .get(..SCHEME.len())
-        .filter(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
-        .map(|_| &url[SCHEME.len()..])?;
+    let rest = SCHEMES.iter().find_map(|scheme| {
+        url.get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .map(|_| &url[scheme.len()..])
+    })?;
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     let rest = rest.split('#').next().unwrap_or_default();
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -491,6 +494,17 @@ mod tests {
     const MAYA: Option<&str> = Some("maya@brightmoor.co");
 
     #[test]
+    fn examail_and_exo_links_both_open() {
+        assert_eq!(
+            parse("examail://maya@brightmoor.co/inbox/other"),
+            parse("exo://maya@brightmoor.co/inbox/other")
+        );
+        assert!(parse("examail://maya@brightmoor.co").is_some());
+        assert!(parse("EXAMAIL://maya@brightmoor.co").is_some());
+        assert_eq!(parse("examailx://maya@brightmoor.co"), None);
+    }
+
+    #[test]
     fn deep_links_name_a_setting_and_maybe_an_account() {
         let deep_link = |name: &str, role: Option<&str>| To::DeepLink {
             name: name.into(),
@@ -512,7 +526,7 @@ mod tests {
         assert_eq!(
             parse("exo://deeplink"),
             link(None, To::home()),
-            "no name: a path Exo can't read"
+            "no name: a path Examail can't read"
         );
     }
 
@@ -587,7 +601,7 @@ mod tests {
         assert_eq!(
             parse("exo://maya@brightmoor.co/starred/19a1"),
             link(MAYA, To::home()),
-            "a path Exo doesn't read"
+            "a path Examail doesn't read"
         );
         assert_eq!(
             parse("exo://maya@brightmoor.co/team-settings/team"),
@@ -655,7 +669,7 @@ mod tests {
         let url = |route: Route| url(&route, &labels, &settings);
         assert_eq!(
             url(route(ListId::Important, None, View::List, None)),
-            "exo://maya@brightmoor.co"
+            "examail://maya@brightmoor.co"
         );
         assert_eq!(
             url(route(
@@ -664,11 +678,11 @@ mod tests {
                 View::List,
                 Some(Filter::Unread)
             )),
-            "exo://maya@brightmoor.co/thread/19a1?filters=unread"
+            "examail://maya@brightmoor.co/thread/19a1?filters=unread"
         );
         assert_eq!(
             url(route(ListId::Other, None, View::List, None)),
-            "exo://maya@brightmoor.co/inbox/other"
+            "examail://maya@brightmoor.co/inbox/other"
         );
         assert_eq!(
             url(route(
@@ -677,15 +691,15 @@ mod tests {
                 View::List,
                 Some(Filter::NoReply)
             )),
-            "exo://maya@brightmoor.co/inbox/big-deals?filters=noreply"
+            "examail://maya@brightmoor.co/inbox/big-deals?filters=noreply"
         );
         assert_eq!(
             url(route(ListId::Done, None, View::List, None)),
-            "exo://maya@brightmoor.co/label/done"
+            "examail://maya@brightmoor.co/label/done"
         );
         assert_eq!(
             url(route(ListId::Drafts, None, View::List, None)),
-            "exo://maya@brightmoor.co/label/draft"
+            "examail://maya@brightmoor.co/label/draft"
         );
         assert_eq!(
             url(route(
@@ -694,7 +708,7 @@ mod tests {
                 View::List,
                 None
             )),
-            "exo://maya@brightmoor.co/label/work%2Fprojects--2026-/thread/19a1"
+            "examail://maya@brightmoor.co/label/work%2Fprojects--2026-/thread/19a1"
         );
         assert_eq!(
             url(route(
@@ -703,7 +717,7 @@ mod tests {
                 View::List,
                 None
             )),
-            "exo://maya@brightmoor.co",
+            "examail://maya@brightmoor.co",
             "a label that's gone"
         );
         assert_eq!(
@@ -713,11 +727,11 @@ mod tests {
                 View::Search(Some("from:bea budget".into())),
                 Some(Filter::Unread)
             )),
-            "exo://maya@brightmoor.co/search/from%3Abea%20budget/thread/19a1"
+            "examail://maya@brightmoor.co/search/from%3Abea%20budget/thread/19a1"
         );
         assert_eq!(
             url(route(ListId::Sent, Some("19a1"), View::Search(None), None)),
-            "exo://maya@brightmoor.co/search/"
+            "examail://maya@brightmoor.co/search/"
         );
         assert_eq!(
             url(route(
@@ -726,7 +740,7 @@ mod tests {
                 View::Week(Date::new(2026, 11, 3).expect("a day")),
                 None
             )),
-            "exo://maya@brightmoor.co/calendar/week/2026-11-03"
+            "examail://maya@brightmoor.co/calendar/week/2026-11-03"
         );
         assert_eq!(
             url(route(
@@ -735,7 +749,7 @@ mod tests {
                 View::Snippets,
                 Some(Filter::Unread)
             )),
-            "exo://maya@brightmoor.co/label/snippets"
+            "examail://maya@brightmoor.co/label/snippets"
         );
     }
 
@@ -750,7 +764,7 @@ mod tests {
         assert_eq!(
             slug("done", &settings),
             Some((ListId::Done, View::List)),
-            "Exo's Done, not the label called Done"
+            "Examail's Done, not the label called Done"
         );
         assert_eq!(slug("sent", &settings), Some((ListId::Sent, View::List)));
         assert_eq!(

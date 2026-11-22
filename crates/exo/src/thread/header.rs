@@ -759,7 +759,7 @@ fn action_tooltip(ui: &Ui, response: &egui::Response, action: &Action, done: boo
         ),
         Action::CommandPalette => (
             KeyTooltip {
-                text: "Exo Command",
+                text: "Examail Command",
                 keys: &["⌘", "K"],
             },
             Placement::Below {

@@ -229,7 +229,7 @@ fn a_mailto_unsubscribe_sends_the_request_from_the_account() {
     let text = String::from_utf8(text).expect("UTF-8");
     assert!(
         text.contains(
-            "This is an unsubscribe request sent from Exo on behalf of maya@brightmoor.co"
+            "This is an unsubscribe request sent from Examail on behalf of maya@brightmoor.co"
         ),
         "{text:?}"
     );

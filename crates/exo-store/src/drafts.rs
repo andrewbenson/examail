@@ -1074,7 +1074,7 @@ impl Inner {
             };
             if rewritten {
                 log::info!(
-                    "draft {} was rewritten outside Exo: sending Gmail's copy",
+                    "draft {} was rewritten outside Examail: sending Gmail's copy",
                     row.id
                 );
             } else {
@@ -1788,7 +1788,7 @@ impl Inner {
         let mut write = self.begin(&mut db).await?;
         for row in gone(DraftRow::all().exec(write.exec()).await?) {
             log::info!(
-                "draft {} was sent, deleted or rewritten outside Exo",
+                "draft {} was sent, deleted or rewritten outside Examail",
                 row.id
             );
             DraftRow::filter_by_id(&row.id)

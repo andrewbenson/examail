@@ -395,7 +395,7 @@ fn sniff(bytes: &[u8]) -> &'static str {
 /// subject), with a leading emoji and Exo's own name taken off. `who` is the account's address
 /// with several accounts signed in, else Exo.
 pub fn title(subject: &str, accounts: usize, email: &str) -> String {
-    let who = if accounts > 1 { email } else { "Exo" };
+    let who = if accounts > 1 { email } else { "Examail" };
     let title = if subject.is_empty() {
         who.to_owned()
     } else {
@@ -406,7 +406,7 @@ pub fn title(subject: &str, accounts: usize, email: &str) -> String {
         _ => title,
     };
     // The first one only.
-    title.replacen(" • Exo", "", 1)
+    title.replacen(" • Examail", "", 1)
 }
 
 /// Whether `word` is one of the characters a title loses before a space: a private-use character
@@ -437,7 +437,7 @@ fn file_name(title: &str) -> String {
             && (stem.starts_with("com") || stem.starts_with("lpt"))
             && stem.as_bytes()[3].is_ascii_digit());
     if reserved || (!name.is_empty() && name.chars().all(|c| c == '.')) {
-        name = format!("Exo – {name}");
+        name = format!("Examail – {name}");
     }
     format!("{name}.pdf")
 }
@@ -458,7 +458,7 @@ mod tests {
         );
         assert_eq!(
             title("", 1, "maya@brightmoor.co"),
-            "Exo",
+            "Examail",
             "no subject: just who"
         );
         assert_eq!(
@@ -540,9 +540,9 @@ mod tests {
     fn file_names_are_safe_everywhere() {
         assert_eq!(file_name("Q4: plan / draft?"), "Q4_ plan _ draft_.pdf");
         assert_eq!(file_name("a\u{7}b\u{85}c"), "abc.pdf");
-        assert_eq!(file_name("con"), "Exo – con.pdf");
-        assert_eq!(file_name("LPT1.txt"), "Exo – LPT1.txt.pdf");
-        assert_eq!(file_name("..."), "Exo – ....pdf");
+        assert_eq!(file_name("con"), "Examail – con.pdf");
+        assert_eq!(file_name("LPT1.txt"), "Examail – LPT1.txt.pdf");
+        assert_eq!(file_name("..."), "Examail – ....pdf");
         assert_eq!(file_name("console"), "console.pdf");
     }
 }

@@ -119,7 +119,7 @@ pub(crate) fn confirm_text(unsent: Unsent) -> Option<String> {
         } => return None,
         Unsent { sends: 1, .. } => "1 email is still sending. Ignore and sign out anyway?".into(),
         Unsent { sends: 0, changes } => format!(
-            "Exo is still uploading {changes} change{}. Ignore and sign out anyway?",
+            "Examail is still uploading {changes} change{}. Ignore and sign out anyway?",
             if changes == 1 { "" } else { "s" }
         ),
         Unsent { sends, .. } => {
@@ -333,11 +333,11 @@ mod tests {
         );
         assert_eq!(
             text(0, 1).as_deref(),
-            Some("Exo is still uploading 1 change. Ignore and sign out anyway?")
+            Some("Examail is still uploading 1 change. Ignore and sign out anyway?")
         );
         assert_eq!(
             text(0, 4).as_deref(),
-            Some("Exo is still uploading 4 changes. Ignore and sign out anyway?")
+            Some("Examail is still uploading 4 changes. Ignore and sign out anyway?")
         );
     }
 

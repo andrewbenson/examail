@@ -64,7 +64,7 @@ impl Releases for Arc<Fake> {
         }
         // Nothing installs a sample, since a handoff refuses it, and this one never gets there.
         let installation = Installation {
-            executable: "/nonexistent/Exo.app/Contents/MacOS/Exo".into(),
+            executable: "/nonexistent/Examail.app/Contents/MacOS/Examail".into(),
             kind: Kind::MacBundle,
         };
         Ok(Prepared::sample(installation, &release.version))
@@ -151,14 +151,14 @@ fn found(version: &'static str) -> Arc<Fake> {
 }
 
 #[test]
-fn exo_knows_its_releases_and_bundle() {
+fn examail_knows_its_releases_and_bundle() {
     CONFIG.validate().expect("a valid configuration");
-    assert_eq!(version(), format!("exo {}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(version(), format!("examail {}", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
 fn only_a_copy_signed_by_a_team_updates_itself() {
-    let signed = "Executable=/Applications/Exo.app/Contents/MacOS/Exo\nIdentifier=build.miguel.Exo\nTeamIdentifier=LR4RJT6586\nSealed Resources version=2\n";
+    let signed = "Executable=/Applications/Examail.app/Contents/MacOS/Examail\nIdentifier=build.miguel.Exo\nTeamIdentifier=LR4RJT6586\nSealed Resources version=2\n";
     assert_eq!(team(signed), Some("LR4RJT6586"));
     let ad_hoc = "Identifier=build.miguel.Exo\nSignature=adhoc\nTeamIdentifier=not set\n";
     assert_eq!(team(ad_hoc), None);
@@ -275,7 +275,7 @@ fn the_app_menu_asks_before_downloading_and_installing() {
     });
     updates.menu_chosen();
     wait("the answer", || {
-        recorder.said() == ["Exo is up to date: You're using the latest and greatest!"]
+        recorder.said() == ["Examail is up to date: You're using the latest and greatest!"]
     });
 
     *fake.latest.lock().unwrap() = Some("9.0.0");
@@ -286,8 +286,8 @@ fn the_app_menu_asks_before_downloading_and_installing() {
     assert_eq!(
         recorder.said()[1..],
         [
-            "Update available!: Ready to download Exo 9.0.0.",
-            "Update ready!: Restart to start using Exo 9.0.0."
+            "Update available!: Ready to download Examail 9.0.0.",
+            "Update ready!: Restart to start using Examail 9.0.0."
         ]
     );
     wait("its end", || !updates.lock().busy);

@@ -368,7 +368,7 @@ mod macos {
             fn clear_cache_and_restart(&self, _sender: Option<&AnyObject>) {
                 let alert = NSAlert::new(self.mtm());
                 alert.setMessageText(ns_string!("Are you sure?"));
-                alert.setInformativeText(ns_string!("This will delete the mail and calendars Exo keeps on this Mac and restart it to download them again. You'll stay signed in, and your settings, drafts, scheduled messages and reminders are kept."));
+                alert.setInformativeText(ns_string!("This will delete the mail and calendars Examail keeps on this Mac and restart it to download them again. You'll stay signed in, and your settings, drafts, scheduled messages and reminders are kept."));
                 alert.addButtonWithTitle(ns_string!("Cancel"));
                 alert.addButtonWithTitle(ns_string!("Yes"));
                 if alert.runModal() != NSAlertFirstButtonReturn {

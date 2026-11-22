@@ -409,7 +409,7 @@ fn draw(
         let text = if signature.is_some() {
             (
                 "To edit this signature, please visit ",
-                " and then reload Exo.",
+                " and then reload Examail.",
             )
         } else {
             ("To add a signature, please visit ", " and then reload.")

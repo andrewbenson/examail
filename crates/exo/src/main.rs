@@ -14,8 +14,8 @@ use exo::notifications::{self, Notifier};
 use exo::sign_in::{self, SignIn};
 use exo_auth::{Auth, ClientConfig, MemorySecrets};
 
-/// Where Exo keeps its files: `~/Library/Application Support/Exo` on macOS.
-const DIRS: fastframe_dirs::App = fastframe_dirs::App::new("exo", "", "", "Exo");
+/// Where Exo keeps its files: `~/Library/Application Support/Examail` on macOS.
+const DIRS: fastframe_dirs::App = fastframe_dirs::App::new("examail", "", "", "Examail");
 
 /// gmail-mock takes any OAuth client.
 const MOCK_CLIENT_ID: &str = "exo-dev.apps.googleusercontent.com";
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let dirs = DIRS
         .discover(|_, _| Ok(()))
         .dirs
-        .context("finding Exo's folders")?;
+        .context("finding Examail's folders")?;
     // `EXO_GMAIL_MOCK=http://127.0.0.1:8787/` signs in against a running gmail-mock instead of
     // Google. Its grants and mail die with it, so the account list and the accounts' stores go
     // in a folder that lasts this run only, away from the real ones.
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             .as_deref(),
     );
     if let Some(failure) = &launch.failure {
-        log::warn!("the update didn't install, so the previous Exo is back: {failure}");
+        log::warn!("the update didn't install, so the previous Examail is back: {failure}");
     }
     let _instance = match claimed {
         Ok(guard) => guard,
@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         }));
         options
     };
-    let result = fastframe_graphics::Graphics::new("Exo")
+    let result = fastframe_graphics::Graphics::new("Examail")
         .run_native(options, || {
             let (assets, config, state, mock) = (
                 assets.clone(),

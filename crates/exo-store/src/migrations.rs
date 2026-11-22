@@ -147,7 +147,7 @@ async fn refuse_unknown(db: &mut Db, path: &Path) -> Result<()> {
     }
     Err(Error::UnknownSchema {
         path: path.to_owned(),
-        found: format!("{}, which this Exo doesn't have", unknown.join(", ")),
+        found: format!("{}, which this Examail doesn't have", unknown.join(", ")),
     })
 }
 
@@ -876,7 +876,7 @@ mod tests {
         drop(db);
         let error = db::open(&path).await.expect_err("isn't opened");
         assert!(
-            matches!(&error, Error::UnknownSchema { found, .. } if found == "0002_from_a_newer_exo.sql, which this Exo doesn't have"),
+            matches!(&error, Error::UnknownSchema { found, .. } if found == "0002_from_a_newer_exo.sql, which this Examail doesn't have"),
             "{error}"
         );
         let mut db = db::connect(&path).await.expect("opens the file as it is");

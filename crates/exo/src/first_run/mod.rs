@@ -21,7 +21,7 @@ use crate::commands;
 const GET_ME_TO_ZERO_OVER: usize = 10;
 /// The welcome alert at the end of the flow. Its text is a `354px` box, so the first line doesn't
 /// wrap at the alert's 300px.
-const WELCOME_TITLE: &str = "Welcome to Exo";
+const WELCOME_TITLE: &str = "Welcome to Examail";
 const WELCOME_LINES: [&str; 2] = [
     "Get ready to regain focus, be more productive,",
     "and save hours every week!",

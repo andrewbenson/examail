@@ -21,7 +21,7 @@ fn the_bar_says_the_network_is_down() {
     assert_eq!((bar.title, bar.color), ("Offline", MessageBarColor::Blue));
     assert_eq!(
         bar.text(),
-        "Good news: Exo works offline! Messages will send and receive when next online."
+        "Good news: Examail works offline! Messages will send and receive when next online."
     );
 }
 
@@ -133,7 +133,7 @@ fn a_conversation_the_store_doesnt_have_is_fetched_when_opened() {
     let thread = message.thread_id.expect("a thread");
     let open = |app: &mut support::Fixture, thread: &str| {
         let link = exo::links::parse(&format!("exo://maya@brightmoor.co/thread/{thread}"))
-            .expect("one of Exo's links");
+            .expect("one of Examail's links");
         app.mail_mut().open_link(&link);
     };
     open(&mut app, &thread);
@@ -180,7 +180,7 @@ fn a_conversation_the_store_doesnt_have_isnt_available_offline() {
     app.mail().account().network_changed();
     app.settle();
     let link = exo::links::parse("exo://maya@brightmoor.co/label/sent/thread/19af00000000beef")
-        .expect("one of Exo's links");
+        .expect("one of Examail's links");
     app.mail_mut().open_link(&link);
     for _ in 0..20 {
         if app.mail().alert().is_some() {
@@ -222,7 +222,7 @@ fn the_bar_says_gmail_doesnt_answer() {
     assert_eq!(bar.title, "Offline");
     assert_eq!(
         bar.text(),
-        "Gmail is not responding right now. Exo will work offline and catch up when Gmail responds."
+        "Gmail is not responding right now. Examail will work offline and catch up when Gmail responds."
     );
 }
 
@@ -239,7 +239,7 @@ fn the_bar_says_gmail_is_throttling() {
     assert_eq!((bar.title, bar.color), ("Note", MessageBarColor::Blue));
     assert_eq!(
         bar.text(),
-        "Gmail is temporarily throttling requests. Exo will work offline and catch up when Gmail responds."
+        "Gmail is temporarily throttling requests. Examail will work offline and catch up when Gmail responds."
     );
 }
 

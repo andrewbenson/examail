@@ -37,18 +37,18 @@ use crate::desktop::Launcher;
 use crate::notifications::Notifier;
 
 /// Where Exo's releases are, on GitHub.
-const REPOSITORY: &str = "andrewbenson/exo";
+const REPOSITORY: &str = "andrewbenson/examail";
 
 /// Exo as its updates know it: its releases, its bundle, and the Apple silicon disk image a
 /// release carries.
 pub const CONFIG: UpdateConfig = UpdateConfig {
     macos: MacConfig {
-        bundle_ids: &["com.andrewbenson.Exo"],
-        executable_names: &["Exo"],
+        bundle_ids: &["com.andrewbenson.Examail"],
+        executable_names: &["Examail"],
         legacy_bundle_names: &[],
     },
     mac_target: MacTarget::Arm64Only,
-    ..UpdateConfig::new(REPOSITORY, "Exo", "exo", env!("CARGO_PKG_VERSION"))
+    ..UpdateConfig::new(REPOSITORY, "Examail", "examail", env!("CARGO_PKG_VERSION"))
 };
 
 /// The argument Exo restarts with after installing an update it was asked to. Its window comes
@@ -179,11 +179,11 @@ pub fn updater() -> Option<Updater> {
     match updater.installation() {
         Ok(installation) if signed_by_a_team(&installation.executable) => Some(updater),
         Ok(_) => {
-            log::info!("Exo can't update itself: it isn't signed by a team");
+            log::info!("Examail can't update itself: it isn't signed by a team");
             None
         }
         Err(reason) => {
-            log::info!("Exo can't update itself: {reason}");
+            log::info!("Examail can't update itself: {reason}");
             None
         }
     }
@@ -225,11 +225,11 @@ pub fn install_kept(updater: &Updater, arguments: Vec<String>) -> bool {
     let version = prepared.version().to_owned();
     match updater.handoff(prepared, arguments) {
         Ok(()) => {
-            log::info!("installing Exo {version}, downloaded earlier");
+            log::info!("installing Examail {version}, downloaded earlier");
             true
         }
         Err(error) => {
-            log::warn!("installing Exo {version}, downloaded earlier: {error:#}");
+            log::warn!("installing Examail {version}, downloaded earlier: {error:#}");
             false
         }
     }
@@ -649,7 +649,7 @@ impl Updates {
 
     /// A step failed, and the alert or the dialog says so.
     fn failed(&self, failure: Failure) {
-        log::warn!("updating Exo: {failure}");
+        log::warn!("updating Examail: {failure}");
         let connection = failure.connection();
         let mode = {
             let mut state = self.lock();

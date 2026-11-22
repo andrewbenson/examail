@@ -1536,7 +1536,7 @@
     "splitTemplate_shared": {
       "id": "splitTemplate_shared",
       "name": "Shared",
-      "description": "Conversations shared via Exo.",
+      "description": "Conversations shared via Examail.",
       "type": "shared",
       "properties": {
         "query": {

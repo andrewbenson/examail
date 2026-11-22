@@ -276,15 +276,15 @@ pub(super) fn crashed_repeatedly(gave_up: crate::recovery::GaveUp) {
     alert.setAlertStyle(NSAlertStyle::Critical);
     alert
         .window()
-        .setTitle(ns_string!("Exo Background Process Error"));
+        .setTitle(ns_string!("Examail Background Process Error"));
     alert.setMessageText(ns_string!("The background process has crashed repeatedly."));
     let detail = format!(
-        "Exo needs to quit. Please try:\n\n1. Restart Exo\n2. If the problem persists, choose Help > Clear Cache and Restart\n\nError: {} ({} attempts)",
+        "Examail needs to quit. Please try:\n\n1. Restart Examail\n2. If the problem persists, choose Help > Clear Cache and Restart\n\nError: {} ({} attempts)",
         crate::recovery::GaveUp::KIND,
         gave_up.attempts
     );
     alert.setInformativeText(&NSString::from_str(&detail));
-    alert.addButtonWithTitle(ns_string!("Quit Exo"));
+    alert.addButtonWithTitle(ns_string!("Quit Examail"));
     alert.runModal();
     terminate_soon();
 }

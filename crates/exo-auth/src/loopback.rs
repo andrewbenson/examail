@@ -20,12 +20,12 @@ const MAX_HEAD: usize = 16 * 1024;
 /// Copy for the browser page the sign-in ends on.
 mod copy {
     /// Signed in.
-    pub const SIGNED_IN: &str = "Thanks for allowing Exo!";
+    pub const SIGNED_IN: &str = "Thanks for allowing Examail!";
     /// The generic error.
     pub const FAILED: &str = "Sorry, something went wrong! Please try again later.";
     /// Fewer scopes granted than asked for.
     pub const MISSING_SCOPES: &str = "Please select all permissions when signing in with Google.\n\
-                                      Exo requires these to manage your email.";
+                                      Examail requires these to manage your email.";
     /// The login attempt expired.
     pub const EXPIRED: &str = "Sorry, this login attempt has expired. Please try again.";
     /// No Gmail mailbox.
@@ -116,7 +116,7 @@ pub(crate) async fn respond<T>(mut stream: TcpStream, result: &Result<T, Error>)
 fn page(text: &str) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><meta charset=\"utf-8\">\
-         <meta name=\"color-scheme\" content=\"light dark\"><title>Exo</title>\
+         <meta name=\"color-scheme\" content=\"light dark\"><title>Examail</title>\
          <style>body{{margin:0 16px;min-height:90vh;display:grid;place-items:center;\
          font:16px/1.5 -apple-system,system-ui,sans-serif;text-align:center}}</style>\
          <p>{}</p></html>",
@@ -184,7 +184,7 @@ mod tests {
         respond::<()>(stream, &Ok(())).await;
         let page = redirect.await.unwrap();
         assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
-        assert!(page.contains("Thanks for allowing Exo!"));
+        assert!(page.contains("Thanks for allowing Examail!"));
     }
 
     // Reads the accepted connection directly, because the paused clock jumps ahead whenever the

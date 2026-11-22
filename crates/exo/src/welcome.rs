@@ -38,9 +38,9 @@ const SPINNER_GAP: f32 = 9.0;
 const LOWER_PADDING: f32 = 4.0;
 
 /// The splash's copy.
-const WELCOME: &str = "Welcome to Exo!";
+const WELCOME: &str = "Welcome to Examail!";
 const BODY_LINES: [&str; 2] = [
-    "Exo is the most productive email app ever made.",
+    "Examail is the most productive email app ever made.",
     "You'll get through your inbox twice as fast as before.",
 ];
 const GETTING_READY: &str = "Getting ready…";
@@ -243,7 +243,7 @@ impl crate::Mail {
 /// the plain welcome.
 fn welcome(name: Option<&str>) -> String {
     match name.and_then(|name| name.split_whitespace().next()) {
-        Some(first) => format!("{first}, welcome to Exo!"),
+        Some(first) => format!("{first}, welcome to Examail!"),
         None => WELCOME.to_owned(),
     }
 }
@@ -307,8 +307,8 @@ mod tests {
 
     #[test]
     fn it_greets_the_account_by_its_first_name() {
-        assert_eq!(welcome(Some("Maya Okafor")), "Maya, welcome to Exo!");
-        assert_eq!(welcome(Some("  ")), "Welcome to Exo!");
-        assert_eq!(welcome(None), "Welcome to Exo!");
+        assert_eq!(welcome(Some("Maya Okafor")), "Maya, welcome to Examail!");
+        assert_eq!(welcome(Some("  ")), "Welcome to Examail!");
+        assert_eq!(welcome(None), "Welcome to Examail!");
     }
 }

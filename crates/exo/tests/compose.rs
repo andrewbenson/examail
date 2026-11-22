@@ -1222,7 +1222,7 @@ fn quitting_right_after_send_still_sends() {
     assert_eq!(
         lone.sent("quit.1@brightmoor.co"),
         1,
-        "a held send goes before Exo quits"
+        "a held send goes before Examail quits"
     );
 }
 
@@ -1652,7 +1652,7 @@ fn a_draft_written_in_gmail_keeps_its_files_once_exo_saves_it() {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>(),
         ["notes.txt"],
-        "Exo's save kept the draft's file"
+        "Examail's save kept the draft's file"
     );
 }
 

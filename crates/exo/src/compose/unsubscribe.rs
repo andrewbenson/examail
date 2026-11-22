@@ -20,7 +20,7 @@ impl crate::Mail {
         let account = self.compose_account();
         let from = account.delivered_to(message);
         let body = format!(
-            "This is an unsubscribe request sent from Exo on behalf of {}",
+            "This is an unsubscribe request sent from Examail on behalf of {}",
             mailto::escape(&from.email)
         );
         let fields = Fields {

@@ -42,7 +42,7 @@ fn a_new_tab_opens_home_and_each_tab_keeps_its_route() {
     assert_eq!((app.mail().list(), open_thread(&app)), (&home, None));
     let titles = app.harness.state().tab_titles();
     assert_eq!(
-        titles[0], "Sent - Exo",
+        titles[0], "Sent - Examail",
         "the tab left behind keeps its title"
     );
     assert!(titles[1].starts_with("Inbox"), "{titles:?}");
@@ -116,7 +116,10 @@ fn a_search_comes_back_with_its_tab() {
     assert_eq!(app.mail().search_query(), Some("potato"));
     app.press(Key::T, COMMAND);
     assert!(!app.mail().is_searching(), "the new tab is at home");
-    assert_eq!(app.harness.state().tab_titles()[0], "Search: potato - Exo");
+    assert_eq!(
+        app.harness.state().tab_titles()[0],
+        "Search: potato - Examail"
+    );
     app.press(Key::Num1, COMMAND);
     assert_eq!(app.mail().search_query(), Some("potato"));
     assert_eq!(app.subjects(), ["Thanksgiving 🦃"]);
@@ -243,7 +246,7 @@ fn the_strips_copy_button_copies_its_tabs_link() {
     assert_eq!(
         copied(&app),
         Some(format!(
-            "exo://maya@brightmoor.co/label/sent/thread/{opened}"
+            "examail://maya@brightmoor.co/label/sent/thread/{opened}"
         )),
         "the tab clicked, not the one on screen"
     );
@@ -256,7 +259,7 @@ fn the_strips_copy_button_copies_its_tabs_link() {
     app.click(pos2(1173.0 - 31.0, 20.0));
     assert_eq!(
         copied(&app).as_deref(),
-        Some("exo://maya@brightmoor.co"),
+        Some("examail://maya@brightmoor.co"),
         "the tab on screen, at home"
     );
 }
@@ -267,7 +270,7 @@ fn control_slash_copies_where_the_tab_is() {
     exo::clipboard::capture(&app.harness.ctx);
     let opened = sent_conversation(&mut app);
     app.press(Key::Slash, Modifiers::CTRL);
-    let link = format!("exo://maya@brightmoor.co/label/sent/thread/{opened}");
+    let link = format!("examail://maya@brightmoor.co/label/sent/thread/{opened}");
     assert_eq!(copied(&app).as_ref(), Some(&link));
     assert_eq!(
         app.mail().hint_text(),
@@ -279,7 +282,7 @@ fn control_slash_copies_where_the_tab_is() {
     app.press(Key::Slash, Modifiers::CTRL);
     assert_eq!(
         copied(&app).as_deref(),
-        Some("exo://maya@brightmoor.co/label/sent?filters=unread"),
+        Some("examail://maya@brightmoor.co/label/sent?filters=unread"),
         "the list's filter"
     );
     // The palette's row for the conversation under the cursor.
@@ -287,7 +290,7 @@ fn control_slash_copies_where_the_tab_is() {
     app.type_text("Copy Private Link to Conversation");
     app.key(Key::Enter);
     assert!(
-        copied(&app).is_some_and(|link| link.starts_with("exo://maya@brightmoor.co/thread/")),
+        copied(&app).is_some_and(|link| link.starts_with("examail://maya@brightmoor.co/thread/")),
         "{:?}",
         copied(&app)
     );
@@ -308,7 +311,7 @@ fn a_link_opens_in_its_accounts_tab() {
     leave_conversation(&mut app);
     app.press(Key::T, COMMAND);
     launcher.open_url(&format!(
-        "exo://maya@brightmoor.co/label/sent/thread/{opened}?filters=unread"
+        "examail://maya@brightmoor.co/label/sent/thread/{opened}?filters=unread"
     ));
     app.settle();
     assert_eq!(tabs(&app), (2, 1), "the tab on screen shows its account");

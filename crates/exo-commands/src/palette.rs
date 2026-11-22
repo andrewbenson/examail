@@ -1030,7 +1030,7 @@ fn paint<A: Clone>(
     // Header: icon, prompt, hairline.
     let left = panel.left() + GUTTER;
     let header_top = panel.top() + PADDING_TOP;
-    let (icon, prompt) = sub.map_or(("data/icon", "Exo Command"), |sub| {
+    let (icon, prompt) = sub.map_or(("data/icon", "Examail Command"), |sub| {
         (sub.icon, sub.prompt.as_ref())
     });
     // The header's glyph: centred in its box, 1px down, at 70%.

@@ -576,8 +576,9 @@ fn unticked_permissions_are_explained() {
 #[test]
 fn without_an_oauth_client_it_says_where_to_put_one() {
     let device = Device::new("no-client");
-    let path =
-        PathBuf::from("/Users/someone/Library/Application Support/Exo/google-oauth-client.json");
+    let path = PathBuf::from(
+        "/Users/someone/Library/Application Support/Examail/google-oauth-client.json",
+    );
     let missing = path.clone();
     let open = move || {
         Err(exo_auth::Error::MissingClient {
@@ -667,7 +668,7 @@ fn signing_out_with_unsent_changes_asks_first() {
         alert(app.state()).unwrap(),
         (
             "One last thing…".to_owned(),
-            "Exo is still uploading 1 change. Ignore and sign out anyway?".to_owned()
+            "Examail is still uploading 1 change. Ignore and sign out anyway?".to_owned()
         )
     );
     press(&mut app, Key::Escape);
@@ -1861,14 +1862,14 @@ fn each_teardown_has_its_alert() {
     assert_eq!(
         Reason::Corrupt.alert(),
         (
-            "The Exo cache is corrupted.\nTo fix this please clear your cache and restart the app.",
+            "The Examail cache is corrupted.\nTo fix this please clear your cache and restart the app.",
             &["Clear Cache and Restart"][..]
         )
     );
     assert_eq!(
         Reason::DiskFull.alert(),
         (
-            "Your disk is full. To fix this, please free up some disk space and restart Exo.",
+            "Your disk is full. To fix this, please free up some disk space and restart Examail.",
             &[][..]
         )
     );

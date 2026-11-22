@@ -8,7 +8,7 @@ use fastframe_instance::{Claim, Guard, Slot};
 use super::Launcher;
 
 /// The slot's name, which starts each request.
-const APP: &str = "Exo";
+const APP: &str = "Examail";
 /// Asks for the window.
 const SHOW: &str = "show";
 /// Asks to open the URL after it.
@@ -17,21 +17,25 @@ const OPEN: &str = "open ";
 /// The link a launch from the command line asks to open: the first `mailto:` or deep link (`exo:`)
 /// among its arguments.
 pub fn launch_url(args: impl IntoIterator<Item = String>) -> Option<String> {
-    args.into_iter()
-        .find(|arg| arg.starts_with("mailto:") || arg.starts_with(crate::links::SCHEME))
+    args.into_iter().find(|arg| {
+        arg.starts_with("mailto:")
+            || crate::links::SCHEMES
+                .iter()
+                .any(|scheme| arg.starts_with(scheme))
+    })
 }
 
 /// Why this launch isn't the running Exo, and is done.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Unclaimed {
     /// The running Exo took the link or the request for the window.
-    #[error("Exo is already running, and took the request")]
+    #[error("Examail is already running, and took the request")]
     HandedOver,
     /// The running Exo didn't understand the request.
-    #[error("the running Exo turned down the request")]
+    #[error("the running Examail turned down the request")]
     Declined,
     /// An Exo holds the slot but didn't answer in time.
-    #[error("Exo is already running, but didn't answer")]
+    #[error("Examail is already running, but didn't answer")]
     Unanswered,
 }
 

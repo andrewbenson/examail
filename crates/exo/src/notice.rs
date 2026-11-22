@@ -32,7 +32,7 @@ const UPDATE_REQUIRED: [&[(&str, bool)]; 3] = [
         ("Check for Updates", true),
         (" to get on the", false),
     ],
-    &[("latest version of Exo.", false)],
+    &[("latest version of Examail.", false)],
 ];
 /// Where an alert's keys work.
 const ALERT: &[Region] = &[Region::Alert];
@@ -85,7 +85,7 @@ impl Notice {
         match self {
             // The version alone.
             Self::VersionInfo => format!("- Version: {VERSION}"),
-            Self::UpdateRequired => "To see this feature, hit Cmd+K (Mac) or Ctrl+K (Windows) → Check for Updates to get on the latest version of Exo.".to_owned(),
+            Self::UpdateRequired => "To see this feature, hit Cmd+K (Mac) or Ctrl+K (Windows) → Check for Updates to get on the latest version of Examail.".to_owned(),
             Self::Update(alert) => alert.text(),
         }
     }
@@ -116,7 +116,7 @@ pub(crate) fn register(
     if updates {
         commands.add(
             Command::new("UPGRADE", "Check for Updates", act(Action::CheckForUpdates))
-                .aliases(["Update Exo", "Upgrade Version"])
+                .aliases(["Update Examail", "Upgrade Version"])
                 .operative_word("update")
                 .default_score(0.9)
                 .icon("data/icon"),

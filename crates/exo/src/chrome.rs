@@ -934,7 +934,7 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_| {})
             .drop_without_applying_deltas();
         let style = TextStyle::new(Font::new(Family::System, 400), 12.8, 22.0);
-        let title = "Important (16) - Exo";
+        let title = "Important (16) - Examail";
         let galley = exo_ui::layout(
             &ctx,
             LayoutJob::single_section(title.to_owned(), style.format(Color32::BLACK)),
@@ -970,7 +970,7 @@ mod tests {
                     ui.ctx(),
                     vec![
                         Pill {
-                            title: "Exo".into(),
+                            title: "Examail".into(),
                             login_screen: true,
                             ..Pill::default()
                         },
@@ -979,7 +979,7 @@ mod tests {
                     1,
                 );
                 let tab = Tab {
-                    title: "Important (16) - Exo",
+                    title: "Important (16) - Examail",
                     email: Some("maya@brightmoor.co"),
                     login_screen: false,
                     account_color: Some("sea"),
@@ -996,6 +996,6 @@ mod tests {
             .iter()
             .map(|title| (title.text.as_str(), title.hovered))
             .collect();
-        assert_eq!(texts, [("Exo", false), ("maya@brightmoor.co", true)]);
+        assert_eq!(texts, [("Examail", false), ("maya@brightmoor.co", true)]);
     }
 }

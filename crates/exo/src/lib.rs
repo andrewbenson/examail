@@ -145,7 +145,7 @@ pub fn assets_dir() -> PathBuf {
 pub fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Exo")
+            .with_title("Examail")
             .with_inner_size([1280.0, 800.0])
             .with_position([22.0, 22.0])
             .with_min_inner_size([780.0, 300.0])
@@ -2330,7 +2330,7 @@ impl Mail {
             Hint::new()
                 .text("Next time, hit")
                 .keys(["⌘", "K"])
-                .text("to instantly open Exo Command!"),
+                .text("to instantly open Examail Command!"),
         );
         self.commands.open_palette(None);
     }

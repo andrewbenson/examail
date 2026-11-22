@@ -572,7 +572,7 @@ fn respond(id: u64, answer: Option<(Vec<u8>, String)>) {
     unsafe {
         let Some((bytes, mime)) = answer else {
             task.didFailWithError(&NSError::errorWithDomain_code_userInfo(
-                &NSString::from_str("Exo"),
+                &NSString::from_str("Examail"),
                 0,
                 None,
             ));
@@ -581,7 +581,7 @@ fn respond(id: u64, answer: Option<(Vec<u8>, String)>) {
         let request = task.request();
         let Some(url) = request.URL() else {
             return task.didFailWithError(&NSError::errorWithDomain_code_userInfo(
-                &NSString::from_str("Exo"),
+                &NSString::from_str("Examail"),
                 0,
                 None,
             ));

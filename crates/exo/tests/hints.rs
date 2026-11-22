@@ -57,7 +57,7 @@ fn the_list_headers_icons_and_a_rows_buttons_coach_their_keys() {
     app.click(ROW_COMMAND);
     assert_eq!(
         hint(&app).as_deref(),
-        Some("Next time, hit ⌘ K to instantly open Exo Command!")
+        Some("Next time, hit ⌘ K to instantly open Examail Command!")
     );
     app.key(Key::Escape);
     app.click(ROW_DONE);
@@ -243,11 +243,11 @@ fn check_for_updates_says_when_exo_is_up_to_date() {
     let mut app = start("hints-check-for-updates");
     app.mail_mut()
         .set_updates(Some(Updates::with(UpToDate, Quiet)));
-    palette(&mut app, "update exo");
+    palette(&mut app, "update examail");
     wait_for_alert(&mut app, Alert::Latest);
     assert_eq!(
         Notice::Update(Alert::Latest).text(),
-        "You are on the latest version of Exo!"
+        "You are on the latest version of Examail!"
     );
     app.key(Key::J);
     assert_eq!(

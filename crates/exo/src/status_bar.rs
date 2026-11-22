@@ -29,11 +29,11 @@ impl StatusBar {
         } else {
             "Messages will send and receive when next online."
         };
-        let catch_up = "Exo will work offline and catch up when Gmail responds.";
+        let catch_up = "Examail will work offline and catch up when Gmail responds.";
         let (title, description, next, color) = match connection.outage? {
             Outage::Offline => (
                 "Offline",
-                "Good news: Exo works offline!",
+                "Good news: Examail works offline!",
                 vec![text(offline)],
                 MessageBarColor::Blue,
             ),
@@ -41,7 +41,7 @@ impl StatusBar {
                 "Offline",
                 "Sorry! Google OAuth is not responding right now.",
                 vec![text(
-                    "Exo will reconnect automatically when Google responds.",
+                    "Examail will reconnect automatically when Google responds.",
                 )],
                 MessageBarColor::Blue,
             ),
@@ -125,23 +125,23 @@ mod tests {
             (offline.title, offline.text().as_str()),
             (
                 "Offline",
-                "Good news: Exo works offline! Messages will send and receive when next online."
+                "Good news: Examail works offline! Messages will send and receive when next online."
             )
         );
         assert_eq!(
             bar(Outage::Auth).text(),
-            "Sorry! Google OAuth is not responding right now. Exo will reconnect automatically when Google responds."
+            "Sorry! Google OAuth is not responding right now. Examail will reconnect automatically when Google responds."
         );
         assert_eq!(
             bar(Outage::Gmail).text(),
-            "Gmail is not responding right now. Exo will work offline and catch up when Gmail responds."
+            "Gmail is not responding right now. Examail will work offline and catch up when Gmail responds."
         );
         let throttled = bar(Outage::Throttled);
         assert_eq!(
             (throttled.title, throttled.text().as_str()),
             (
                 "Note",
-                "Gmail is temporarily throttling requests. Exo will work offline and catch up when Gmail responds."
+                "Gmail is temporarily throttling requests. Examail will work offline and catch up when Gmail responds."
             )
         );
         let disabled = bar(Outage::GmailDisabled);
@@ -164,7 +164,7 @@ mod tests {
         let week = StatusBar::offline(&offline, true).expect("a bar");
         assert_eq!(
             week.text(),
-            "Good news: Exo works offline! Events will sync when next online. Your updates may overwrite changes from others."
+            "Good news: Examail works offline! Events will sync when next online. Your updates may overwrite changes from others."
         );
         let full = StatusBar::offline(
             &Connection {
@@ -176,7 +176,7 @@ mod tests {
         .expect("a bar");
         assert_eq!(
             full.text(),
-            "Good news: Exo works offline! This may be caused by lack of disk space."
+            "Good news: Examail works offline! This may be caused by lack of disk space."
         );
         let throttled = StatusBar::offline(
             &Connection {

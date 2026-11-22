@@ -174,7 +174,7 @@ pub(super) const SEND_SPECIAL: &[(u64, &[&str])] = &[
             "Good thing emails don't need stamps.",
         ],
     ),
-    (5_000, &["Exo wants to be you when it grows up."]),
+    (5_000, &["Examail wants to be you when it grows up."]),
     (5_280, &["You've run a mile via email."]),
     (
         5_387,
@@ -331,7 +331,10 @@ pub(super) const CLEAR_SPECIAL: &[(u64, &[&str])] = &[
     ),
     (
         3_000,
-        &["In the year 3,000 you'll be able to use Exo", "from space."],
+        &[
+            "In the year 3,000 you'll be able to use Examail",
+            "from space.",
+        ],
     ),
     (3_600, &["One for every second in an hour."]),
     (

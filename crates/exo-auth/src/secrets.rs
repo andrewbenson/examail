@@ -92,7 +92,7 @@ mod keychain {
     use super::{Keychain, SecretStore};
     use crate::Error;
 
-    const SERVICE: &str = "Exo Google sign-in";
+    const SERVICE: &str = "Examail Google sign-in";
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 

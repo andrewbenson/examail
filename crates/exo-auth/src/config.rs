@@ -123,7 +123,7 @@ impl ClientConfig {
             (Some(installed), _) => installed,
             (None, Some(_)) => {
                 return Err(
-                    "is for a \"Web application\" client; Exo needs a \"Desktop app\" client"
+                    "is for a \"Web application\" client; Examail needs a \"Desktop app\" client"
                         .into(),
                 );
             }

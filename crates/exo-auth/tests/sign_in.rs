@@ -17,7 +17,7 @@ async fn signs_in_through_the_loopback_redirect() {
     let page = page.await.unwrap();
     assert_eq!(page.status, 200);
     assert!(
-        page.text.contains("Thanks for allowing Exo!"),
+        page.text.contains("Thanks for allowing Examail!"),
         "{}",
         page.text
     );

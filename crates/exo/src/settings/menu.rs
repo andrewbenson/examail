@@ -161,7 +161,7 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        header: "Learn Exo",
+        header: "Learn Examail",
         rows: &[
             ("Shortcuts", Action::Shortcuts),
             (

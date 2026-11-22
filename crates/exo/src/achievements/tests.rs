@@ -196,7 +196,7 @@ fn popup_copy_depends_on_kind_and_count() {
     );
     assert_eq!(
         body(reached(Kind::Send, 5_000, 0), |_| 0),
-        ["Exo wants to be you when it grows up."]
+        ["Examail wants to be you when it grows up."]
     );
     assert_eq!(
         body(reached(Kind::Send, 600, 500), |_| 2),

@@ -95,7 +95,7 @@ fn missing_client(path: &std::path::Path, from_env: bool) -> String {
         format!("{env} is set to {path}, but there's no file there")
     } else {
         format!(
-            "Exo has no Google OAuth client. In Google Cloud Console, create an OAuth client of \
+            "Examail has no Google OAuth client. In Google Cloud Console, create an OAuth client of \
              type \"Desktop app\", download its JSON and save it as {path} (or set {env} to its \
              path)"
         )

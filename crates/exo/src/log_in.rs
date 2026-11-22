@@ -449,7 +449,7 @@ impl LogIn {
         chrome::show(
             ui,
             chrome::Tab {
-                title: "Exo",
+                title: "Examail",
                 email: None,
                 login_screen: true,
                 account_color: None,

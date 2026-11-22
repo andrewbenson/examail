@@ -146,7 +146,7 @@ pub enum Outcome {
 /// POSTs RFC 8058's unsubscribe to `url`, connecting only to addresses `reach` allows.
 pub async fn post(url: &Url, reach: Reach) -> Outcome {
     if !reach.permits(url) {
-        return Outcome::Refused("not a link Exo posts to".into());
+        return Outcome::Refused("not a link Examail posts to".into());
     }
     let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -167,7 +167,7 @@ pub async fn post(url: &Url, reach: Reach) -> Outcome {
             .collect();
         if allowed.is_empty() {
             return Outcome::Refused(format!(
-                "{domain} resolves to {resolved:?}, which Exo doesn't post to"
+                "{domain} resolves to {resolved:?}, which Examail doesn't post to"
             ));
         }
         // Connect to the addresses checked, not to a second lookup's.

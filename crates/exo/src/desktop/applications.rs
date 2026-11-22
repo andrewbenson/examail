@@ -72,7 +72,7 @@ fn ask(state: &Path, location: &Location, home: &Path) -> Moved {
     let question = if location.writable {
         Question::Offer {
             detail: format!(
-                "Would you like to move Exo to the Applications folder?{}",
+                "Would you like to move Examail to the Applications folder?{}",
                 where_it_is(&location.app, home)
             ),
         }
@@ -92,7 +92,7 @@ fn ask(state: &Path, location: &Location, home: &Path) -> Moved {
             }
             // Exo runs on where it is.
             Err(error) => {
-                log::error!("moving Exo to the Applications folder: {error}");
+                log::error!("moving Examail to the Applications folder: {error}");
                 Moved::Stay
             }
         },
@@ -227,7 +227,7 @@ fn relaunch(app: &Path) {
         .arg(app)
         .spawn();
     if let Err(error) = spawned {
-        log::error!("opening Exo again from the Applications folder: {error}");
+        log::error!("opening Examail again from the Applications folder: {error}");
     }
 }
 
@@ -313,7 +313,7 @@ mod macos {
             }
             Question::Require => {
                 alert.setInformativeText(ns_string!(
-                    "Exo needs to be in the Applications folder to run."
+                    "Examail needs to be in the Applications folder to run."
                 ));
                 alert.addButtonWithTitle(ns_string!("Cancel"));
             }
@@ -342,17 +342,17 @@ mod tests {
     #[test]
     fn applications_folders_and_their_subfolders_need_no_move() {
         for app in [
-            "/Applications/Exo.app",
-            "/Applications/Mail/Exo.app",
-            "/Users/maya/Applications/Exo.app",
+            "/Applications/Examail.app",
+            "/Applications/Mail/Examail.app",
+            "/Users/maya/Applications/Examail.app",
         ] {
             assert!(in_applications(Path::new(app), &home()), "{app}");
         }
         for app in [
-            "/Users/maya/Downloads/Exo.app",
-            "/Applications Old/Exo.app",
-            "/Users/maya/Desktop/Exo.app",
-            "/Volumes/Exo/Exo.app",
+            "/Users/maya/Downloads/Examail.app",
+            "/Applications Old/Examail.app",
+            "/Users/maya/Desktop/Examail.app",
+            "/Volumes/Examail/Examail.app",
         ] {
             assert!(!in_applications(Path::new(app), &home()), "{app}");
         }
@@ -361,18 +361,24 @@ mod tests {
     #[test]
     fn the_detail_says_where_exo_is() {
         assert_eq!(
-            where_it_is(Path::new("/Users/maya/Downloads/Exo.app"), &home()),
+            where_it_is(Path::new("/Users/maya/Downloads/Examail.app"), &home()),
             "\nIt is currently in your Downloads folder."
         );
         assert_eq!(
-            where_it_is(Path::new("/Users/maya/Downloads/Exo 2/Exo.app"), &home()),
+            where_it_is(
+                Path::new("/Users/maya/Downloads/Examail 2/Examail.app"),
+                &home()
+            ),
             "\nIt is currently in your Downloads folder."
         );
         assert_eq!(
-            where_it_is(Path::new("/Users/maya/Desktop/Exo.app"), &home()),
+            where_it_is(Path::new("/Users/maya/Desktop/Examail.app"), &home()),
             "\nIt is currently on your Desktop."
         );
-        assert_eq!(where_it_is(Path::new("/Volumes/Exo/Exo.app"), &home()), "");
+        assert_eq!(
+            where_it_is(Path::new("/Volumes/Examail/Examail.app"), &home()),
+            ""
+        );
     }
 
     /// A folder for one test, empty.
@@ -385,14 +391,14 @@ mod tests {
 
     /// A downloaded app: a bundle with a link and a quarantined file.
     fn downloaded(dir: &Path) -> PathBuf {
-        let app = dir.join("Downloads/Exo.app");
+        let app = dir.join("Downloads/Examail.app");
         std::fs::create_dir_all(app.join("Contents/MacOS")).expect("a bundle");
-        std::fs::write(app.join("Contents/MacOS/Exo"), b"#!/bin/sh\n").expect("an executable");
-        std::os::unix::fs::symlink("MacOS/Exo", app.join("Contents/Current")).expect("a link");
+        std::fs::write(app.join("Contents/MacOS/Examail"), b"#!/bin/sh\n").expect("an executable");
+        std::os::unix::fs::symlink("MacOS/Examail", app.join("Contents/Current")).expect("a link");
         let quarantine = "0083;6740a000;Safari;";
         run(std::process::Command::new("/usr/bin/xattr")
             .args(["-w", "com.apple.quarantine", quarantine])
-            .arg(app.join("Contents/MacOS/Exo")))
+            .arg(app.join("Contents/MacOS/Examail")))
         .expect("quarantined");
         assert!(has_quarantine(&app));
         app
@@ -408,16 +414,16 @@ mod tests {
             std::fs::remove_dir_all(path)
         };
         let folder = dir.join("Applications");
-        std::fs::create_dir_all(folder.join("Exo.app")).expect("an older Exo");
+        std::fs::create_dir_all(folder.join("Examail.app")).expect("an older Examail");
         let moved = relocate(&app, &folder, true, trash).expect("moved");
-        assert_eq!(moved, folder.join("Exo.app"));
+        assert_eq!(moved, folder.join("Examail.app"));
         assert_eq!(
-            std::fs::read(moved.join("Contents/MacOS/Exo")).expect("copied"),
+            std::fs::read(moved.join("Contents/MacOS/Examail")).expect("copied"),
             b"#!/bin/sh\n"
         );
         assert_eq!(
             std::fs::read_link(moved.join("Contents/Current")).expect("a link still"),
-            Path::new("MacOS/Exo")
+            Path::new("MacOS/Examail")
         );
         assert!(
             !has_quarantine(&moved),
@@ -425,8 +431,8 @@ mod tests {
         );
         assert_eq!(
             *trashed.borrow(),
-            [folder.join("Exo.app"), app.clone()],
-            "the older Exo, then the download"
+            [folder.join("Examail.app"), app.clone()],
+            "the older Examail, then the download"
         );
         assert!(!app.exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -440,7 +446,7 @@ mod tests {
             Err(std::io::Error::other("not asked"))
         })
         .expect("copied");
-        assert!(moved.join("Contents/MacOS/Exo").exists() && app.exists());
+        assert!(moved.join("Contents/MacOS/Examail").exists() && app.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -452,14 +458,14 @@ mod tests {
             writable,
         };
         assert_eq!(
-            ask(&dir, &location("/Applications/Exo.app", true), &home()),
+            ask(&dir, &location("/Applications/Examail.app", true), &home()),
             Moved::Stay
         );
         std::fs::write(dir.join(FILE_NAME), r#"{"declined_moving": true}"#).expect("declined");
         assert_eq!(
             ask(
                 &dir,
-                &location("/Users/maya/Downloads/Exo.app", true),
+                &location("/Users/maya/Downloads/Examail.app", true),
                 &home()
             ),
             Moved::Stay,

@@ -541,7 +541,7 @@ impl App {
         match request {
             Request::Open(link) => self.open_link(ctx, &link, true),
             _ if self.sign_in.is_none() => log::warn!(
-                "switching or signing accounts out needs Exo's sign-in, which this app wasn't started with"
+                "switching or signing accounts out needs Examail's sign-in, which this app wasn't started with"
             ),
             Request::SignOut(email) => self.sign_out(ctx, &email),
             Request::CheckSignOut(email) => self.check_sign_out(ctx, &email),
@@ -754,7 +754,7 @@ impl App {
     pub fn clear_cache_and_restart(&mut self, ctx: &egui::Context) {
         if self.sign_in.is_none() {
             return log::warn!(
-                "clearing the cache needs Exo's sign-in, which this app wasn't started with"
+                "clearing the cache needs Examail's sign-in, which this app wasn't started with"
             );
         }
         if let Screen::Mail(mail) = &mut self.screen {
@@ -794,7 +794,9 @@ impl App {
     /// again. The sign-in screen stays.
     fn reload(&mut self, ctx: &egui::Context) {
         if self.sign_in.is_none() {
-            return log::warn!("reloading needs Exo's sign-in, which this app wasn't started with");
+            return log::warn!(
+                "reloading needs Examail's sign-in, which this app wasn't started with"
+            );
         }
         let route = match &self.screen {
             Screen::Mail(mail) => Route {
@@ -1272,7 +1274,11 @@ impl App {
                     Parked::Route(route) => (self.account_of(&route.email)?, route.clone()),
                     Parked::SignIn | Parked::Screen(_) => return None,
                 };
-                let who = if several { route.email.as_str() } else { "Exo" };
+                let who = if several {
+                    route.email.as_str()
+                } else {
+                    "Examail"
+                };
                 let color = crate::accounts::color_name(
                     &route.email,
                     listed.iter().find(|account| account.email == route.email),
@@ -1318,7 +1324,7 @@ impl eframe::App for App {
             match &self.desktop {
                 Some(desktop) => desktop.crashed_repeatedly(gave_up),
                 None => log::error!(
-                    "not quitting after repeated panics: Exo isn't running as a Mac app"
+                    "not quitting after repeated panics: Examail isn't running as a Mac app"
                 ),
             }
         }

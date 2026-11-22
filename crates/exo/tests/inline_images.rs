@@ -337,7 +337,7 @@ fn a_draft_written_in_gmail_shows_its_image_and_keeps_it() {
     assert!(
         draft.contains("Content-ID: <chart@brightmoor>")
             && draft.contains("src=\"cid:chart@brightmoor\""),
-        "Exo's save keeps it: {draft}"
+        "Examail's save keeps it: {draft}"
     );
 }
 

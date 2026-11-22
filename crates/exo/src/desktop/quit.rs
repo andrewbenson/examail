@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// The alert's message.
 #[cfg(target_os = "macos")]
-pub(super) const MESSAGE: &str = "Are you sure you want to quit Exo?";
+pub(super) const MESSAGE: &str = "Are you sure you want to quit Examail?";
 /// The alert's informative text.
 #[cfg(target_os = "macos")]
 pub(super) const INFORMATIVE_TEXT: &str =
-    "Scheduled emails, reminders and notifications won't work until you open Exo again.";
+    "Scheduled emails, reminders and notifications won't work until you open Examail again.";
 /// The default button (Return).
 #[cfg(target_os = "macos")]
 pub(super) const QUIT: &str = "Quit";

@@ -49,7 +49,7 @@ pub enum Error {
     },
     /// The database file has a schema this build can't open, from a migration that a newer Exo
     /// applied. The file was left as it was.
-    #[error("{} has a schema this Exo can't open: {found}", path.display())]
+    #[error("{} has a schema this Examail can't open: {found}", path.display())]
     UnknownSchema {
         /// The database file.
         path: PathBuf,
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(
             Error::UnknownSchema {
                 path: "x".into(),
-                found: "0003_x.sql, which this Exo doesn't have".into()
+                found: "0003_x.sql, which this Examail doesn't have".into()
             }
             .unusable(),
             Some(Unusable::Corrupt)
