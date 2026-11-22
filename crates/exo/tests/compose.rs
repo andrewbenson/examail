@@ -666,6 +666,44 @@ fn a_reply_taller_than_the_window_scrolls_its_body_and_keeps_its_top_in_view() {
 }
 
 #[test]
+fn the_wheel_scrolls_the_thread_up_past_a_reply_being_typed() {
+    let mut app = start("compose-reply-tall");
+    app.key(Key::Enter);
+    app.wait(0.5);
+    app.key(Key::R);
+    for line in 1..=40 {
+        app.type_text(&format!("line {line}"));
+        app.key(Key::Enter);
+    }
+    let wheel = |app: &mut Fixture, delta: f32| {
+        app.harness
+            .input_mut()
+            .events
+            .push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta),
+                phase: egui::TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            });
+        app.wait(0.5);
+    };
+    let before = app
+        .mail()
+        .thread()
+        .map(|thread| thread.scroll())
+        .expect("the thread is open");
+    assert!(before > 40.0, "the thread scrolled to the reply ({before})");
+    // The body scrolls up to its top first, then the wheel goes on to the thread.
+    app.hover(egui::pos2(400.0, 400.0));
+    wheel(&mut app, 5000.0);
+    let after = app.mail().thread().map(|thread| thread.scroll());
+    assert!(
+        after.is_some_and(|after| after < before - 40.0),
+        "the thread scrolled up and stayed ({before} → {after:?}), though the reply still has the keyboard"
+    );
+}
+
+#[test]
 fn a_header_past_300px_scrolls_its_recipients_and_leaves_room_for_the_body() {
     let mut app = start("compose-many-recipients");
     app.press(Key::C, Modifiers::SHIFT);

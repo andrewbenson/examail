@@ -211,6 +211,9 @@ pub struct ThreadView {
     reveal_draft: Option<String>,
     /// Whether the draft being typed in showed when last looked at.
     draft_was_in_view: bool,
+    /// Where the bottom of the draft being typed in was last frame, so the thread follows it only
+    /// as it grows. `-∞` while no draft has the keyboard.
+    draft_bottom: f32,
     /// Scroll to the end once everything is measured (a reply was just sent).
     reveal_end: bool,
     /// The message column's visible height and the content's, from the last frame.
@@ -334,6 +337,7 @@ impl ThreadView {
             wanted: None,
             reveal_draft: None,
             draft_was_in_view: false,
+            draft_bottom: f32::NEG_INFINITY,
             reveal_end: false,
             viewport: 0.0,
             content: 0.0,
@@ -1495,7 +1499,9 @@ impl ThreadView {
         if let Some((id, top)) = anchored {
             self.scroll_to_anchor(ui, &layout, &id, top, bodies);
         }
-        if typing && self.animation.is_none() {
+        if !typing {
+            self.draft_bottom = f32::NEG_INFINITY;
+        } else if self.animation.is_none() {
             self.keep_draft_in_view(&draft_heights);
         }
         // When the draft being typed in scrolls away, suggest popping it out.
@@ -2351,6 +2357,8 @@ impl ThreadView {
     }
 
     /// Keeps the focused draft's bottom 28px above the messages' bottom.
+    /// Scrolls so the bottom of the draft being typed in stays in view as it grows. Only as it
+    /// grows: the wheel can still scroll the thread up to read what the reply answers.
     fn keep_draft_in_view(&mut self, drafts: &HashMap<String, f32>) {
         let bottom = self
             .items
@@ -2359,7 +2367,12 @@ impl ThreadView {
             .filter(|(item, _)| drafts.get(&item.id).is_some_and(|height| *height > 0.0))
             .map(|(_, (top, height))| top + height)
             .fold(f32::NEG_INFINITY, f32::max);
-        if bottom.is_finite() && bottom > self.scroll + self.viewport - DRAFT_MARGIN_BOTTOM {
+        let grew = bottom > self.draft_bottom + 0.5;
+        self.draft_bottom = bottom;
+        if grew
+            && bottom.is_finite()
+            && bottom > self.scroll + self.viewport - DRAFT_MARGIN_BOTTOM
+        {
             self.scroll = self.clamp_scroll(bottom - self.viewport + DRAFT_MARGIN_BOTTOM);
         }
     }
