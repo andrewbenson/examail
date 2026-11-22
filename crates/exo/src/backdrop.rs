@@ -93,8 +93,8 @@ fn index(now: &Zoned) -> usize {
     day.rem_euclid(PHOTOS.len() as i64) as usize
 }
 
-/// Where the photos are, which is `Contents/Resources/inbox-zero` in `Exo.app` (`fastlane
-/// build`), or else `assets/inbox-zero` in the checkout.
+/// Where the photos are, which is `Contents/Resources/inbox-zero` in `Exo.app` (`cargo
+/// xtask build`), or else `assets/inbox-zero` in the checkout.
 fn photos_dir() -> PathBuf {
     let bundled = std::env::current_exe()
         .ok()

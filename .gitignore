@@ -7,8 +7,7 @@ __pycache__/
 client_secret*.json
 *oauth-client*.json
 
-# Signing material never enters the repo. fastlane match keeps the certificate, and CI's secrets
-# keep the rest.
+# Signing material never enters the repo. CI's secrets keep it.
 *.p8
 *.p12
 *.cer
@@ -16,7 +15,3 @@ client_secret*.json
 *.mobileprovision
 *.keychain-db
 .env*
-# What fastlane writes beside its files.
-fastlane/report.xml
-fastlane/README.md
-fastlane/test_output/

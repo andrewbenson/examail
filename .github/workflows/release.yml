@@ -22,19 +22,11 @@ jobs:
     environment: release
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
-      FASTLANE_OPT_OUT_USAGE: '1'
-      FASTLANE_SKIP_UPDATE_CHECK: '1'
     steps:
       - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
 
-      - uses: ruby/setup-ruby@v1.343.0
-        with:
-          bundler-cache: true
-
-      # Before fastlane, so rustup's messages about installing it don't end up in the output
-      # fastlane parses.
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal
 
@@ -48,7 +40,7 @@ jobs:
           APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_KEY_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}
           APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-        run: bundle exec fastlane release
+        run: cargo xtask release
 
       - uses: actions/upload-artifact@v7.0.2
         with:

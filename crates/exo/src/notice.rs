@@ -138,7 +138,7 @@ pub(crate) fn register(
     }
 }
 
-/// Where Exo's third-party notices are, which is in `Exo.app`'s resources (`fastlane build`), or
+/// Where Exo's third-party notices are, which is in `Exo.app`'s resources (`cargo xtask build`), or
 /// else in the checkout.
 fn notices() -> std::path::PathBuf {
     let bundled = std::env::current_exe().ok().and_then(|exe| {

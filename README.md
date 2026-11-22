@@ -44,11 +44,10 @@ If you untick any of them on Google's screen, sign-in fails.
 
 ## Building from source
 
-You'll need Rust 1.98 or later, Xcode 27 and Ruby 4.0 with Bundler.
+You'll need Rust 1.98 or later and Xcode 27.
 
 ```sh
-bundle install
-bundle exec fastlane build
+cargo xtask build
 open target/release/Examail.app
 ```
 

@@ -130,7 +130,7 @@ const SELECT_ALL_HINT_TOAST_BOTTOM: f32 = 72.0;
 const STATUS_BAR_TOAST_BOTTOM: f32 = 64.0;
 
 /// Where Exo's images are (their `images` folder): `Exo.app`'s `Contents/Resources/assets`
-/// (`fastlane build`), else the checkout's `assets`. (Exo's fonts and icons are compiled in.)
+/// (`cargo xtask build`), else the checkout's `assets`. (Exo's fonts and icons are compiled in.)
 pub fn assets_dir() -> PathBuf {
     let bundled = std::env::current_exe()
         .ok()
