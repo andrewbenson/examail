@@ -897,7 +897,8 @@ impl Mail {
                 .position(|tab| tab.list == *self.split_highlight.as_ref().unwrap_or(&self.list))
                 .unwrap_or_default(),
             tabs,
-            add_split: splits::shows_add_split(settings, &self.list, self.joined(), &self.now),
+            // Examail adds splits from Split Inbox Settings (the header's gear), not a header button.
+            add_split: false,
             inbox,
             more: current && self.snapshot.more,
             loading: !current || self.snapshot.loading,

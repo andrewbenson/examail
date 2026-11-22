@@ -188,27 +188,6 @@ pub fn step(tabs: &[Tab], current: &ListId, step: isize) -> Option<ListId> {
     tabs.get(next).map(|tab| tab.list.clone())
 }
 
-/// Whether the header shows Add Split. It shows in an inbox view until a split is first turned
-/// on, and not once the account `joined` (first signed in to Exo) over a week before `now`. With
-/// no join date, it shows.
-pub fn shows_add_split(
-    settings: &Settings,
-    current: &ListId,
-    joined: Option<jiff::Timestamp>,
-    now: &jiff::Zoned,
-) -> bool {
-    let week_on = joined.and_then(|joined| {
-        joined
-            .to_zoned(now.time_zone().clone())
-            .checked_add(jiff::Span::new().days(7))
-            .ok()
-    });
-    let member_longer = week_on.is_some_and(|week_on| *now > week_on);
-    is_inbox_view(current)
-        && !member_longer
-        && settings.splits_engagement.first_split_enabled_at.is_none()
-}
-
 /// Where Tab and ⇧Tab switch splits: the list and its header.
 const TAB_REGIONS: &[Region] = &[Region::ThreadListHeader, Region::ThreadList];
 /// Where the palette's split rows are offered: the list and thread regions.
@@ -361,53 +340,6 @@ mod tests {
         assert_eq!(label(12, false).as_deref(), Some("12+"));
         assert_eq!(label(999, false).as_deref(), Some("999+"));
         assert_eq!(label(1000, true), None);
-    }
-
-    #[test]
-    fn add_split_shows_in_the_inbox_for_an_accounts_first_week() {
-        let settings = Settings::default();
-        let now: jiff::Zoned = "2026-11-19T10:00[America/New_York]"
-            .parse()
-            .expect("a time");
-        let joined = |at: &str| Some(at.parse::<jiff::Zoned>().expect("a time").timestamp());
-        assert!(
-            shows_add_split(&settings, &ListId::Important, None, &now),
-            "no join date"
-        );
-        assert!(
-            shows_add_split(
-                &settings,
-                &ListId::Important,
-                joined("2026-11-12T10:00[America/New_York]"),
-                &now
-            ),
-            "a week to the minute"
-        );
-        assert!(
-            !shows_add_split(
-                &settings,
-                &ListId::Important,
-                joined("2026-11-12T09:59[America/New_York]"),
-                &now
-            ),
-            "over a week"
-        );
-        assert!(
-            !shows_add_split(
-                &settings,
-                &ListId::Done,
-                joined("2026-11-18T10:00[America/New_York]"),
-                &now
-            ),
-            "not an inbox view"
-        );
-    }
-
-    fn names(tabs: &[Tab]) -> Vec<(&str, bool)> {
-        tabs.iter()
-            .filter(|tab| !tab.hidden)
-            .map(|tab| (tab.name.as_str(), tab.bullet))
-            .collect()
     }
 
     #[test]
