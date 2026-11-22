@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cuts a release: sets Exo's version, commits it on main, tags it vX.Y.Z and pushes both. The tag
+# Cuts a release: sets Examail's version, commits it on main, tags it vX.Y.Z and pushes both. The tag
 # starts .github/workflows/release.yml, which builds, signs, notarizes and publishes it.
 #
 #   scripts/release 0.3.0
@@ -27,6 +27,6 @@ cargo update --workspace --offline --quiet
 
 git commit --quiet -am "release v$version"
 trap - ERR
-git tag -a "v$version" -m "Exo v$version"
+git tag --sign "v$version" -m "Examail v$version"
 git push --quiet --atomic origin main "v$version"
 echo "Pushed v$version. Watch it: gh run watch \$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
