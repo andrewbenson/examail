@@ -342,6 +342,13 @@ mod tests {
         assert_eq!(label(1000, true), None);
     }
 
+    fn names(tabs: &[Tab]) -> Vec<(&str, bool)> {
+        tabs.iter()
+            .filter(|tab| !tab.hidden)
+            .map(|tab| (tab.name.as_str(), tab.bullet))
+            .collect()
+    }
+
     #[test]
     fn tabs_follow_the_accounts_order() {
         let mut settings = Settings::default();
