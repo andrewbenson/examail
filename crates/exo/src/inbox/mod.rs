@@ -38,12 +38,13 @@ const SEPARATOR_HEIGHT: f32 = 48.0;
 const LIST_PADDING_TOP: f32 = 2.0;
 /// The list's side padding.
 const VIEW_PADDING_X: f32 = 6.0;
-/// A dismissed row slides out over 200ms and is gone at the removal timer's first tick, 550ms
-/// after it started.
-const LEAVE_SLIDE: f32 = 0.2;
+/// A dismissed row slides out over 140ms. Its slot closes from 80ms to 200ms, so the rows below
+/// glide up into it rather than jumping, and the row is gone at 200ms, with nothing left to move.
+const LEAVE_SLIDE: f32 = 0.14;
 const LEAVE_CURVE: CubicBezier = CubicBezier::new(0.525, 0.0825, 0.215, 1.18);
-const LEAVE_HIDDEN: f64 = 0.4;
-const LEAVE_REMOVED: f64 = 0.55;
+const LEAVE_COLLAPSE_START: f32 = 0.08;
+const LEAVE_COLLAPSE: f32 = 0.12;
+const LEAVE_REMOVED: f64 = 0.2;
 /// A row brought back mid-slide (undo) slides back in over 400ms on the same curve.
 const RETURN_SLIDE: f32 = 0.4;
 /// The list asks for more rows when its end is this close below the visible area.
@@ -266,6 +267,8 @@ pub struct Inbox {
     covered: Option<Rect>,
     /// Dismissed threads and when they started leaving (egui time).
     leaving: Vec<(ThreadSummary, f64)>,
+    /// The frame's time, from [`Self::settle`], which sizes the slots of leaving rows.
+    clock: f64,
     /// Threads sliding back in, from how far out (0–1 of the row's width) and since when.
     returning: Vec<(ThreadSummary, f32, f64)>,
     scroll: f32,
@@ -451,6 +454,7 @@ impl Inbox {
             popout_focused: false,
             covered: None,
             leaving: Vec::new(),
+            clock: 0.0,
             returning: Vec::new(),
             scroll: 0.0,
             viewport: 0.0,
@@ -815,11 +819,22 @@ impl Inbox {
     fn item_height(&self, item: &Item) -> f32 {
         match item {
             Item::Separator(_) => SEPARATOR_HEIGHT,
-            Item::Thread(at) => self
-                .threads
-                .get(*at)
-                .map_or(ROW_HEIGHT, |thread| self.row_height(thread)),
+            Item::Thread(at) => self.threads.get(*at).map_or(ROW_HEIGHT, |thread| {
+                self.row_height(thread) * (1.0 - self.collapsed(&thread.id))
+            }),
         }
+    }
+
+    /// How far a leaving row's slot has closed, 0–1 (0 for a row that isn't leaving).
+    fn collapsed(&self, id: &str) -> f32 {
+        self.leaving
+            .iter()
+            .find(|(leaving, _)| leaving.id == id)
+            .map_or(0.0, |(_, started)| {
+                let t = (((self.clock - started) as f32 - LEAVE_COLLAPSE_START) / LEAVE_COLLAPSE)
+                    .clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            })
     }
 
     /// Selects or unselects the cursor's thread (X).
@@ -1272,6 +1287,7 @@ impl Inbox {
     /// Drops rows whose slide-out finished, and slide-ins that finished. Call once a frame,
     /// before asking about the rows.
     pub fn settle(&mut self, now: f64) {
+        self.clock = now;
         self.returning
             .retain(|(_, _, started)| now - started < f64::from(RETURN_SLIDE));
         let departed: Vec<String> = self
@@ -1679,7 +1695,7 @@ impl Inbox {
                         .iter()
                         .find(|(leaving, _)| leaving.id == thread.id)
                         .map(|(_, started)| now - started);
-                    if elapsed.is_some_and(|elapsed| elapsed >= LEAVE_HIDDEN) {
+                    if elapsed.is_some_and(|elapsed| elapsed >= LEAVE_REMOVED) {
                         continue;
                     }
                     // Leaving slides the row its full width to the left; returning slides it back.
@@ -1715,10 +1731,16 @@ impl Inbox {
                         ui.id().with(("thread-row", &thread.id)),
                         Sense::click(),
                     );
+                    // A leaving row keeps its full height, cut off by its closing slot.
+                    let full = Rect::from_min_size(
+                        item_rect.min,
+                        vec2(item_rect.width(), self.row_height(thread)),
+                    );
+                    let slot = painter.with_clip_rect(painter.clip_rect().intersect(item_rect));
                     let hit = row::paint(
                         ui,
-                        &painter,
-                        item_rect.translate(vec2(shift, 0.0)),
+                        if elapsed.is_some() { &slot } else { &painter },
+                        full.translate(vec2(shift, 0.0)),
                         geometry,
                         thread,
                         &state,
