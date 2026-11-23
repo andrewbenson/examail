@@ -67,12 +67,16 @@ impl<E: Into<anyhow::Error>> From<E> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        if self.0.is_server_error() {
+        // A server error's detail can quote Firestore, KMS or Google, so it stays in the log. A
+        // client error's message is one of this file's own.
+        let message = if self.0.is_server_error() {
             log::error!("{:#}", self.1);
+            "internal error".to_owned()
         } else {
             log::info!("{}: {:#}", self.0, self.1);
-        }
-        (self.0, Json(json!({ "error": format!("{:#}", self.1) }))).into_response()
+            format!("{:#}", self.1)
+        };
+        (self.0, Json(json!({ "error": message }))).into_response()
     }
 }
 
@@ -82,7 +86,11 @@ async fn identify(app: &App, headers: &HeaderMap) -> Result<Identity> {
     app.iap
         .identify(headers)
         .await
-        .map_err(|error| Error::new(StatusCode::UNAUTHORIZED, error))
+        .map_err(|error| {
+            // Why it failed is for the log; the caller only learns it isn't signed in.
+            log::info!("refused an IAP assertion: {error:#}");
+            Error::new(StatusCode::UNAUTHORIZED, anyhow!("not signed in"))
+        })
 }
 
 /// The caller's identity, after checking the device token is theirs.
