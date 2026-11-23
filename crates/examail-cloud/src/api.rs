@@ -387,8 +387,8 @@ async fn put_job(
         Some(existing) if existing.status == crate::jobs::Status::Pending => {
             job.attempts = existing.attempts;
         }
-        Some(_) => {}
-        None => {
+        // A new job, or a finished one set for a new time: either adds one waiting.
+        Some(_) | None => {
             let pending = app
                 .store
                 .jobs(&identity.sub)
@@ -396,6 +396,8 @@ async fn put_job(
                 .into_iter()
                 .filter(|job| job.status == crate::jobs::Status::Pending)
                 .count();
+            // Counted, not enforced atomically: two requests at once may both pass at the limit,
+            // which only an account's own Macs, behind IAP, can do.
             if pending >= crate::jobs::MOST_PENDING {
                 return Err(Error::new(
                     StatusCode::TOO_MANY_REQUESTS,
