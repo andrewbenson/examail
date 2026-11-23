@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::firestore::{Firestore, Precondition};
+use crate::jobs::{self, Job};
 
 const ACCOUNTS: &str = "accounts";
 const GRANTS: &str = "grants";
@@ -53,6 +54,34 @@ impl Store {
         Self { db }
     }
 
+    /// The database itself, for what's queried rather than looked up ([`crate::jobs`]).
+    pub fn db(&self) -> &Firestore {
+        &self.db
+    }
+
+    pub async fn job(&self, id: &str) -> Result<Option<Job>> {
+        self.db.get(jobs::COLLECTION, id).await
+    }
+
+    pub async fn put_job(&self, id: &str, job: &Job) -> Result<()> {
+        Ok(self.db.set(jobs::COLLECTION, id, job, Precondition::None).await?)
+    }
+
+    pub async fn delete_job(&self, id: &str) -> Result<()> {
+        self.db.delete(jobs::COLLECTION, id).await
+    }
+
+    /// `sub`'s jobs, finished or not.
+    pub async fn jobs(&self, sub: &str) -> Result<Vec<Job>> {
+        Ok(self
+            .db
+            .where_eq(jobs::COLLECTION, "sub", &serde_json::Value::from(sub))
+            .await?
+            .into_iter()
+            .map(|(_, job)| job)
+            .collect())
+    }
+
     pub async fn account(&self, sub: &str) -> Result<Option<Account>> {
         self.db.get(ACCOUNTS, sub).await
     }
@@ -92,8 +121,15 @@ impl Store {
         Ok(connect)
     }
 
-    /// Forgets everything about `sub`: its account, grant and devices.
+    /// Forgets everything about `sub`: its account, grant, devices and jobs.
     pub async fn forget(&self, sub: &str) -> Result<()> {
+        for job in self
+            .db
+            .ids_where(jobs::COLLECTION, "sub", &serde_json::Value::from(sub))
+            .await?
+        {
+            self.db.delete(jobs::COLLECTION, &job).await?;
+        }
         for device in self
             .db
             .ids_where(DEVICES, "sub", &serde_json::Value::from(sub))

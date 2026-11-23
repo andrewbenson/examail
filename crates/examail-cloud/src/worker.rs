@@ -1,7 +1,7 @@
 //! `relay-worker`: what Google's own services call. Cloud Run lets only the Cloud Scheduler
 //! and Pub/Sub service accounts invoke it, so these routes check nothing themselves.
 //!
-//! - `POST /internal/tick`, every minute from Cloud Scheduler: fires due jobs (phase 2).
+//! - `POST /internal/tick`, every minute from Cloud Scheduler: fires due jobs ([`crate::jobs`]).
 //! - `POST /hooks/gmail`, from the Gmail push subscription: new mail (phase 4).
 
 use std::sync::Arc;
@@ -19,9 +19,19 @@ pub fn router(app: Arc<App>) -> axum::Router {
         .with_state(app)
 }
 
-async fn tick() -> StatusCode {
-    log::debug!("tick");
-    StatusCode::NO_CONTENT
+async fn tick(axum::extract::State(app): axum::extract::State<Arc<App>>) -> StatusCode {
+    match crate::jobs::tick(&app).await {
+        Ok(0) => StatusCode::NO_CONTENT,
+        Ok(finished) => {
+            log::info!("tick finished {finished} jobs");
+            StatusCode::NO_CONTENT
+        }
+        // Cloud Scheduler logs the failure; the next tick tries again.
+        Err(error) => {
+            log::error!("tick: {error:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 async fn gmail(body: axum::body::Bytes) -> StatusCode {

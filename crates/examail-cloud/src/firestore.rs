@@ -18,6 +18,15 @@ pub struct Firestore {
     root: String,
 }
 
+/// A document a query found: its id, its fields as JSON, and when it was last written (for
+/// [`Firestore::set_if_unchanged`]).
+#[derive(Debug, Clone)]
+pub struct Document {
+    pub id: String,
+    pub fields: Value,
+    pub update_time: String,
+}
+
 /// Whether a write may make the document, replace it, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Precondition {
@@ -96,23 +105,107 @@ impl Firestore {
 
     /// The ids of the documents in `collection` whose `field` equals `value`.
     pub async fn ids_where(&self, collection: &str, field: &str, value: &Value) -> Result<Vec<String>> {
-        let query = json!({
-            "structuredQuery": {
-                "from": [{ "collectionId": collection }],
-                "where": { "fieldFilter": {
-                    "field": { "fieldPath": field },
-                    "op": "EQUAL",
-                    "value": encode(value)?,
-                } },
-                "select": { "fields": [{ "fieldPath": "__name__" }] },
+        let filter = json!({ "fieldFilter": {
+            "field": { "fieldPath": field },
+            "op": "EQUAL",
+            "value": encode(value)?,
+        } });
+        Ok(self
+            .query(collection, filter, None, None)
+            .await?
+            .into_iter()
+            .map(|document| document.id)
+            .collect())
+    }
+
+    /// The documents in `collection` whose `field` equals `value`.
+    pub async fn where_eq<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &Value,
+    ) -> Result<Vec<(String, T)>> {
+        let filter = json!({ "fieldFilter": {
+            "field": { "fieldPath": field },
+            "op": "EQUAL",
+            "value": encode(value)?,
+        } });
+        self.query(collection, filter, None, None)
+            .await?
+            .into_iter()
+            .map(|document| Ok((document.id, serde_json::from_value(document.fields)?)))
+            .collect()
+    }
+
+    /// Up to `limit` documents in `collection` whose `field` is at most `value`, lowest first.
+    /// One field's range needs only Firestore's automatic single-field index.
+    pub async fn at_most(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &Value,
+        limit: u32,
+    ) -> Result<Vec<Document>> {
+        let filter = json!({ "fieldFilter": {
+            "field": { "fieldPath": field },
+            "op": "LESS_THAN_OR_EQUAL",
+            "value": encode(value)?,
+        } });
+        self.query(collection, filter, Some(field), Some(limit)).await
+    }
+
+    /// Writes `value` as `collection/id` only if the document hasn't changed since it was read at
+    /// `update_time`. `false` when it had: another writer got there first.
+    pub async fn set_if_unchanged<T: Serialize>(
+        &self,
+        collection: &str,
+        id: &str,
+        value: &T,
+        update_time: &str,
+    ) -> Result<bool> {
+        let fields = encode_fields(&serde_json::to_value(value)?)?;
+        let time: String = url::form_urlencoded::byte_serialize(update_time.as_bytes()).collect();
+        let response = self
+            .request(
+                Method::PATCH,
+                &format!("{collection}/{id}?currentDocument.updateTime={time}"),
+                Some(json!({ "fields": fields })),
+            )
+            .await?;
+        if matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND) {
+            let text = response.text().await.unwrap_or_default();
+            if text.contains("FAILED_PRECONDITION") || text.contains("NOT_FOUND") {
+                return Ok(false);
             }
+            bail!("writing {collection}/{id}: {text}");
+        }
+        checked(response).await?;
+        Ok(true)
+    }
+
+    async fn query(
+        &self,
+        collection: &str,
+        filter: Value,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Document>> {
+        let mut query = json!({
+            "from": [{ "collectionId": collection }],
+            "where": filter,
         });
+        if let Some(field) = order_by {
+            query["orderBy"] = json!([{ "field": { "fieldPath": field }, "direction": "ASCENDING" }]);
+        }
+        if let Some(limit) = limit {
+            query["limit"] = json!(limit);
+        }
         let url = format!("https://firestore.googleapis.com/v1/{}:runQuery", self.root);
         let response = self
             .http
             .post(url)
             .bearer_auth(self.google.access_token().await?)
-            .json(&query)
+            .json(&json!({ "structuredQuery": query }))
             .send()
             .await
             .context("querying Firestore")?;
@@ -121,9 +214,14 @@ impl Firestore {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|row| row["document"]["name"].as_str())
-            .filter_map(|name| name.rsplit('/').next())
-            .map(str::to_owned)
+            .filter_map(|row| {
+                let document = &row["document"];
+                Some(Document {
+                    id: document["name"].as_str()?.rsplit('/').next()?.to_owned(),
+                    fields: decode_document(document),
+                    update_time: document["updateTime"].as_str()?.to_owned(),
+                })
+            })
             .collect())
     }
 

@@ -10,6 +10,9 @@
 //! | `DELETE /v1/devices/self` | app | Forgets this Mac |
 //! | `GET /v1/check` | app | Proves the grant still works by refreshing it |
 //! | `DELETE /v1/account` | app | Disconnect: revokes the grant and forgets the account |
+//! | `GET /v1/jobs` | app | The account's reminders and scheduled sends, and how each stands |
+//! | `PUT /v1/jobs/{key}` | app | Records a reminder or scheduled send, or replaces it ([`crate::jobs`]) |
+//! | `DELETE /v1/jobs/{key}` | app | Calls one off |
 
 use std::sync::Arc;
 
@@ -18,7 +21,8 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::extract::Path;
+use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -47,6 +51,8 @@ pub fn router(app: Arc<App>) -> axum::Router {
         .route("/v1/devices", post(add_device))
         .route("/v1/devices/self", delete(remove_device))
         .route("/v1/check", get(check))
+        .route("/v1/jobs", get(list_jobs))
+        .route("/v1/jobs/{key}", put(put_job).delete(delete_job))
         .with_state(app)
 }
 
@@ -124,7 +130,7 @@ async fn capabilities() -> Json<Value> {
     Json(json!({
         "version": API_VERSION,
         "service": env!("CARGO_PKG_VERSION"),
-        "features": ["connect", "devices"],
+        "features": ["connect", "devices", "jobs"],
     }))
 }
 
@@ -346,6 +352,52 @@ async fn disconnect(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<S
     }
     app.store.forget(&identity.sub).await?;
     log::info!("disconnected {}", identity.sub);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The account's jobs, so the app can learn what fired while it was closed.
+async fn list_jobs(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Json<Value>> {
+    let (identity, _) = identify_device(&app, &headers).await?;
+    let jobs = app.store.jobs(&identity.sub).await?;
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+/// Records `key`'s reminder or scheduled send, replacing what was there. A job that already
+/// finished isn't brought back by the app resending it.
+async fn put_job(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Json(request): Json<crate::jobs::Request>,
+) -> Result<Json<Value>> {
+    let (identity, _) = identify_device(&app, &headers).await?;
+    if !crate::jobs::valid_key(&key) {
+        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("a key is 1–200 of A–Z, a–z, 0–9, -, _, . and :")));
+    }
+    let id = crate::jobs::document_id(&identity.sub, &key);
+    let job = crate::jobs::Job::new(&identity.sub, &key, request);
+    if let Some(existing) = app.store.job(&id).await?
+        && existing.status != crate::jobs::Status::Pending
+        && existing.at == job.at
+    {
+        return Ok(Json(json!({ "job": existing })));
+    }
+    app.store.put_job(&id, &job).await?;
+    Ok(Json(json!({ "job": job })))
+}
+
+async fn delete_job(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<StatusCode> {
+    let (identity, _) = identify_device(&app, &headers).await?;
+    if !crate::jobs::valid_key(&key) {
+        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("not a job key")));
+    }
+    app.store
+        .delete_job(&crate::jobs::document_id(&identity.sub, &key))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
