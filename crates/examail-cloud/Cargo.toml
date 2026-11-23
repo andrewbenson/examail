@@ -1,0 +1,29 @@
+[package]
+name = "examail-cloud"
+description = "Examail Cloud: the service that runs Examail's reminders, scheduled sends and mail rules while the app is closed (Cloud Run)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+env_logger = { workspace = true }
+getrandom = { workspace = true }
+gmail = { workspace = true }
+jiff = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

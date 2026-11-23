@@ -15,3 +15,6 @@ client_secret*.json
 *.mobileprovision
 *.keychain-db
 .env*
+
+# Examail Cloud deploy target (project, region): kept out of the public repo.
+cloud/relay.env

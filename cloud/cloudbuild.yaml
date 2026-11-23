@@ -1,0 +1,8 @@
+# Builds Examail Cloud's image (cloud/Dockerfile) and pushes it. cloud/deploy submits it.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '--file', 'cloud/Dockerfile', '--tag', '${_IMAGE}', '.']
+images: ['${_IMAGE}']
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

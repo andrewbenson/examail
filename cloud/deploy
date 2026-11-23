@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Builds Examail Cloud's image and deploys both services.
+#
+#   cloud/deploy            build, then deploy relay-api and relay-worker
+#   cloud/deploy --no-build redeploy the last image (settings changes)
+#
+# Where it deploys comes from cloud/relay.env, which git ignores so the project and its URLs stay
+# out of the public repo:
+#
+#   PROJECT=my-project
+#   REGION=us-west1
+#
+# The project needs the Firestore database `relay`, the KMS key relay/refresh-tokens, the Artifact
+# Registry repository `relay`, and the service accounts relay-api and relay-worker (see
+# cloud/README.md). The OAuth client's id and secret come from Secret Manager
+# (relay-oauth-client-id, relay-oauth-client-secret) once they exist.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+# shellcheck source=/dev/null
+source cloud/relay.env
+: "${PROJECT:?set PROJECT in cloud/relay.env}" "${REGION:?set REGION in cloud/relay.env}"
+
+NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
+IMAGE="$REGION-docker.pkg.dev/$PROJECT/relay/relay:$(git rev-parse --short HEAD)$(git diff --quiet || echo -dirty)"
+LATEST="$REGION-docker.pkg.dev/$PROJECT/relay/relay:latest"
+API_URL="https://relay-api-$NUMBER.$REGION.run.app"
+
+if [[ "${1:-}" != --no-build ]]; then
+    gcloud builds submit --project "$PROJECT" --region "$REGION" \
+        --config cloud/cloudbuild.yaml --substitutions "_IMAGE=$IMAGE" .
+    gcloud artifacts docker tags add "$IMAGE" "$LATEST" --quiet
+else
+    IMAGE=$LATEST
+fi
+
+COMMON=(
+    --project "$PROJECT" --region "$REGION" --image "$IMAGE" --quiet
+    --no-allow-unauthenticated --cpu 1 --memory 256Mi --max-instances 3
+)
+ENV="PROJECT_ID=$PROJECT,FIRESTORE_DATABASE=relay,KMS_KEY=projects/$PROJECT/locations/$REGION/keyRings/relay/cryptoKeys/refresh-tokens"
+
+secrets=()
+if gcloud secrets describe relay-oauth-client-secret --project "$PROJECT" >/dev/null 2>&1; then
+    secrets=(--set-secrets "OAUTH_CLIENT_ID=relay-oauth-client-id:latest,OAUTH_CLIENT_SECRET=relay-oauth-client-secret:latest")
+fi
+
+gcloud run deploy relay-api "${COMMON[@]}" ${secrets[@]+"${secrets[@]}"} \
+    --service-account "relay-api@$PROJECT.iam.gserviceaccount.com" \
+    --iap \
+    --set-env-vars "$ENV,ROLE=api,PUBLIC_URL=$API_URL,IAP_AUDIENCE=/projects/$NUMBER/locations/$REGION/services/relay-api"
+
+gcloud run deploy relay-worker "${COMMON[@]}" ${secrets[@]+"${secrets[@]}"} \
+    --service-account "relay-worker@$PROJECT.iam.gserviceaccount.com" \
+    --set-env-vars "$ENV,ROLE=worker"
+
+echo "relay-api:    $API_URL"
+echo "relay-worker: $(gcloud run services describe relay-worker --project "$PROJECT" --region "$REGION" --format='value(status.url)')"

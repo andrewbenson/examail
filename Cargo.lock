@@ -2274,6 +2274,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "examail-cloud"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "env_logger",
+ "getrandom 0.3.4",
+ "gmail",
+ "jiff",
+ "log",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "url",
+]
+
+[[package]]
 name = "exo"
 version = "0.3.2"
 dependencies = [
