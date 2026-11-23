@@ -35,6 +35,10 @@ const ATTEMPTS: u32 = 5;
 const LATE_SEND: SignedDuration = SignedDuration::from_hours(24);
 /// How many jobs one tick takes on.
 const BATCH: u32 = 50;
+/// How many jobs an account may have waiting, so one can't fill the queue.
+pub const MOST_PENDING: usize = 1_000;
+/// How far ahead a job may be set.
+const FURTHEST: SignedDuration = SignedDuration::from_hours(5 * 366 * 24);
 
 const INBOX: &str = "INBOX";
 const SENT: &str = "SENT";
@@ -147,6 +151,18 @@ impl Job {
     }
 }
 
+/// Why `request` can't be a job at `now`, if it can't: due more than a day ago (the app fires
+/// those itself), or further ahead than [`FURTHEST`].
+pub fn refuse(request: &Request, now: Timestamp) -> Option<&'static str> {
+    if now.duration_since(request.at) > SignedDuration::from_hours(24) {
+        Some("it was due more than a day ago")
+    } else if request.at.duration_since(now) > FURTHEST {
+        Some("it's more than five years away")
+    } else {
+        None
+    }
+}
+
 /// The document id of `sub`'s job `key`.
 pub fn document_id(sub: &str, key: &str) -> String {
     format!("{sub}:{key}")
@@ -245,7 +261,8 @@ pub fn plan(job: &Job, thread: Option<&[Seen]>, now: Timestamp) -> Plan {
     }
 }
 
-/// Fires the jobs that are due. Returns how many it finished.
+/// Fires the jobs that are due. Returns how many it finished. One job's or account's trouble is
+/// logged and left for a later tick, never stopping the others.
 pub async fn tick(app: &App) -> Result<usize> {
     let now = Timestamp::now();
     let due = app
@@ -254,47 +271,79 @@ pub async fn tick(app: &App) -> Result<usize> {
         .at_most(COLLECTION, "due", &serde_json::Value::from(stamp(now)), BATCH)
         .await?;
     let mut finished = 0;
+    // Each account's Gmail, made once a tick; `None` for one that can't be acted for now.
     let mut accounts: HashMap<String, Option<gmail::Client>> = HashMap::new();
     for document in due {
-        let Some(mut job) = claim(app, &document, now).await? else {
-            continue;
-        };
-        if job.status != Status::Pending {
-            finished += 1;
-            continue;
-        }
-        let gmail = match accounts.get(&job.sub) {
-            Some(gmail) => gmail.clone(),
-            None => {
-                let gmail = account_gmail(app, &job.sub).await?;
-                accounts.insert(job.sub.clone(), gmail.clone());
-                gmail
-            }
-        };
-        let Some(gmail) = gmail else {
-            job.finish(Status::Failed, Some("the account isn't connected".into()), now);
-            app.store.put_job(&document.id, &job).await?;
-            finished += 1;
-            continue;
-        };
-        match fire(&gmail, &mut job, now).await {
-            Ok(()) => {
-                app.store.put_job(&document.id, &job).await?;
-                finished += 1;
-                log::info!("job {} {:?}", document.id, job.status);
-            }
-            // The lease runs out and a later tick tries again.
-            Err(error) => log::warn!("job {} attempt {}: {error:#}", document.id, job.attempts),
+        match run(app, &document, now, &mut accounts).await {
+            Ok(true) => finished += 1,
+            Ok(false) => {}
+            Err(error) => log::warn!("job {}: {error:#}", document.id),
         }
     }
     Ok(finished)
 }
 
+/// Claims and fires one due job. `true` when it finished.
+async fn run(
+    app: &App,
+    document: &Document,
+    now: Timestamp,
+    accounts: &mut HashMap<String, Option<gmail::Client>>,
+) -> Result<bool> {
+    let Some(mut job) = claim(app, document, now).await? else {
+        return Ok(false);
+    };
+    if job.status != Status::Pending {
+        return Ok(true);
+    }
+    let gmail = match accounts.get(&job.sub) {
+        Some(gmail) => gmail.clone(),
+        None => {
+            // An account whose grant can't be read or refreshed now waits out this tick, with
+            // its other jobs, rather than failing them.
+            let gmail = match account_gmail(app, &job.sub).await {
+                Ok(Some(gmail)) => Some(gmail),
+                Ok(None) => {
+                    job.finish(Status::Failed, Some("the account isn't connected".into()), now);
+                    app.store.put_job(&document.id, &job).await?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    accounts.insert(job.sub.clone(), None);
+                    return Err(error.context("acting for the account"));
+                }
+            };
+            accounts.insert(job.sub.clone(), gmail.clone());
+            gmail
+        }
+    };
+    let Some(gmail) = gmail else {
+        return Ok(false);
+    };
+    // The lease runs out and a later tick tries again.
+    fire(&gmail, &mut job, now)
+        .await
+        .with_context(|| format!("attempt {}", job.attempts))?;
+    app.store.put_job(&document.id, &job).await?;
+    log::info!("job {} {:?}", document.id, job.status);
+    Ok(true)
+}
+
 /// Takes `document` for this tick: its lease moves ahead and its attempts go up, or it's failed
 /// once it has run out of attempts. `None` when another tick took it first.
 async fn claim(app: &App, document: &Document, now: Timestamp) -> Result<Option<Job>> {
-    let mut job: Job = serde_json::from_value(document.fields.clone())
-        .with_context(|| format!("reading job {}", document.id))?;
+    let Ok(mut job) = serde_json::from_value::<Job>(document.fields.clone()) else {
+        // A job that doesn't read would be found first by every tick: take it off the queue.
+        log::error!("job {} doesn't read; taking it off the queue", document.id);
+        let mut fields = document.fields.clone();
+        fields["due"] = FINISHED.into();
+        fields["status"] = "failed".into();
+        app.store
+            .db()
+            .set_if_unchanged(COLLECTION, &document.id, &fields, &document.update_time)
+            .await?;
+        return Ok(None);
+    };
     if job.attempts >= ATTEMPTS {
         job.finish(Status::Failed, Some(format!("{ATTEMPTS} attempts failed")), now);
     } else {
@@ -549,6 +598,24 @@ mod tests {
         let later = stamp("2026-11-23T09:00:01Z".parse().unwrap());
         assert_eq!(early, "2026-11-23T09:00:00Z");
         assert!(early < later && later.as_str() < FINISHED);
+    }
+
+    #[test]
+    fn jobs_too_old_or_too_far_off_are_refused() {
+        let request = |at: &str| Request {
+            work: Work::Remind {
+                thread_id: "t1".into(),
+                snoozed_label: "s".into(),
+                reminded_label: "r".into(),
+            },
+            at: at.parse().unwrap(),
+            if_no_reply: false,
+            message_ids: Vec::new(),
+        };
+        let now = now();
+        assert_eq!(super::refuse(&request("2026-11-23T08:00:00Z"), now), None);
+        assert!(super::refuse(&request("2026-11-21T09:00:00Z"), now).is_some());
+        assert!(super::refuse(&request("2032-11-23T09:00:00Z"), now).is_some());
     }
 
     #[test]

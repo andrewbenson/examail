@@ -362,8 +362,7 @@ async fn list_jobs(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Js
     Ok(Json(json!({ "jobs": jobs })))
 }
 
-/// Records `key`'s reminder or scheduled send, replacing what was there. A job that already
-/// finished isn't brought back by the app resending it.
+/// Records `key`'s reminder or scheduled send, replacing what was there.
 async fn put_job(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -374,13 +373,36 @@ async fn put_job(
     if !crate::jobs::valid_key(&key) {
         return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("a key is 1–200 of A–Z, a–z, 0–9, -, _, . and :")));
     }
+    if let Some(why) = crate::jobs::refuse(&request, jiff::Timestamp::now()) {
+        return Err(Error::new(StatusCode::UNPROCESSABLE_ENTITY, anyhow!("{why}")));
+    }
     let id = crate::jobs::document_id(&identity.sub, &key);
-    let job = crate::jobs::Job::new(&identity.sub, &key, request);
-    if let Some(existing) = app.store.job(&id).await?
-        && existing.status != crate::jobs::Status::Pending
-        && existing.at == job.at
-    {
-        return Ok(Json(json!({ "job": existing })));
+    let mut job = crate::jobs::Job::new(&identity.sub, &key, request);
+    match app.store.job(&id).await? {
+        // A job that already finished isn't brought back by the app resending it.
+        Some(existing) if existing.status != crate::jobs::Status::Pending && existing.at == job.at => {
+            return Ok(Json(json!({ "job": existing })));
+        }
+        // Resending a waiting job keeps its attempts, so it can't be retried forever.
+        Some(existing) if existing.status == crate::jobs::Status::Pending => {
+            job.attempts = existing.attempts;
+        }
+        Some(_) => {}
+        None => {
+            let pending = app
+                .store
+                .jobs(&identity.sub)
+                .await?
+                .into_iter()
+                .filter(|job| job.status == crate::jobs::Status::Pending)
+                .count();
+            if pending >= crate::jobs::MOST_PENDING {
+                return Err(Error::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    anyhow!("an account may have {} jobs waiting", crate::jobs::MOST_PENDING),
+                ));
+            }
+        }
     }
     app.store.put_job(&id, &job).await?;
     Ok(Json(json!({ "job": job })))
