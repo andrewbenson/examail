@@ -37,6 +37,9 @@ struct State {
     /// The refresh token, or `None` once Google rejected it (or when there never was one).
     grant: Option<String>,
     access: Option<Access>,
+    /// The OpenID Connect ID token the last refresh came with, and when to stop using it. Only a
+    /// grant with `openid` gets one.
+    id: Option<Access>,
 }
 
 /// An access token and when to stop using it.
@@ -83,6 +86,7 @@ impl Tokens {
             state: Mutex::new(State {
                 grant,
                 access: None,
+                id: None,
             }),
             refreshing: tokio::sync::Mutex::new(()),
         }))
@@ -99,6 +103,36 @@ impl Tokens {
         let mut state = self.state();
         state.grant = Some(grant);
         state.access = Some(access);
+        // The old grant's ID token; the next one comes from the new grant.
+        state.id = None;
+    }
+
+    /// An OpenID Connect ID token for the account, whose audience is Examail's OAuth client:
+    /// what Examail Cloud's gateway (IAP) admits it by. `None` when the account's grant has no
+    /// `openid`, which signing in again adds.
+    ///
+    /// # Errors
+    /// As for an access token: [`Error::SignInAgain`] inside [`gmail::Error::Token`], or the
+    /// refresh's own.
+    pub async fn id_token(&self) -> Result<Option<String>, gmail::Error> {
+        if let Some(id) = self.usable_id() {
+            return Ok(Some(id));
+        }
+        {
+            // The next request refreshes, and a refresh brings a new ID token.
+            let mut state = self.state();
+            state.access = None;
+        }
+        self.access().await?;
+        Ok(self.usable_id())
+    }
+
+    fn usable_id(&self) -> Option<String> {
+        self.state()
+            .id
+            .as_ref()
+            .filter(|id| id.usable_at(Timestamp::now()))
+            .map(|id| id.token.clone())
     }
 
     /// The account was removed, so stop handing out tokens.
@@ -106,6 +140,7 @@ impl Tokens {
         let mut state = self.state();
         state.grant = None;
         state.access = None;
+        state.id = None;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -155,6 +190,10 @@ impl Tokens {
                         issued,
                         response.expires_in,
                     ));
+                    if let Some(id) = &response.id_token {
+                        let lifetime = expires_in(id, issued).unwrap_or(response.expires_in);
+                        state.id = Some(Access::new(id.clone(), issued, lifetime));
+                    }
                     Ok(response.access_token)
                 }
                 Err(gmail::Error::OAuth(error)) if error.error == "invalid_grant" => {
@@ -167,6 +206,20 @@ impl Tokens {
             };
         }
     }
+}
+
+/// How many seconds after `issued` ID token `token` expires, from its `exp` claim.
+fn expires_in(token: &str, issued: Timestamp) -> Option<u64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload.trim_end_matches('='))
+            .ok()?,
+    )
+    .ok()?;
+    let exp = claims["exp"].as_i64()?;
+    u64::try_from(exp - issued.as_second()).ok()
 }
 
 impl TokenProvider for Tokens {
@@ -189,6 +242,19 @@ impl TokenProvider for Tokens {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_tokens_lifetime_comes_from_its_exp() {
+        use base64::Engine as _;
+        let issued: Timestamp = "2026-11-17T14:00:00Z".parse().unwrap();
+        let claims = format!(r#"{{"exp":{}}}"#, issued.as_second() + 3600);
+        let token = format!(
+            "e30.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+        );
+        assert_eq!(expires_in(&token, issued), Some(3600));
+        assert_eq!(expires_in("not-a-jwt", issued), None);
+    }
 
     #[test]
     fn tokens_are_refreshed_five_minutes_before_they_expire() {

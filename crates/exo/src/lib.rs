@@ -19,6 +19,7 @@ mod calendar;
 mod chrome;
 pub mod clipboard;
 mod clock;
+pub mod cloud;
 mod command_nudge;
 mod commands;
 mod compose;

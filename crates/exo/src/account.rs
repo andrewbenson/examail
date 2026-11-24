@@ -1101,6 +1101,16 @@ impl Account {
             .replace(self.shared.next_undo.get() + 1)
     }
 
+    /// Hands the account's reminders and scheduled sends to Examail Cloud, and keeps them
+    /// there, while the account is open ([`crate::cloud`]).
+    pub fn start_cloud(&self, access: crate::cloud::Access) {
+        let loader = &self.shared.loader;
+        loader.restarts.spawn_task(
+            &loader.runtime,
+            crate::cloud::run(loader.store.clone(), access),
+        );
+    }
+
     /// Signs calendar accounts in with `auth` from now on, and reads the ones the settings list as
     /// signed in, with their grants. The first time, the grants come from the Keychain, which can
     /// block, as opening the mail's grant does. An account whose grant is gone is listed as signed

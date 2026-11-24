@@ -35,6 +35,7 @@ mod brands;
 mod bulk;
 mod bulk_log;
 mod calendar;
+mod cloud;
 mod connection;
 mod db;
 mod drafts;
@@ -74,6 +75,7 @@ pub use calendar::outbox::{
 };
 pub use calendar::recurrence::{End as RecurrenceEnd, Frequency, Nth, Recurrence};
 pub use calendar::{AccountCalendar, StoredEvent};
+pub use cloud::{CLOUD_GRACE, CloudJob, remind_key, send_key};
 pub use connection::{Connection, Debounce, Outage};
 pub use drafts::{
     Address, AttachmentSource, Draft, DraftAction, DraftAttachment, DraftFailure, DraftRecord,

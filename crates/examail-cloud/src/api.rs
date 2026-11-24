@@ -18,10 +18,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use axum::Json;
+use axum::extract::Path;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::extract::Path;
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -89,14 +89,11 @@ impl IntoResponse for Error {
 type Result<T> = std::result::Result<T, Error>;
 
 async fn identify(app: &App, headers: &HeaderMap) -> Result<Identity> {
-    app.iap
-        .identify(headers)
-        .await
-        .map_err(|error| {
-            // Why it failed is for the log; the caller only learns it isn't signed in.
-            log::info!("refused an IAP assertion: {error:#}");
-            Error::new(StatusCode::UNAUTHORIZED, anyhow!("not signed in"))
-        })
+    app.iap.identify(headers).await.map_err(|error| {
+        // Why it failed is for the log; the caller only learns it isn't signed in.
+        log::info!("refused an IAP assertion: {error:#}");
+        Error::new(StatusCode::UNAUTHORIZED, anyhow!("not signed in"))
+    })
 }
 
 /// The caller's identity, after checking the device token is theirs.
@@ -109,7 +106,10 @@ async fn identify_device(app: &App, headers: &HeaderMap) -> Result<(Identity, St
     let hash = token_hash(token);
     match app.store.device(&hash).await? {
         Some(device) if device.sub == identity.sub => Ok((identity, hash)),
-        _ => Err(Error::new(StatusCode::UNAUTHORIZED, anyhow!("unknown device token"))),
+        _ => Err(Error::new(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("unknown device token"),
+        )),
     }
 }
 
@@ -189,22 +189,30 @@ async fn callback(
 ) -> Result<Html<String>> {
     let identity = identify(&app, &headers).await?;
     if let Some(error) = callback.error {
-        return Ok(page("Examail Cloud isn't connected", &format!("Google said: {error}. You can close this tab and try again from Examail.")));
+        return Ok(page(
+            "Examail Cloud isn't connected",
+            &format!("Google said: {error}. You can close this tab and try again from Examail."),
+        ));
     }
     let (Some(code), Some(state)) = (callback.code, callback.state) else {
-        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("no code or state")));
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            anyhow!("no code or state"),
+        ));
     };
-    let connect = app
-        .store
-        .take_connect(&state)
-        .await?
-        .ok_or_else(|| Error::new(StatusCode::BAD_REQUEST, anyhow!("unknown or used consent")))?;
+    let connect =
+        app.store.take_connect(&state).await?.ok_or_else(|| {
+            Error::new(StatusCode::BAD_REQUEST, anyhow!("unknown or used consent"))
+        })?;
     let expired = connect
         .expires_at
         .parse::<jiff::Timestamp>()
         .map_or(true, |at| at < jiff::Timestamp::now());
     if connect.sub != identity.sub || expired {
-        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("the consent isn't this account's, or expired")));
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            anyhow!("the consent isn't this account's, or expired"),
+        ));
     }
     let tokens = app
         .google
@@ -222,7 +230,10 @@ async fn callback(
     if granted != identity.sub {
         return Ok(page(
             "That's a different Google account",
-            &format!("You're signed in to Examail Cloud as {}, but gave access to another account. Close this tab and connect again, choosing {}.", identity.email, identity.email),
+            &format!(
+                "You're signed in to Examail Cloud as {}, but gave access to another account. Close this tab and connect again, choosing {}.",
+                identity.email, identity.email
+            ),
         ));
     }
     let refresh = tokens
@@ -250,7 +261,10 @@ async fn callback(
     log::info!("connected {}", identity.sub);
     Ok(page(
         "Examail Cloud is connected",
-        &format!("{} is connected. You can close this tab and go back to Examail.", identity.email),
+        &format!(
+            "{} is connected. You can close this tab and go back to Examail.",
+            identity.email
+        ),
     ))
 }
 
@@ -294,7 +308,10 @@ async fn add_device(
         .await?
         .is_some_and(|account| account.status == "active");
     if !connected {
-        return Err(Error::new(StatusCode::CONFLICT, anyhow!("connect the account first")));
+        return Err(Error::new(
+            StatusCode::CONFLICT,
+            anyhow!("connect the account first"),
+        ));
     }
     let token = random_token();
     app.store
@@ -371,21 +388,36 @@ async fn put_job(
 ) -> Result<Json<Value>> {
     let (identity, _) = identify_device(&app, &headers).await?;
     if !crate::jobs::valid_key(&key) {
-        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("a key is 1–200 of A–Z, a–z, 0–9, -, _, . and :")));
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            anyhow!("a key is 1–200 of A–Z, a–z, 0–9, -, _, . and :"),
+        ));
     }
     if let Some(why) = crate::jobs::refuse(&request, jiff::Timestamp::now()) {
-        return Err(Error::new(StatusCode::UNPROCESSABLE_ENTITY, anyhow!("{why}")));
+        return Err(Error::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            anyhow!("{why}"),
+        ));
     }
     let id = crate::jobs::document_id(&identity.sub, &key);
     let mut job = crate::jobs::Job::new(&identity.sub, &key, request);
     match app.store.job(&id).await? {
         // A job that already finished isn't brought back by the app resending it.
-        Some(existing) if existing.status != crate::jobs::Status::Pending && existing.at == job.at => {
+        // (One whose draft changed since is a new send, though.)
+        Some(existing)
+            if existing.status != crate::jobs::Status::Pending
+                && existing.at == job.at
+                && job.work.same_as_kept(&existing.work) =>
+        {
             return Ok(Json(json!({ "job": existing })));
         }
         // Resending a waiting job keeps its attempts, so it can't be retried forever.
         Some(existing) if existing.status == crate::jobs::Status::Pending => {
             job.attempts = existing.attempts;
+            // The same send, whose draft a tick has dated since: keep the tick's message.
+            if job.work.same_as_kept(&existing.work) {
+                job.work = existing.work;
+            }
         }
         // A new job, or a finished one set for a new time: either adds one waiting.
         Some(_) | None => {
@@ -401,7 +433,10 @@ async fn put_job(
             if pending >= crate::jobs::MOST_PENDING {
                 return Err(Error::new(
                     StatusCode::TOO_MANY_REQUESTS,
-                    anyhow!("an account may have {} jobs waiting", crate::jobs::MOST_PENDING),
+                    anyhow!(
+                        "an account may have {} jobs waiting",
+                        crate::jobs::MOST_PENDING
+                    ),
                 ));
             }
         }
@@ -417,7 +452,10 @@ async fn delete_job(
 ) -> Result<StatusCode> {
     let (identity, _) = identify_device(&app, &headers).await?;
     if !crate::jobs::valid_key(&key) {
-        return Err(Error::new(StatusCode::BAD_REQUEST, anyhow!("not a job key")));
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            anyhow!("not a job key"),
+        ));
     }
     app.store
         .delete_job(&crate::jobs::document_id(&identity.sub, &key))
@@ -435,7 +473,10 @@ mod tests {
     #[test]
     fn an_id_tokens_sub_is_read() {
         let body = URL_SAFE_NO_PAD.encode(br#"{"sub":"1234","email":"me@example.com"}"#);
-        assert_eq!(id_token_sub(&format!("h.{body}.s")).as_deref(), Some("1234"));
+        assert_eq!(
+            id_token_sub(&format!("h.{body}.s")).as_deref(),
+            Some("1234")
+        );
         assert_eq!(id_token_sub("not a token"), None);
     }
 

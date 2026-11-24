@@ -38,7 +38,7 @@ pub use auth::Auth;
 pub use config::ClientConfig;
 pub use error::Error;
 #[cfg(target_os = "macos")]
-pub use secrets::Keychain;
+pub use secrets::{CloudKeychain, Keychain};
 pub use secrets::{MemorySecrets, SecretStore};
 pub use sign_in::TIMEOUT;
 pub use tokens::Tokens;
@@ -66,6 +66,9 @@ pub const SCOPES: &[&str] = &[
     scopes::USERINFO_EMAIL,
     // The account's name and photo, for the account switcher.
     scopes::USERINFO_PROFILE,
+    // An ID token for Examail Cloud, whose gateway admits the app by it. Scopes are checked only
+    // at sign-in, so an account signed in without it keeps working, without Examail Cloud.
+    scopes::OPENID,
 ];
 
 /// What a calendar account asks Google for: Calendar and the address only. A calendar account is

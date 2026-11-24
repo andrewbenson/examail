@@ -83,16 +83,23 @@ impl SecretStore for MemorySecrets {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Keychain;
 
+/// The login keychain's items for Examail Cloud: a device token per account, under the service
+/// `Examail Cloud device`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CloudKeychain;
+
 #[cfg(target_os = "macos")]
 mod keychain {
     use security_framework::passwords::{
         PasswordOptions, delete_generic_password, generic_password, set_generic_password,
     };
 
-    use super::{Keychain, SecretStore};
+    use super::{CloudKeychain, Keychain, SecretStore};
     use crate::Error;
 
     const SERVICE: &str = "Examail Google sign-in";
+    const CLOUD_SERVICE: &str = "Examail Cloud device";
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 
@@ -105,24 +112,50 @@ mod keychain {
         String::from_utf8(secret).map_err(|error| failed(error.utf8_error()))
     }
 
+    fn get(service: &str, account: &str) -> Result<Option<String>, Error> {
+        match generic_password(PasswordOptions::new_generic_password(service, account)) {
+            Ok(secret) => text(secret).map(Some),
+            Err(error) if error.code() == NOT_FOUND => Ok(None),
+            Err(error) => Err(failed(error)),
+        }
+    }
+
+    fn set(service: &str, account: &str, secret: &str) -> Result<(), Error> {
+        set_generic_password(service, account, secret.as_bytes()).map_err(failed)
+    }
+
+    fn delete(service: &str, account: &str) -> Result<(), Error> {
+        match delete_generic_password(service, account) {
+            Err(error) if error.code() != NOT_FOUND => Err(failed(error)),
+            _ => Ok(()),
+        }
+    }
+
     impl SecretStore for Keychain {
         fn get(&self, account: &str) -> Result<Option<String>, Error> {
-            match generic_password(PasswordOptions::new_generic_password(SERVICE, account)) {
-                Ok(secret) => text(secret).map(Some),
-                Err(error) if error.code() == NOT_FOUND => Ok(None),
-                Err(error) => Err(failed(error)),
-            }
+            get(SERVICE, account)
         }
 
         fn set(&self, account: &str, secret: &str) -> Result<(), Error> {
-            set_generic_password(SERVICE, account, secret.as_bytes()).map_err(failed)
+            set(SERVICE, account, secret)
         }
 
         fn delete(&self, account: &str) -> Result<(), Error> {
-            match delete_generic_password(SERVICE, account) {
-                Err(error) if error.code() != NOT_FOUND => Err(failed(error)),
-                _ => Ok(()),
-            }
+            delete(SERVICE, account)
+        }
+    }
+
+    impl SecretStore for CloudKeychain {
+        fn get(&self, account: &str) -> Result<Option<String>, Error> {
+            get(CLOUD_SERVICE, account)
+        }
+
+        fn set(&self, account: &str, secret: &str) -> Result<(), Error> {
+            set(CLOUD_SERVICE, account, secret)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), Error> {
+            delete(CLOUD_SERVICE, account)
         }
     }
 

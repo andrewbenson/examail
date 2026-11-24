@@ -63,7 +63,47 @@ pub enum Work {
         /// The message's `Message-ID`, to tell whether it already went (sent elsewhere, or an
         /// attempt whose answer was lost).
         rfc822_id: String,
+        /// The Gmail message the draft held when the app last wrote it. A draft holding another
+        /// (edited since, in Examail or in Gmail web) isn't sent: the job fails, and the app,
+        /// which knows the new version, sends the job again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        /// The message the app scheduled, once a tick has dated the draft afresh (a new message,
+        /// now `message_id`). The app resending the job with this one is resending the same job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dated_from: Option<String>,
     },
+}
+
+impl Work {
+    /// Whether `self`, as the app sends it, is `kept` as a tick has left it: the same, but for
+    /// the date a tick gave the draft.
+    pub fn same_as_kept(&self, kept: &Work) -> bool {
+        match (self, kept) {
+            (
+                Work::Send {
+                    thread_id,
+                    draft_id,
+                    rfc822_id,
+                    message_id: Some(scheduled),
+                    dated_from: None,
+                },
+                Work::Send {
+                    thread_id: kept_thread,
+                    draft_id: kept_draft,
+                    rfc822_id: kept_rfc822,
+                    dated_from: Some(from),
+                    ..
+                },
+            ) => {
+                thread_id == kept_thread
+                    && draft_id == kept_draft
+                    && rfc822_id == kept_rfc822
+                    && scheduled == from
+            }
+            _ => self == kept,
+        }
+    }
 }
 
 /// A job as the app sends it.
@@ -268,7 +308,12 @@ pub async fn tick(app: &App) -> Result<usize> {
     let due = app
         .store
         .db()
-        .at_most(COLLECTION, "due", &serde_json::Value::from(stamp(now)), BATCH)
+        .at_most(
+            COLLECTION,
+            "due",
+            &serde_json::Value::from(stamp(now)),
+            BATCH,
+        )
         .await?;
     let mut finished = 0;
     // Each account's Gmail, made once a tick; `None` for one that can't be acted for now.
@@ -304,7 +349,11 @@ async fn run(
             let gmail = match account_gmail(app, &job.sub).await {
                 Ok(Some(gmail)) => Some(gmail),
                 Ok(None) => {
-                    job.finish(Status::Failed, Some("the account isn't connected".into()), now);
+                    job.finish(
+                        Status::Failed,
+                        Some("the account isn't connected".into()),
+                        now,
+                    );
                     app.store.put_job(&document.id, &job).await?;
                     return Ok(true);
                 }
@@ -320,10 +369,15 @@ async fn run(
     let Some(gmail) = gmail else {
         return Ok(false);
     };
-    // The lease runs out and a later tick tries again.
-    fire(&gmail, &mut job, now)
-        .await
-        .with_context(|| format!("attempt {}", job.attempts))?;
+    // The lease runs out and a later tick tries again. What the attempt learned (the draft's
+    // new message, once dated) is kept for it.
+    let before = job.work.clone();
+    if let Err(error) = fire(&gmail, &mut job, now).await {
+        if job.work != before {
+            app.store.put_job(&document.id, &job).await?;
+        }
+        return Err(error.context(format!("attempt {}", job.attempts)));
+    }
     app.store.put_job(&document.id, &job).await?;
     log::info!("job {} {:?}", document.id, job.status);
     Ok(true)
@@ -345,7 +399,11 @@ async fn claim(app: &App, document: &Document, now: Timestamp) -> Result<Option<
         return Ok(None);
     };
     if job.attempts >= ATTEMPTS {
-        job.finish(Status::Failed, Some(format!("{ATTEMPTS} attempts failed")), now);
+        job.finish(
+            Status::Failed,
+            Some(format!("{ATTEMPTS} attempts failed")),
+            now,
+        );
     } else {
         job.attempts += 1;
         job.due = stamp(now.checked_add(LEASE)?);
@@ -416,17 +474,41 @@ async fn fire(gmail: &gmail::Client, job: &mut Job, now: Timestamp) -> Result<()
             let Work::Send {
                 draft_id,
                 rfc822_id,
+                message_id,
+                dated_from,
                 ..
-            } = &job.work
+            } = &mut job.work
             else {
                 unreachable!("only a send plans to send");
             };
-            let sent = match gmail.gmail().send_draft(draft_id).await {
-                Ok(message) => message.id,
-                // The draft is gone: sent from elsewhere, an attempt whose answer was lost, or
-                // deleted. Its message tells which.
-                Err(error) if not_found(&error) => sent_message(gmail, rfc822_id).await?,
-                Err(error) => return Err(error.into()),
+            let (draft_id, rfc822_id) = (draft_id.clone(), rfc822_id.clone());
+            let sent = match ready(gmail, &draft_id, message_id.as_deref(), now).await? {
+                Ready::Changed => {
+                    job.finish(
+                        Status::Failed,
+                        Some("the draft changed after it was scheduled".into()),
+                        now,
+                    );
+                    return Ok(());
+                }
+                Ready::Gone => sent_message(gmail, &rfc822_id).await?,
+                Ready::Yes(dated) => {
+                    // Dating the draft made it a new message: later attempts, and the app's
+                    // copy of the job, are checked against that one.
+                    if let Some(dated) = dated {
+                        if dated_from.is_none() {
+                            *dated_from = message_id.clone();
+                        }
+                        *message_id = Some(dated);
+                    }
+                    match gmail.gmail().send_draft(&draft_id).await {
+                        Ok(message) => message.id,
+                        // The draft is gone: sent from elsewhere, an attempt whose answer was
+                        // lost, or deleted. Its message tells which.
+                        Err(error) if not_found(&error) => sent_message(gmail, &rfc822_id).await?,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
             };
             match sent {
                 Some(id) => {
@@ -438,6 +520,86 @@ async fn fire(gmail: &gmail::Client, job: &mut Job, now: Timestamp) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Whether a scheduled draft can go as it is.
+enum Ready {
+    /// Yes, dated now: the new message dating made, if it made one.
+    Yes(Option<String>),
+    /// It holds another message than the one scheduled.
+    Changed,
+    /// It's gone.
+    Gone,
+}
+
+/// Readies draft `draft_id` to go at `now`: it must still hold `message_id` (when that's known),
+/// and its `Date:` becomes now, because Gmail sends a draft's date as written and recipients see
+/// it. Dating it is a new version of the draft, so it's checked first.
+async fn ready(
+    gmail: &gmail::Client,
+    draft_id: &str,
+    message_id: Option<&str>,
+    now: Timestamp,
+) -> Result<Ready> {
+    let draft = match gmail.gmail().draft(draft_id, gmail::Format::Raw).await {
+        Ok(draft) => draft,
+        Err(error) if not_found(&error) => return Ok(Ready::Gone),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(message) = draft.message else {
+        return Ok(Ready::Gone);
+    };
+    if message_id.is_some_and(|scheduled| message.id.as_deref() != Some(scheduled)) {
+        return Ok(Ready::Changed);
+    }
+    let Some(raw) = message.raw else {
+        return Ok(Ready::Yes(None));
+    };
+    let dated = redate(&raw, now);
+    match gmail
+        .gmail()
+        .update_draft(draft_id, dated, message.thread_id.as_deref())
+        .await
+    {
+        Ok(draft) => Ok(Ready::Yes(draft.message.and_then(|message| message.id))),
+        Err(error) if not_found(&error) => Ok(Ready::Gone),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `raw` with its `Date:` header (and any folded lines of it) replaced by one for `now`.
+pub fn redate(raw: &[u8], now: Timestamp) -> Vec<u8> {
+    let (head, body) = match find(raw, b"\r\n\r\n") {
+        Some(end) => (&raw[..end], &raw[end..]),
+        None => (raw, &b""[..]),
+    };
+    let date =
+        jiff::fmt::rfc2822::to_string(&now.to_zoned(jiff::tz::TimeZone::UTC)).unwrap_or_default();
+    let mut out = format!("Date: {date}").into_bytes();
+    let mut in_date = false;
+    for line in head.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let folded = line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t');
+        if folded && in_date {
+            continue;
+        }
+        in_date = !folded && line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"date:");
+        if in_date || line.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// The thread's messages and their labels, or `None` when it's gone.
@@ -508,6 +670,8 @@ mod tests {
                     thread_id: Some("t1".into()),
                     draft_id: "r-1".into(),
                     rfc822_id: "<x@example.com>".into(),
+                    message_id: Some("m9".into()),
+                    dated_from: None,
                 },
                 at: "2026-11-23T09:00:00Z".parse().unwrap(),
                 if_no_reply,
@@ -542,10 +706,17 @@ mod tests {
 
     #[test]
     fn a_reply_calls_off_an_if_no_reply_reminder_but_not_the_users_own_messages() {
-        let mine = [seen("m1", &[]), seen("m2", &["SENT"]), seen("m3", &["DRAFT"])];
+        let mine = [
+            seen("m1", &[]),
+            seen("m2", &["SENT"]),
+            seen("m3", &["DRAFT"]),
+        ];
         assert!(matches!(
             plan(&remind(true), Some(&mine), now()),
-            Plan::Labels { status: Status::Done, .. }
+            Plan::Labels {
+                status: Status::Done,
+                ..
+            }
         ));
         let replied = [seen("m1", &[]), seen("m4", &["INBOX"])];
         assert_eq!(
@@ -559,7 +730,10 @@ mod tests {
         // Without "if no reply", a reply changes nothing.
         assert!(matches!(
             plan(&remind(false), Some(&replied), now()),
-            Plan::Labels { status: Status::Done, .. }
+            Plan::Labels {
+                status: Status::Done,
+                ..
+            }
         ));
     }
 
@@ -616,6 +790,36 @@ mod tests {
         assert_eq!(super::refuse(&request("2026-11-23T08:00:00Z"), now), None);
         assert!(super::refuse(&request("2026-11-21T09:00:00Z"), now).is_some());
         assert!(super::refuse(&request("2032-11-23T09:00:00Z"), now).is_some());
+    }
+
+    #[test]
+    fn the_app_resending_a_dated_send_resends_the_same_job() {
+        let send = |message: &str, from: Option<&str>| Work::Send {
+            thread_id: Some("t1".into()),
+            draft_id: "r-1".into(),
+            rfc822_id: "x@example.com".into(),
+            message_id: Some(message.into()),
+            dated_from: from.map(str::to_owned),
+        };
+        let kept = send("m10", Some("m9"));
+        assert!(send("m9", None).same_as_kept(&kept));
+        assert!(!send("m11", None).same_as_kept(&kept));
+        assert!(send("m9", None).same_as_kept(&send("m9", None)));
+    }
+
+    #[test]
+    fn a_send_is_dated_when_it_goes() {
+        let raw = b"From: a@example.com\r\nDate: Mon, 2 Nov 2026 10:00:00 -0800\r\n (folded)\r\nSubject: Hi\r\n\r\nBody\r\nDate: in the body\r\n";
+        let dated = String::from_utf8(super::redate(raw, now())).unwrap();
+        assert_eq!(
+            dated,
+            "Date: Mon, 23 Nov 2026 09:00:30 +0000\r\nFrom: a@example.com\r\nSubject: Hi\r\n\r\nBody\r\nDate: in the body\r\n"
+        );
+        // A message without a date gets one.
+        let undated = String::from_utf8(super::redate(b"Subject: Hi\r\n\r\nBody", now())).unwrap();
+        assert!(
+            undated.starts_with("Date: Mon, 23 Nov 2026 09:00:30 +0000\r\nSubject: Hi\r\n\r\nBody")
+        );
     }
 
     #[test]

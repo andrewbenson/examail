@@ -108,7 +108,14 @@ impl Store {
     /// On database failures.
     pub async fn next_reminder(&self) -> Result<Option<Timestamp>> {
         let mut db = self.inner.db.clone();
-        Ok(waiting(&mut db).await?.iter().map(|row| row.at).min())
+        Ok(waiting(&mut db)
+            .await?
+            .iter()
+            .map(|row| {
+                self.inner
+                    .due_here(&crate::cloud::remind_key(&row.thread_id), row.at)
+            })
+            .min())
     }
 
     /// Brings back every thread whose reminder is due at `now`. The thread goes into the inbox,
@@ -128,19 +135,38 @@ impl Store {
         let rows = waiting(&mut db).await?;
         let ids: Vec<String> = rows.iter().map(|row| row.thread_id.clone()).collect();
         let views = crate::store::load_views(&mut db, &ids).await?;
-        let ends = |view: Option<&ThreadView>, at: Timestamp| match view
+        let due = |thread: &str, at: Timestamp| {
+            self.inner.due_here(&crate::cloud::remind_key(thread), at) <= now
+        };
+        let ends = |view: Option<&ThreadView>, thread: &str, at: Timestamp| match view
             .map(|view| view.reminder_status(me))
         {
             None | Some(Some(ReminderStatus::Aborted { .. })) => true,
-            Some(Some(ReminderStatus::Set { .. })) => at <= now,
+            Some(Some(ReminderStatus::Set { .. })) => due(thread, at),
             Some(_) => false,
         };
         if !rows
             .iter()
-            .any(|row| ends(views.get(&row.thread_id), row.at))
+            .any(|row| ends(views.get(&row.thread_id), &row.thread_id, row.at))
         {
             return Ok(Vec::new());
         }
+        // Handed-off reminders Exo is to do now, as the fallback: Gmail says whether Examail Cloud
+        // did them meanwhile. Asked before the write, which mustn't wait on Gmail.
+        let handed: Vec<String> = rows
+            .iter()
+            .filter(|row| {
+                self.inner
+                    .handed_off(&crate::cloud::remind_key(&row.thread_id))
+                    && due(&row.thread_id, row.at)
+            })
+            .map(|row| row.thread_id.clone())
+            .collect();
+        let (ended_in_gmail, asked) = if handed.is_empty() {
+            Default::default()
+        } else {
+            self.inner.ended_in_gmail(&handed).await
+        };
         let mut write = self.inner.begin(&mut db).await?;
         let mut rows = waiting(write.exec()).await?;
         rows.sort_by_key(|row| row.at);
@@ -155,14 +181,28 @@ impl Store {
                 aborted,
                 ..row.clone()
             };
+            let handed_off = self.inner.handed_off(&crate::cloud::remind_key(&view.id));
+            if handed_off && due(&view.id, row.at) {
+                if ended_in_gmail.contains(&view.id) {
+                    // Examail Cloud did it, or a reply called it off there: it only ends here.
+                    log::info!("Examail Cloud already ended the reminder on {}", view.id);
+                    restore(write.exec(), &view.id, None).await?;
+                    reindex(write.exec(), &view.id, &router).await?;
+                    changed = true;
+                    continue;
+                }
+                if !asked.contains(&view.id) {
+                    continue;
+                }
+            }
             let ended = match view.reminder_status(me) {
                 Some(ReminderStatus::Aborted { .. }) => Some(Some(take_label_off(true))),
                 Some(ReminderStatus::Set { at, .. })
-                    if at <= now && (view.has(SPAM) || view.has(TRASH)) =>
+                    if due(&view.id, at) && (view.has(SPAM) || view.has(TRASH)) =>
                 {
                     Some(None)
                 }
-                Some(ReminderStatus::Set { at, .. }) if at <= now => {
+                Some(ReminderStatus::Set { at, .. }) if due(&view.id, at) => {
                     let Some((forward, _)) = Mutation::ReturnFromReminder.plan(&view, me)? else {
                         continue;
                     };
@@ -444,7 +484,7 @@ pub(crate) async fn given(exec: &mut dyn Executor) -> Result<HashMap<String, Dra
 }
 
 /// The reminders that haven't brought their thread back or been cancelled by a reply.
-async fn waiting(exec: &mut dyn Executor) -> Result<Vec<ReminderRow>> {
+pub(crate) async fn waiting(exec: &mut dyn Executor) -> Result<Vec<ReminderRow>> {
     let mut rows = ReminderRow::all().exec(exec).await?;
     rows.retain(|row| row.fired_at.is_none() && !row.aborted);
     Ok(rows)

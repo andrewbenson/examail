@@ -878,7 +878,11 @@ impl Store {
         }
         // Held sends coming due.
         for row in DraftRow::all().exec(&mut db).await? {
-            if let Some(at) = row.send_at.filter(|at| *at > now && !row.discarded) {
+            if let Some(at) = row
+                .send_at
+                .map(|at| inner.due_here(&crate::cloud::send_key(&row.id), at))
+                .filter(|at| *at > now && !row.discarded)
+            {
                 report.retry_at = earliest(report.retry_at, at);
             }
         }
@@ -1061,7 +1065,7 @@ impl Inner {
             return self.delete_gmail_draft(row).await;
         }
         let mut row = row;
-        if row.send_at.is_some_and(|at| at <= now) && row.record.0.send_later.is_some() {
+        if self.send_due(&row, now) && row.record.0.send_later.is_some() {
             // A draft rewritten in Gmail web since Exo last wrote it goes as Gmail has it, edits
             // and all, rather than with Exo's copy written over them.
             let rewritten = if row.pushed >= row.revision {
@@ -1129,7 +1133,7 @@ impl Inner {
                 }
             }
         }
-        if row.send_at.is_some_and(|at| at <= now) {
+        if self.send_due(&row, now) {
             return self.send_gmail_draft(&row.id, now, report).await;
         }
         if row.failures > 0 {
@@ -1143,6 +1147,13 @@ impl Inner {
             write.commit().await?;
         }
         Ok(Ok(()))
+    }
+
+    /// Whether draft `row`'s scheduled send is Exo's to send at `now`: it's due, and when
+    /// Examail Cloud holds it, the wait for the service ([`crate::CLOUD_GRACE`]) is over.
+    pub(crate) fn send_due(&self, row: &DraftRow, now: Timestamp) -> bool {
+        row.send_at
+            .is_some_and(|at| self.due_here(&crate::cloud::send_key(&row.id), at) <= now)
     }
 
     /// Dates a scheduled send's message now, as it goes, rather than when Schedule was pressed,
@@ -1523,14 +1534,28 @@ impl Inner {
             return Ok(Ok(()));
         };
         // Taken back, held longer, discarded, or saved again (sent once Gmail has that version).
-        if row.discarded || row.pushed < row.revision || !row.send_at.is_some_and(|at| at <= now) {
+        if row.discarded || row.pushed < row.revision || !self.send_due(&row, now) {
             return Ok(Ok(()));
         }
         let Some(gmail_id) = row.gmail_id.clone() else {
             return Ok(Ok(()));
         };
+        // Examail Cloud may have sent it while Exo waited, and then it went and isn't sent again.
+        // Asked first, because its draft may still be there.
+        let mut sent_by_cloud = None;
+        if self.handed_off(&crate::cloud::send_key(&row.id)) {
+            match self.sent_message(&row.record.0.rfc822_id).await {
+                Ok(Some(message)) => {
+                    log::info!("Examail Cloud already sent draft {}", row.id);
+                    sent_by_cloud = Some(message);
+                }
+                Ok(None) => {}
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
         // A reply that sync hasn't brought in yet (Exo was closed, say) still calls the send off.
         match self.aborting_reply(&row).await {
+            _ if sent_by_cloud.is_some() => {}
             Ok(None) => {}
             Ok(Some(_)) => {
                 drop(sending);
@@ -1539,12 +1564,16 @@ impl Inner {
             }
             Err(failure) => return Ok(Err(failure)),
         }
-        let mut result = self
-            .api
-            .call(Lane::Act, SEND_ATTEMPTS, |gmail| {
-                gmail.send_draft(&gmail_id)
-            })
-            .await;
+        let mut result = match sent_by_cloud {
+            Some(message) => Ok(message),
+            None => {
+                self.api
+                    .call(Lane::Act, SEND_ATTEMPTS, |gmail| {
+                        gmail.send_draft(&gmail_id)
+                    })
+                    .await
+            }
+        };
         if result.as_ref().is_err_and(|failure| {
             failure.is_not_found() || matches!(failure, Failure::Transient(_))
         }) {

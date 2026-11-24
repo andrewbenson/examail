@@ -118,8 +118,12 @@ pub(crate) struct Inner {
     /// How to take back the reminder that each held send put on its thread this session, as undo
     /// send does.
     pub given: std::sync::Mutex<HashMap<String, crate::outbox::Undo>>,
+    /// The keys of the jobs Examail Cloud holds ([`crate::cloud`]).
+    pub handed_off: std::sync::RwLock<std::collections::HashSet<String>>,
     /// One held send's reminder given or taken back at a time, so none is given twice.
     pub giving: Mutex<()>,
+    /// [`Options::cloud_grace`].
+    pub cloud_grace: jiff::SignedDuration,
     /// [`Options::draft_pace`] and [`Options::draft_files_pace`].
     pub draft_pace: Duration,
     pub draft_files_pace: Duration,
@@ -143,6 +147,9 @@ pub struct Options {
     pub draft_pace: Duration,
     /// [`draft_pace`](Self::draft_pace) for a draft with files, which every write uploads again.
     pub draft_files_pace: Duration,
+    /// How long after a job Examail Cloud holds is due Exo waits before doing it itself
+    /// ([`CLOUD_GRACE`](crate::CLOUD_GRACE)).
+    pub cloud_grace: jiff::SignedDuration,
 }
 
 impl Default for Options {
@@ -153,6 +160,7 @@ impl Default for Options {
             debounce: Debounce::default(),
             draft_pace: Duration::from_secs(5),
             draft_files_pace: Duration::from_secs(30),
+            cloud_grace: crate::cloud::CLOUD_GRACE,
         }
     }
 }
@@ -199,6 +207,7 @@ impl Store {
         let mut db = db::open(&dir.as_ref().join(format!("{account}.sqlite3"))).await?;
         let identity = db::kv_get(&mut db, IDENTITY).await?.unwrap_or_default();
         let splits = load_splits(&mut db).await?;
+        let handed_off = crate::cloud::load(&mut db).await?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -234,9 +243,11 @@ impl Store {
                 acked: std::sync::Mutex::default(),
                 uploads: watch::Sender::new(crate::drafts::Uploads::new()),
                 given: std::sync::Mutex::default(),
+                handed_off: std::sync::RwLock::new(handed_off),
                 giving: Mutex::new(()),
                 draft_pace: options.draft_pace,
                 draft_files_pace: options.draft_files_pace,
+                cloud_grace: options.cloud_grace,
             }),
         })
     }

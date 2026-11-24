@@ -209,6 +209,13 @@ impl SignIn {
         let mut account = Account::open(&self.stores, credentials, ctx.clone())?;
         account.follow_power(&self.power);
         account.sign_in_calendars_with(calendars);
+        if let Some(config) = crate::cloud::Config::load(&self.stores) {
+            account.start_cloud(crate::cloud::Access {
+                config,
+                email: email.to_owned(),
+                tokens: tokens.clone(),
+            });
+        }
         Ok((account, tokens))
     }
 }
