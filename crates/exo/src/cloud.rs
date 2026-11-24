@@ -170,10 +170,7 @@ impl Client {
         exo_auth::CloudKeychain
             .set(&self.access.email, &token)
             .map_err(|error| Failure::Other(format!("the Keychain: {error}")))?;
-        log::info!(
-            "this Mac is now an Examail Cloud device for {}",
-            self.access.email
-        );
+        log::warn!("this Mac is now an Examail Cloud device for an account");
         self.device = Some(token);
         Ok(())
     }
@@ -207,7 +204,7 @@ pub async fn hand_off_now(email: &str, timeout: Duration) {
         .get(email)
         .is_some_and(|ask| ask.send(reply).is_ok());
     if asked && tokio::time::timeout(timeout, done).await.is_err() {
-        log::warn!("Examail Cloud didn't take {email}'s jobs before quitting");
+        log::warn!("Examail Cloud didn't take an account's jobs before quitting");
     }
 }
 
@@ -233,26 +230,26 @@ pub async fn run(store: Store, access: Access) {
     let mut sent: HashMap<String, (Value, bool)> = HashMap::new();
     let mut checked: Option<std::time::Instant> = None;
     let mut told_no_id = false;
+    let mut told_not_connected = false;
     loop {
         let wait = match round(&store, &mut client, &mut sent, &mut checked).await {
-            Ok(()) => RECHECK,
+            Ok(()) => {
+                told_not_connected = false;
+                RECHECK
+            }
             Err(Failure::NoIdToken) => {
                 if !told_no_id {
-                    log::warn!(
-                        "Examail Cloud needs {} signed in again, to add an ID token",
-                        client.access.email
-                    );
+                    log::warn!("Examail Cloud needs an account signed in again, for an ID token");
                     told_no_id = true;
                 }
                 let _ = store.set_handed_off([]).await;
                 IDLE
             }
             Err(Failure::NotConnected) => {
-                log::info!(
-                    "{} hasn't connected Examail Cloud: {}",
-                    client.access.email,
-                    client.access.config.connect_url(&client.access.email)
-                );
+                if !told_not_connected {
+                    log::warn!("an account hasn't connected Examail Cloud (open /v1/connect)");
+                    told_not_connected = true;
+                }
                 sent.clear();
                 let _ = store.set_handed_off([]).await;
                 IDLE
@@ -265,7 +262,7 @@ pub async fn run(store: Store, access: Access) {
             }
             Err(Failure::Other(message)) => {
                 // What the service holds it still holds; Exo does those itself after the grace.
-                log::info!("Examail Cloud for {}: {message}", client.access.email);
+                log::warn!("Examail Cloud: {message}");
                 RECHECK
             }
         };
