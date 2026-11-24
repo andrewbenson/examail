@@ -68,6 +68,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest the reminder scheduler sleeps before looking at the clock again, because a Mac
 /// that's asleep doesn't advance the timer the scheduler sleeps on.
 const REMINDER_RECHECK: Duration = Duration::from_secs(60);
+/// How soon a reminder that's due but couldn't be settled is looked at again.
+const REMINDER_OVERDUE_RECHECK: Duration = Duration::from_secs(15);
 /// The most a remote image may weigh. Past it, the body gives up on the image rather than let a
 /// sender fill memory (a 30 s download can be gigabytes).
 const MAX_DOWNLOAD: usize = 25 << 20;
@@ -941,6 +943,7 @@ impl Account {
         });
         let bulk = crate::bulk::Jobs::start(store.clone(), repaint.clone(), &restarts, logged);
         let worker = Worker {
+            email: email.clone(),
             address_book: None,
             mail_contacts: None,
             google_contacts: None,
@@ -1743,6 +1746,8 @@ struct SenderJobState {
 /// The task that owns what's on screen. It handles requests in order and publishes snapshots.
 struct Worker {
     store: Store,
+    /// The account's address.
+    email: String,
     /// What compose suggests from (mail's contacts with Google's merged in).
     address_book: Option<Arc<Vec<ScoredContact>>>,
     /// Stored mail's contacts, as last scored.
@@ -2525,6 +2530,9 @@ impl Worker {
                 if let Err(error) = self.store.push_drafts_now().await {
                     log::error!("writing drafts before quitting: {error}");
                 }
+                // Then the reminders and sends go to Examail Cloud, which does them while Exo is
+                // closed, the ones just set or edited too.
+                crate::cloud::hand_off_now(&self.email, Duration::from_secs(5)).await;
                 let _ = done.send(());
             }
         }
@@ -3699,7 +3707,12 @@ async fn reminder_loop(
             log::warn!("reading reminders: {error}");
             None
         });
+        // A reminder still due after the look above couldn't be settled now (Gmail can't say
+        // whether Examail Cloud did it, while offline), so it waits a little, not a busy loop.
         let wait = next.map_or(REMINDER_RECHECK, |at| {
+            if at <= now {
+                return REMINDER_OVERDUE_RECHECK;
+            }
             Duration::try_from(at.duration_since(now))
                 .unwrap_or_default()
                 .min(REMINDER_RECHECK)

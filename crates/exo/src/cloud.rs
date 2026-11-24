@@ -186,8 +186,39 @@ impl Client {
     }
 }
 
+/// Each running account's way to ask its loop for a round now, by address.
+type Rounds = std::sync::Mutex<
+    HashMap<String, tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+>;
+
+fn rounds() -> &'static Rounds {
+    static ROUNDS: std::sync::OnceLock<Rounds> = std::sync::OnceLock::new();
+    ROUNDS.get_or_init(Rounds::default)
+}
+
+/// Hands `email`'s jobs to Examail Cloud now, waiting `timeout` at most: what quitting does after
+/// writing the drafts, so a send scheduled (or edited) just before quitting reaches the service.
+/// Does nothing for an account Examail Cloud isn't on for.
+pub async fn hand_off_now(email: &str, timeout: Duration) {
+    let (reply, done) = tokio::sync::oneshot::channel();
+    let asked = rounds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(email)
+        .is_some_and(|ask| ask.send(reply).is_ok());
+    if asked && tokio::time::timeout(timeout, done).await.is_err() {
+        log::warn!("Examail Cloud didn't take {email}'s jobs before quitting");
+    }
+}
+
 /// Keeps the account's jobs with Examail Cloud until the account closes.
 pub async fn run(store: Store, access: Access) {
+    let (ask, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    rounds()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(access.email.clone(), ask);
+    let mut replies: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut client = Client {
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -238,6 +269,9 @@ pub async fn run(store: Store, access: Access) {
                 RECHECK
             }
         };
+        for reply in replies.drain(..) {
+            let _ = reply.send(());
+        }
         // A change is sent once things settle; otherwise look again after `wait`.
         tokio::select! {
             changed = changes.changed() => {
@@ -248,6 +282,10 @@ pub async fn run(store: Store, access: Access) {
                 changes.borrow_and_update();
             }
             () = tokio::time::sleep(wait) => {}
+            reply = asked.recv() => match reply {
+                Some(reply) => replies.push(reply),
+                None => return,
+            },
         }
     }
 }
@@ -281,6 +319,13 @@ async fn round(
         .filter_map(|job| Some((job["key"].as_str()?.to_owned(), job.clone())))
         .collect();
     let wanted: HashSet<&str> = jobs.iter().map(|job| job.key.as_str()).collect();
+    // The jobs this Mac handed off, as last recorded (kept across launches) or sent since. Only
+    // those are this Mac's to take back: another Mac on the account keeps its own.
+    let mine: HashSet<String> = store
+        .handed_off()
+        .into_iter()
+        .chain(sent.keys().cloned())
+        .collect();
 
     for CloudJob { key, request } in &jobs {
         let unchanged = sent.get(key).is_some_and(|(last, _)| last == request);
@@ -306,7 +351,10 @@ async fn round(
         }
     }
     // Jobs Exo no longer has (done, called off, unscheduled, edited into another key) come off.
-    for key in remote.keys().filter(|key| !wanted.contains(key.as_str())) {
+    for key in remote
+        .keys()
+        .filter(|key| !wanted.contains(key.as_str()) && mine.contains(*key))
+    {
         let path = format!("v1/jobs/{}", encode(key));
         match client.call(reqwest::Method::DELETE, &path, None).await {
             Ok(_) => {

@@ -23,6 +23,11 @@ fn options() -> Options {
 
 /// A new message to Ann, sent later at `at`.
 fn draft(id: &str, at: Timestamp) -> Draft {
+    dated_draft(id, at, Timestamp::now())
+}
+
+/// [`draft`], its message dated `dated`.
+fn dated_draft(id: &str, at: Timestamp, dated: Timestamp) -> Draft {
     let email = gmail::mime::Email {
         from: Some(gmail::mime::Mailbox::new("Maya Okafor", support::ACCOUNT)),
         to: vec![gmail::mime::Mailbox::new("Ann", "ann@example.com")],
@@ -30,7 +35,7 @@ fn draft(id: &str, at: Timestamp) -> Draft {
         html: Some("<div>Here it is</div>".into()),
         text: Some("Here it is".into()),
         message_id: Some(format!("{id}@exo")),
-        date: Some(Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC)),
+        date: Some(dated.to_zoned(jiff::tz::TimeZone::UTC)),
         ..gmail::mime::Email::default()
     };
     let record = DraftRecord {
@@ -175,6 +180,62 @@ async fn a_handed_off_send_waits_out_the_grace_then_goes() {
     let report = harness.store.push_drafts().await.unwrap();
     assert_eq!(report.sent.len(), 1, "the service didn't, so Exo does");
     assert_eq!(sent(&harness, "draft00000000000102@exo").await, 1);
+}
+
+#[tokio::test]
+async fn a_send_the_service_made_leaves_no_draft_or_failure_behind() {
+    let harness = Harness::synced_with(options()).await;
+    let drafts = || async {
+        harness
+            .gmail
+            .gmail()
+            .drafts(&gmail::DraftQuery::default())
+            .await
+            .expect("drafts.list")
+            .drafts
+            .into_iter()
+            .filter_map(|draft| draft.id)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = drafts().await;
+    let at = Timestamp::now() + SignedDuration::from_secs(1);
+    // Dated an hour ago, so Exo would date it afresh before sending it itself.
+    let an_hour_ago = Timestamp::now() - SignedDuration::from_hours(1);
+    schedule(
+        &harness,
+        dated_draft("draft00000000000105", at, an_hour_ago),
+    )
+    .await;
+    harness
+        .store
+        .set_handed_off([send_key("draft00000000000105")])
+        .await
+        .unwrap();
+    let gmail_id = gmail_draft(&harness, "draft00000000000105").await;
+    harness
+        .gmail
+        .gmail()
+        .send_draft(&gmail_id)
+        .await
+        .expect("drafts.send");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let report = harness.store.push_drafts().await.unwrap();
+    assert!(report.failed.is_empty(), "no failure: {:?}", report.failed);
+    assert!(report.retrying.is_empty(), "nothing retrying");
+    assert_eq!(
+        sent(&harness, "draft00000000000105@exo").await,
+        1,
+        "sent once"
+    );
+    assert_eq!(drafts().await, before, "no draft made of mail that went");
+    assert!(
+        harness
+            .store
+            .draft("draft00000000000105")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

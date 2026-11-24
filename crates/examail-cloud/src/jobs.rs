@@ -273,7 +273,11 @@ pub fn plan(job: &Job, thread: Option<&[Seen]>, now: Timestamp) -> Plan {
                 remove: vec![snoozed_label.clone()],
                 status,
             };
-            if replied {
+            if !has(snoozed_label) {
+                // Ended elsewhere: the reminder taken off in Gmail web or on a phone, or Examail
+                // brought the thread back itself. Nothing to do.
+                Plan::Finish(Status::Done, Some("the thread is no longer snoozed".into()))
+            } else if replied {
                 off(Status::Aborted)
             } else if has(SPAM) || has(TRASH) {
                 off(Status::Done)
@@ -567,39 +571,54 @@ async fn ready(
     }
 }
 
-/// `raw` with its `Date:` header (and any folded lines of it) replaced by one for `now`.
+/// `raw` with its `Date:` header (and any folded lines of it) replaced by one for `now`. Only the
+/// header, the lines before the first empty one, is rewritten; the empty line and everything after
+/// it are kept byte for byte. A message without an empty line is returned as it is, undated,
+/// rather than guessed at.
 pub fn redate(raw: &[u8], now: Timestamp) -> Vec<u8> {
-    let (head, body) = match find(raw, b"\r\n\r\n") {
-        Some(end) => (&raw[..end], &raw[end..]),
-        None => (raw, &b""[..]),
+    // The header's lines, each with its own line ending, up to the empty line.
+    let mut header = Vec::new();
+    let mut at = 0;
+    let body_at = loop {
+        let Some(end) = raw[at..].iter().position(|byte| *byte == b'\n') else {
+            return raw.to_vec();
+        };
+        let line = &raw[at..at + end + 1];
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        let text = text.strip_suffix(b"\r").unwrap_or(text);
+        if text.is_empty() {
+            break at;
+        }
+        header.push((text, line));
+        at += end + 1;
+    };
+    let ending: &[u8] = if header
+        .first()
+        .is_some_and(|(_, line)| line.ends_with(b"\r\n"))
+    {
+        b"\r\n"
+    } else {
+        b"\n"
     };
     let date =
         jiff::fmt::rfc2822::to_string(&now.to_zoned(jiff::tz::TimeZone::UTC)).unwrap_or_default();
     let mut out = format!("Date: {date}").into_bytes();
+    out.extend_from_slice(ending);
     let mut in_date = false;
-    for line in head.split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let folded = line
+    for (text, line) in header {
+        let folded = text
             .first()
             .is_some_and(|byte| *byte == b' ' || *byte == b'\t');
         if folded && in_date {
             continue;
         }
-        in_date = !folded && line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"date:");
-        if in_date || line.is_empty() {
-            continue;
+        in_date = !folded && text.len() >= 5 && text[..5].eq_ignore_ascii_case(b"date:");
+        if !in_date {
+            out.extend_from_slice(line);
         }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(line);
     }
-    out.extend_from_slice(body);
+    out.extend_from_slice(&raw[body_at..]);
     out
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// The thread's messages and their labels, or `None` when it's gone.
@@ -707,7 +726,7 @@ mod tests {
     #[test]
     fn a_reply_calls_off_an_if_no_reply_reminder_but_not_the_users_own_messages() {
         let mine = [
-            seen("m1", &[]),
+            seen("m1", &["Label_snoozed"]),
             seen("m2", &["SENT"]),
             seen("m3", &["DRAFT"]),
         ];
@@ -718,7 +737,7 @@ mod tests {
                 ..
             }
         ));
-        let replied = [seen("m1", &[]), seen("m4", &["INBOX"])];
+        let replied = [seen("m1", &["Label_snoozed"]), seen("m4", &["INBOX"])];
         assert_eq!(
             plan(&remind(true), Some(&replied), now()),
             Plan::Labels {
@@ -738,8 +757,17 @@ mod tests {
     }
 
     #[test]
+    fn a_reminder_ended_elsewhere_changes_nothing() {
+        let thread = [seen("m1", &["INBOX"])];
+        assert!(matches!(
+            plan(&remind(false), Some(&thread), now()),
+            Plan::Finish(Status::Done, Some(_))
+        ));
+    }
+
+    #[test]
     fn a_thread_in_the_trash_only_loses_its_snoozed_label() {
-        let thread = [seen("m1", &["TRASH"])];
+        let thread = [seen("m1", &["TRASH", "Label_snoozed"])];
         assert_eq!(
             plan(&remind(false), Some(&thread), now()),
             Plan::Labels {
@@ -817,8 +845,24 @@ mod tests {
         );
         // A message without a date gets one.
         let undated = String::from_utf8(super::redate(b"Subject: Hi\r\n\r\nBody", now())).unwrap();
-        assert!(
-            undated.starts_with("Date: Mon, 23 Nov 2026 09:00:30 +0000\r\nSubject: Hi\r\n\r\nBody")
+        assert_eq!(
+            undated,
+            "Date: Mon, 23 Nov 2026 09:00:30 +0000\r\nSubject: Hi\r\n\r\nBody"
+        );
+        // Bare newlines: the first empty line still ends the header, and the body is kept.
+        let bare = String::from_utf8(super::redate(
+            b"Date: x\nSubject: Hi\n\nBody\r\n\r\nDate: in the body\n",
+            now(),
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            "Date: Mon, 23 Nov 2026 09:00:30 +0000\nSubject: Hi\n\nBody\r\n\r\nDate: in the body\n"
+        );
+        // Without an empty line it goes as it is.
+        assert_eq!(
+            super::redate(b"Subject: Hi\nBody", now()),
+            b"Subject: Hi\nBody"
         );
     }
 

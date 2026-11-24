@@ -1065,6 +1065,15 @@ impl Inner {
             return self.delete_gmail_draft(row).await;
         }
         let mut row = row;
+        // A send Examail Cloud already made goes no further than being found: not dated afresh
+        // or written to Gmail again, which would make a new draft of mail that went.
+        if self.send_due(&row, now) && row.record.0.send_later.is_some() {
+            match self.sent_by_cloud(&row).await {
+                Ok(Some(_)) => return self.send_gmail_draft(&row.id, now, report).await,
+                Ok(None) => {}
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
         if self.send_due(&row, now) && row.record.0.send_later.is_some() {
             // A draft rewritten in Gmail web since Exo last wrote it goes as Gmail has it, edits
             // and all, rather than with Exo's copy written over them.
@@ -1147,6 +1156,22 @@ impl Inner {
             write.commit().await?;
         }
         Ok(Ok(()))
+    }
+
+    /// The message Examail Cloud sent for draft `row`, when the service holds its send and Sent
+    /// has it.
+    async fn sent_by_cloud(
+        &self,
+        row: &DraftRow,
+    ) -> std::result::Result<Option<gmail::Message>, Failure> {
+        if !self.handed_off(&crate::cloud::send_key(&row.id)) {
+            return Ok(None);
+        }
+        let sent = self.sent_message(&row.record.0.rfc822_id).await?;
+        if sent.is_some() {
+            log::info!("Examail Cloud already sent draft {}", row.id);
+        }
+        Ok(sent)
     }
 
     /// Whether draft `row`'s scheduled send is Exo's to send at `now`: it's due, and when
@@ -1533,26 +1558,25 @@ impl Inner {
         let Some(row) = DraftRow::filter_by_id(id).first().exec(&mut db).await? else {
             return Ok(Ok(()));
         };
-        // Taken back, held longer, discarded, or saved again (sent once Gmail has that version).
-        if row.discarded || row.pushed < row.revision || !self.send_due(&row, now) {
+        // Taken back, held longer or discarded.
+        if row.discarded || !self.send_due(&row, now) {
             return Ok(Ok(()));
         }
-        let Some(gmail_id) = row.gmail_id.clone() else {
-            return Ok(Ok(()));
-        };
         // Examail Cloud may have sent it while Exo waited, and then it went and isn't sent again.
         // Asked first, because its draft may still be there.
-        let mut sent_by_cloud = None;
-        if self.handed_off(&crate::cloud::send_key(&row.id)) {
-            match self.sent_message(&row.record.0.rfc822_id).await {
-                Ok(Some(message)) => {
-                    log::info!("Examail Cloud already sent draft {}", row.id);
-                    sent_by_cloud = Some(message);
-                }
-                Ok(None) => {}
-                Err(failure) => return Ok(Err(failure)),
-            }
+        let sent_by_cloud = match self.sent_by_cloud(&row).await {
+            Ok(sent) => sent,
+            Err(failure) => return Ok(Err(failure)),
+        };
+        // Saved again: sent once Gmail has that version.
+        if sent_by_cloud.is_none() && row.pushed < row.revision {
+            return Ok(Ok(()));
         }
+        let gmail_id = match (&row.gmail_id, &sent_by_cloud) {
+            (Some(gmail_id), _) => gmail_id.clone(),
+            (None, Some(_)) => String::new(),
+            (None, None) => return Ok(Ok(())),
+        };
         // A reply that sync hasn't brought in yet (Exo was closed, say) still calls the send off.
         match self.aborting_reply(&row).await {
             _ if sent_by_cloud.is_some() => {}
