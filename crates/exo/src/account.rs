@@ -1104,6 +1104,25 @@ impl Account {
             .replace(self.shared.next_undo.get() + 1)
     }
 
+    /// Makes the account reachable through Examail's MCP server ([`crate::mcp`]) while it's open.
+    pub fn start_mcp(&self) {
+        let loader = &self.shared.loader;
+        let flush = self.shared.flush.clone();
+        let registration = crate::mcp::register(
+            &self.shared.email,
+            crate::mcp::Entry {
+                store: loader.store.clone(),
+                runtime: loader.runtime.clone(),
+                flush: Arc::new(move || flush.wake()),
+            },
+        );
+        // Held by a task that lives as long as the account's loops, so closing the account ends it.
+        loader.restarts.spawn_task(&loader.runtime, async move {
+            let _registration = registration;
+            std::future::pending::<()>().await;
+        });
+    }
+
     /// Hands the account's reminders and scheduled sends to Examail Cloud, and keeps them
     /// there, while the account is open ([`crate::cloud`]).
     pub fn start_cloud(&self, access: crate::cloud::Access) {

@@ -38,6 +38,14 @@ fn main() -> anyhow::Result<()> {
         println!("{}", exo::update::version());
         return Ok(());
     }
+    // `Examail mcp`: the stdio end of Examail's MCP server, for an agent to start.
+    if arguments.get(1).is_some_and(|argument| argument == "mcp") {
+        let dirs = DIRS
+            .discover(|_, _| Ok(()))
+            .dirs
+            .context("finding Examail's folders")?;
+        return exo::mcp::bridge(&dirs.state);
+    }
     fastframe_titlebar::init();
     exo::format::locale::install(exo::format::locale::Locale::system());
     let assets = exo::assets_dir();
@@ -101,6 +109,9 @@ fn main() -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(dir);
     }
     let state = mock_state.clone().unwrap_or_else(|| dirs.state.clone());
+    if mock.is_none() && exo::mcp::enabled(&state) {
+        exo::mcp::serve(&state);
+    }
     exo::mail_client::listen(launcher.clone());
     desktop::menu::install(launcher.clone());
     // Only an app bundle's notifications show (Exo.app). A bare binary posts none.

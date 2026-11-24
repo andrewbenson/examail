@@ -221,3 +221,33 @@ pub(crate) async fn load(exec: &mut dyn toasty::Executor) -> Result<HashSet<Stri
         .into_iter()
         .collect())
 }
+
+/// A reminder waiting to bring its thread back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingReminder {
+    pub thread_id: String,
+    pub at: Timestamp,
+    /// A reply calls it off.
+    pub if_no_reply: bool,
+}
+
+impl Store {
+    /// The reminders waiting to bring their threads back, soonest first.
+    ///
+    /// # Errors
+    /// On database failures.
+    pub async fn waiting_reminders(&self) -> Result<Vec<WaitingReminder>> {
+        let mut db = self.inner.db.clone();
+        let mut rows: Vec<WaitingReminder> = crate::reminders::waiting(&mut db)
+            .await?
+            .into_iter()
+            .map(|row| WaitingReminder {
+                thread_id: row.thread_id,
+                at: row.at,
+                if_no_reply: !row.keep_on_reply,
+            })
+            .collect();
+        rows.sort_by_key(|row| row.at);
+        Ok(rows)
+    }
+}

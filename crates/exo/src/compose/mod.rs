@@ -22,7 +22,7 @@ mod chips;
 pub(crate) mod contacts;
 pub(crate) mod discard;
 mod draft;
-mod factory;
+pub(crate) mod factory;
 mod failed;
 mod files;
 mod form;

@@ -46,6 +46,7 @@ mod lists;
 pub mod log_in;
 pub mod logging;
 pub mod mail_client;
+pub mod mcp;
 pub mod mailbox;
 mod new_split;
 pub mod notice;
