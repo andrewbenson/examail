@@ -1158,8 +1158,12 @@ impl Inner {
         Ok(Ok(()))
     }
 
-    /// The message Examail Cloud sent for draft `row`, when the service holds its send and Sent
-    /// has it.
+    /// The message Examail Cloud sent for draft `row`, when the service holds its send and sent
+    /// it. Gmail gives a sent message a Message-ID of its own, so Sent is rarely found by the
+    /// draft's. What tells is the draft: Examail Cloud sends it with `drafts.send`, which takes the
+    /// Gmail draft away. A handed-off send whose Gmail draft is gone went, and the message is the
+    /// thread's newest in Sent that the thread didn't have when the send was scheduled (or, before
+    /// Gmail lists it there, the thread alone).
     async fn sent_by_cloud(
         &self,
         row: &DraftRow,
@@ -1167,11 +1171,53 @@ impl Inner {
         if !self.handed_off(&crate::cloud::send_key(&row.id)) {
             return Ok(None);
         }
-        let sent = self.sent_message(&row.record.0.rfc822_id).await?;
-        if sent.is_some() {
+        if let Some(sent) = self.sent_message(&row.record.0.rfc822_id).await? {
             log::info!("Examail Cloud already sent draft {}", row.id);
+            return Ok(Some(sent));
         }
-        Ok(sent)
+        let Some(gmail_id) = &row.gmail_id else {
+            return Ok(None);
+        };
+        match self
+            .api
+            .call(Lane::Act, 2, |gmail| gmail.draft(gmail_id, gmail::Format::Minimal))
+            .await
+        {
+            Ok(_) => return Ok(None),
+            Err(failure) if failure.is_not_found() => {}
+            Err(failure) => return Err(failure),
+        }
+        log::info!("Examail Cloud already sent draft {} (its Gmail draft is gone)", row.id);
+        let before: &[String] = row
+            .record
+            .0
+            .send_later
+            .as_ref()
+            .map_or(&[], |later| later.current_message_ids.as_slice());
+        let mut sent = None;
+        if let Some(thread) = &row.thread_id {
+            match self
+                .api
+                .call(Lane::Act, 2, |gmail| {
+                    gmail.thread(thread, gmail::Format::Minimal, &[])
+                })
+                .await
+            {
+                Ok(found) => {
+                    sent = found.messages.into_iter().rev().find(|message| {
+                        message.label_ids.iter().any(|label| label == SENT)
+                            && !message.label_ids.iter().any(|label| label == "DRAFT")
+                            && message.id.as_ref().is_some_and(|id| !before.contains(id))
+                    });
+                }
+                Err(failure) if failure.is_not_found() => {}
+                Err(failure) => return Err(failure),
+            }
+        }
+        Ok(Some(sent.unwrap_or_else(|| gmail::Message {
+            thread_id: row.thread_id.clone(),
+            ..gmail::Message::default()
+        })))
     }
 
     /// Whether draft `row`'s scheduled send is Exo's to send at `now`: it's due, and when

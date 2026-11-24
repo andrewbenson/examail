@@ -239,6 +239,45 @@ async fn a_send_the_service_made_leaves_no_draft_or_failure_behind() {
 }
 
 #[tokio::test]
+async fn a_send_the_service_made_under_a_new_message_id_isnt_made_again() {
+    // Real Gmail gives the sent message a Message-ID of its own, so Sent can't be searched by
+    // the draft's. What's left to tell by is the Gmail draft, which drafts.send took away.
+    let harness = Harness::synced_with(options()).await;
+    let at = Timestamp::now() + SignedDuration::from_secs(1);
+    let an_hour_ago = Timestamp::now() - SignedDuration::from_hours(1);
+    schedule(&harness, dated_draft("draft00000000000106", at, an_hour_ago)).await;
+    harness
+        .store
+        .set_handed_off([send_key("draft00000000000106")])
+        .await
+        .unwrap();
+    let gmail_id = gmail_draft(&harness, "draft00000000000106").await;
+    harness
+        .gmail
+        .gmail()
+        .delete_draft(&gmail_id)
+        .await
+        .expect("drafts.delete");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let report = harness.store.push_drafts().await.unwrap();
+    assert!(report.failed.is_empty(), "no failure: {:?}", report.failed);
+    assert_eq!(
+        sent(&harness, "draft00000000000106@exo").await,
+        0,
+        "Exo didn't send it again"
+    );
+    assert!(
+        harness
+            .store
+            .draft("draft00000000000106")
+            .await
+            .unwrap()
+            .is_none(),
+        "and Exo knows it went"
+    );
+}
+
+#[tokio::test]
 async fn a_send_the_service_made_isnt_made_again() {
     let harness = Harness::synced_with(options()).await;
     let at = Timestamp::now() + SignedDuration::from_secs(1);
