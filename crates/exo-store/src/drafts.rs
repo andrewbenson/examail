@@ -289,6 +289,14 @@ pub enum SendFailure {
     Other,
 }
 
+/// What [`Inner::sent_by_cloud`] found of a send Examail Cloud held.
+enum CloudSend {
+    /// It went: this is the message.
+    Sent(gmail::Message),
+    /// Its Gmail draft is gone, but nothing says it went.
+    Unconfirmed,
+}
+
 impl SendFailure {
     /// The failure's code, as it's stored.
     #[must_use]
@@ -1069,7 +1077,13 @@ impl Inner {
         // or written to Gmail again, which would make a new draft of mail that went.
         if self.send_due(&row, now) && row.record.0.send_later.is_some() {
             match self.sent_by_cloud(&row).await {
-                Ok(Some(_)) => return self.send_gmail_draft(&row.id, now, report).await,
+                Ok(Some(CloudSend::Sent(_))) => {
+                    return self.send_gmail_draft(&row.id, now, report).await;
+                }
+                Ok(Some(CloudSend::Unconfirmed)) => {
+                    self.fail_send(&row.id, SendFailure::Other, report).await?;
+                    return Ok(Ok(()));
+                }
                 Ok(None) => {}
                 Err(failure) => return Ok(Err(failure)),
             }
@@ -1161,33 +1175,34 @@ impl Inner {
     /// The message Examail Cloud sent for draft `row`, when the service holds its send and sent
     /// it. Gmail gives a sent message a Message-ID of its own, so Sent is rarely found by the
     /// draft's. What tells is the draft: Examail Cloud sends it with `drafts.send`, which takes the
-    /// Gmail draft away. A handed-off send whose Gmail draft is gone went, and the message is the
-    /// thread's newest in Sent that the thread didn't have when the send was scheduled (or, before
-    /// Gmail lists it there, the thread alone).
+    /// Gmail draft away. A handed-off send whose Gmail draft is gone went when its thread has a
+    /// message in Sent it didn't have when the send was scheduled. Gone without one (deleted in
+    /// Gmail web, say) it's [`CloudSend::Unconfirmed`]: not sent again, and failed, to be seen.
     async fn sent_by_cloud(
         &self,
         row: &DraftRow,
-    ) -> std::result::Result<Option<gmail::Message>, Failure> {
+    ) -> std::result::Result<Option<CloudSend>, Failure> {
         if !self.handed_off(&crate::cloud::send_key(&row.id)) {
             return Ok(None);
         }
         if let Some(sent) = self.sent_message(&row.record.0.rfc822_id).await? {
             log::info!("Examail Cloud already sent draft {}", row.id);
-            return Ok(Some(sent));
+            return Ok(Some(CloudSend::Sent(sent)));
         }
         let Some(gmail_id) = &row.gmail_id else {
             return Ok(None);
         };
         match self
             .api
-            .call(Lane::Act, 2, |gmail| gmail.draft(gmail_id, gmail::Format::Minimal))
+            .call(Lane::Act, 2, |gmail| {
+                gmail.draft(gmail_id, gmail::Format::Minimal)
+            })
             .await
         {
             Ok(_) => return Ok(None),
             Err(failure) if failure.is_not_found() => {}
             Err(failure) => return Err(failure),
         }
-        log::info!("Examail Cloud already sent draft {} (its Gmail draft is gone)", row.id);
         let before: &[String] = row
             .record
             .0
@@ -1214,10 +1229,19 @@ impl Inner {
                 Err(failure) => return Err(failure),
             }
         }
-        Ok(Some(sent.unwrap_or_else(|| gmail::Message {
-            thread_id: row.thread_id.clone(),
-            ..gmail::Message::default()
-        })))
+        Ok(Some(match sent {
+            Some(sent) => {
+                log::info!("Examail Cloud already sent draft {}", row.id);
+                CloudSend::Sent(sent)
+            }
+            None => {
+                log::warn!(
+                    "draft {}'s Gmail draft is gone and Sent has nothing new, so it isn't sent again",
+                    row.id
+                );
+                CloudSend::Unconfirmed
+            }
+        }))
     }
 
     /// Whether draft `row`'s scheduled send is Exo's to send at `now`: it's due, and when
@@ -1611,7 +1635,12 @@ impl Inner {
         // Examail Cloud may have sent it while Exo waited, and then it went and isn't sent again.
         // Asked first, because its draft may still be there.
         let sent_by_cloud = match self.sent_by_cloud(&row).await {
-            Ok(sent) => sent,
+            Ok(Some(CloudSend::Sent(sent))) => Some(sent),
+            Ok(Some(CloudSend::Unconfirmed)) => {
+                self.fail_send(&row.id, SendFailure::Other, report).await?;
+                return Ok(Ok(()));
+            }
+            Ok(None) => None,
             Err(failure) => return Ok(Err(failure)),
         };
         // Saved again: sent once Gmail has that version.

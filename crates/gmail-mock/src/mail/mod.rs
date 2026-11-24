@@ -90,6 +90,9 @@ pub enum Threading {
     Requested(Option<String>),
     /// SMTP delivery: join the thread of a message named in `In-Reply-To`/`References`.
     Headers,
+    /// `drafts.send` of a new message's draft: the thread the draft started, which the sent
+    /// message keeps, as Gmail's does.
+    Kept(String),
 }
 
 /// What `threads.list`, `messages.list` and `drafts.list` select.
@@ -419,6 +422,7 @@ impl Mailbox {
                 let joins = !mime.ancestors.is_empty() && thread.iter().any(|m| same_subject(m));
                 Ok(joins.then(|| thread_id.clone()))
             }
+            Threading::Kept(thread_id) => Ok(Some(thread_id.clone())),
             Threading::Headers => Ok(mime.ancestors.iter().rev().find_map(|ancestor| {
                 self.messages
                     .values()
@@ -549,6 +553,10 @@ impl Mailbox {
     /// `messages.send`: fills in `From`, `Date` and `Message-ID` like Gmail, then files the
     /// message under SENT (and INBOX when addressed to the account itself).
     pub fn send(&mut self, raw: Vec<u8>, thread_id: Option<String>, now: i64) -> Result<String> {
+        self.send_threaded(raw, Threading::Requested(thread_id), now)
+    }
+
+    fn send_threaded(&mut self, raw: Vec<u8>, threading: Threading, now: i64) -> Result<String> {
         let probe = mime::parse(&raw, "probe")
             .ok_or_else(|| Failure::invalid_argument("Invalid raw message"))?;
         if probe.recipients.is_empty() {
@@ -588,7 +596,7 @@ impl Mailbox {
         self.insert(NewMessage {
             raw: stamped,
             labels,
-            threading: Threading::Requested(thread_id),
+            threading,
             internal_date: now,
             apply_filters: false,
         })
@@ -637,11 +645,33 @@ impl Mailbox {
         now: i64,
     ) -> Result<()> {
         let old = self.draft(id)?.id.clone();
-        let thread_id = thread_id.or_else(|| Some(self.messages[&old].thread_id.clone()));
-        let message = self.insert_draft_message(raw, thread_id, now)?;
+        let kept = self.messages[&old].thread_id.clone();
+        // A new message's draft keeps the thread it started, as Gmail's does.
+        let threading = if thread_id.is_none() || self.alone(&old) {
+            Threading::Kept(kept)
+        } else {
+            Threading::Requested(thread_id)
+        };
+        let message = self.insert(NewMessage {
+            raw,
+            labels: vec!["DRAFT".into()],
+            threading,
+            internal_date: now,
+            apply_filters: false,
+        })?;
         self.delete(&old)?;
         self.drafts.insert(id.to_owned(), message);
         Ok(())
+    }
+
+    /// Whether message `id` is the only one in its thread.
+    fn alone(&self, id: &str) -> bool {
+        let thread = &self.messages[id].thread_id;
+        self.messages
+            .values()
+            .filter(|message| &message.thread_id == thread)
+            .count()
+            == 1
     }
 
     fn insert_draft_message(
@@ -669,9 +699,15 @@ impl Mailbox {
         let draft = self.draft(id)?;
         let (raw, thread_id, draft_message) =
             (draft.raw.clone(), draft.thread_id.clone(), draft.id.clone());
-        // The draft was already threaded on creation, so its thread can be requested as is.
-        let thread = (thread_id != draft_message).then_some(thread_id);
-        let sent = self.send(raw, thread, now)?;
+        // The draft was already threaded on creation, so its thread is requested as is. A new
+        // message's draft started a thread of its own, which the sent message keeps, as Gmail's
+        // does.
+        let threading = if self.alone(&draft_message) {
+            Threading::Kept(thread_id)
+        } else {
+            Threading::Requested(Some(thread_id))
+        };
+        let sent = self.send_threaded(raw, threading, now)?;
         self.delete(&draft_message)?;
         Ok(sent)
     }

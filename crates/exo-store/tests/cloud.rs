@@ -241,23 +241,42 @@ async fn a_send_the_service_made_leaves_no_draft_or_failure_behind() {
 #[tokio::test]
 async fn a_send_the_service_made_under_a_new_message_id_isnt_made_again() {
     // Real Gmail gives the sent message a Message-ID of its own, so Sent can't be searched by
-    // the draft's. What's left to tell by is the Gmail draft, which drafts.send took away.
+    // the draft's. drafts.send takes the Gmail draft away, and the message lands in the thread.
     let harness = Harness::synced_with(options()).await;
     let at = Timestamp::now() + SignedDuration::from_secs(1);
     let an_hour_ago = Timestamp::now() - SignedDuration::from_hours(1);
-    schedule(&harness, dated_draft("draft00000000000106", at, an_hour_ago)).await;
+    let scheduled = dated_draft("draft00000000000106", at, an_hour_ago);
+    let renamed = scheduled.raw.replace(
+        "draft00000000000106@exo",
+        "CAGYk1Y-gmail-made@mail.gmail.com",
+    );
+    schedule(&harness, scheduled).await;
     harness
         .store
         .set_handed_off([send_key("draft00000000000106")])
         .await
         .unwrap();
     let gmail_id = gmail_draft(&harness, "draft00000000000106").await;
+    let draft = harness
+        .gmail
+        .gmail()
+        .draft(&gmail_id, gmail::Format::Minimal)
+        .await
+        .expect("drafts.get");
+    let thread = draft.message.and_then(|message| message.thread_id);
+    // Gmail's own Message-ID, then drafts.send, which takes the draft away.
     harness
         .gmail
         .gmail()
-        .delete_draft(&gmail_id)
+        .update_draft(&gmail_id, renamed.into_bytes(), thread.as_deref())
         .await
-        .expect("drafts.delete");
+        .expect("drafts.update");
+    harness
+        .gmail
+        .gmail()
+        .send_draft(&gmail_id)
+        .await
+        .expect("drafts.send");
     tokio::time::sleep(Duration::from_millis(2200)).await;
     let report = harness.store.push_drafts().await.unwrap();
     assert!(report.failed.is_empty(), "no failure: {:?}", report.failed);
@@ -274,6 +293,43 @@ async fn a_send_the_service_made_under_a_new_message_id_isnt_made_again() {
             .unwrap()
             .is_none(),
         "and Exo knows it went"
+    );
+}
+
+#[tokio::test]
+async fn a_handed_off_send_whose_draft_vanished_unsent_fails_rather_than_going() {
+    // Deleted in Gmail web, say: nothing in Sent says the service sent it.
+    let harness = Harness::synced_with(options()).await;
+    let at = Timestamp::now() + SignedDuration::from_secs(1);
+    schedule(&harness, draft("draft00000000000107", at)).await;
+    harness
+        .store
+        .set_handed_off([send_key("draft00000000000107")])
+        .await
+        .unwrap();
+    let gmail_id = gmail_draft(&harness, "draft00000000000107").await;
+    harness
+        .gmail
+        .gmail()
+        .delete_draft(&gmail_id)
+        .await
+        .expect("drafts.delete");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let report = harness.store.push_drafts().await.unwrap();
+    assert_eq!(report.failed.len(), 1, "it fails, to be seen");
+    assert_eq!(
+        sent(&harness, "draft00000000000107@exo").await,
+        0,
+        "not sent"
+    );
+    assert!(
+        harness
+            .store
+            .draft("draft00000000000107")
+            .await
+            .unwrap()
+            .is_some(),
+        "kept, to edit or discard"
     );
 }
 
