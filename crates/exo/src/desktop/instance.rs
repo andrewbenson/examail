@@ -38,7 +38,7 @@ pub enum Unclaimed {
 /// Makes this process the running Exo, which opens `url` once its window is up. If an Exo is
 /// already running, hands it `url`, or else a request for the window, instead. `scope`, when given,
 /// names a slot of its own beside the real one, for an Exo that should run alongside the real Exo
-/// (on gmail-mock). Keep the guard until the process exits. An error means this launch is done.
+/// (on mock-servers). Keep the guard until the process exits. An error means this launch is done.
 ///
 /// # Errors
 /// When another Exo is running and took the request, turned it down or didn't answer.

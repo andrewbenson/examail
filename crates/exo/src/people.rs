@@ -18,7 +18,10 @@ use exo_store::GoogleContact;
 use exo_ui::AvatarPhoto;
 use sha2::{Digest, Sha256};
 
-use crate::account::Loader;
+use crate::{
+    account::Loader,
+    avatar_cache::{AvatarCache, Lookup},
+};
 
 pub(crate) mod listing;
 
@@ -29,6 +32,7 @@ pub(crate) const SIZE: u32 = 112;
 const NOTIFICATION_PHOTOS: &str = "ExoNotificationPhotos";
 /// How long a notification waits for a photo that isn't saved yet, or a brand's logo.
 pub(crate) const NOTIFICATION_WAIT: Duration = Duration::from_secs(5);
+const PHOTOS_CACHE_ID: &str = "exo::people::photos";
 
 /// What Google says about someone, besides their name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,27 +51,21 @@ pub(crate) struct Photos {
     loader: Loader,
     /// The photo cache.
     dir: PathBuf,
-    /// Gmail is served from this Mac (gmail-mock), so its photos are too.
+    /// Gmail is served from this Mac (mock-servers), so its photos are too.
     local: bool,
 }
 
-/// The people the accounts listed, and the photos loaded so far. It lives in the context's data,
-/// so whatever draws a person can find it.
+/// The people the accounts listed. It lives in the context's data, so whatever draws a person can
+/// find it.
 #[derive(Default)]
 struct Registry {
-    /// Each account's people that have something to show, by lower-cased address, with where
-    /// their photos come from.
+    /// Each account's people that have something to show, keyed by lower-cased account address and
+    /// then by lower-cased contact address, with where their photos come from.
     accounts: HashMap<String, (Photos, HashMap<String, Person>)>,
-    /// Photos by URL.
-    photos: HashMap<String, Slot>,
 }
 
-enum Slot {
-    Loading,
-    Shown(AvatarPhoto),
-    /// Google didn't give it, or it isn't an image.
-    Missing,
-}
+#[derive(Clone, Default)]
+struct ActiveAccount(Option<String>);
 
 type Shared = Arc<Mutex<Registry>>;
 
@@ -76,6 +74,26 @@ fn registry(ctx: &egui::Context) -> Shared {
         data.get_temp_mut_or_default::<Shared>(egui::Id::new("exo::people"))
             .clone()
     })
+}
+
+fn active_id() -> egui::Id {
+    egui::Id::new("exo::people::active")
+}
+
+fn active_account(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|data| data.get_temp::<ActiveAccount>(active_id()))
+        .and_then(|active| active.0)
+}
+
+/// Records which signed-in account is drawing on `ctx` this frame, scoping [`person`] and
+/// [`photo`] so contacts never leak across accounts.
+pub(crate) fn set_active_account(ctx: &egui::Context, account: &str) {
+    let lower = account.to_lowercase();
+    ctx.data_mut(|data| data.insert_temp(active_id(), ActiveAccount(Some(lower))));
+}
+
+fn photo_cache(ctx: &egui::Context) -> AvatarCache<String> {
+    AvatarCache::of(ctx, PHOTOS_CACHE_ID)
 }
 
 impl Photos {
@@ -123,62 +141,136 @@ impl Photos {
         let mut registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
         registry
             .accounts
-            .insert(self.account.clone(), (self.clone(), people));
-        // Photos that couldn't be had are asked for again.
-        registry
-            .photos
-            .retain(|_, slot| !matches!(slot, Slot::Missing));
+            .insert(self.account.to_lowercase(), (self.clone(), people));
         drop(registry);
+        // Photos that couldn't be had are asked for again.
+        photo_cache(&self.ctx).clear_missing();
         self.ctx.request_repaint();
     }
 }
 
-/// `account` closed: its people show no more.
+/// `account` closed: its people and brand logos show no more.
 pub(crate) fn forget(ctx: &egui::Context, account: &str) {
+    let lower = account.to_lowercase();
     let shared = registry(ctx);
     let mut registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
-    registry.accounts.remove(account);
+    registry.accounts.remove(&lower);
+    drop(registry);
+    ctx.data_mut(|data| {
+        if data
+            .get_temp::<ActiveAccount>(active_id())
+            .and_then(|active| active.0)
+            .as_deref()
+            == Some(lower.as_str())
+        {
+            data.insert_temp(active_id(), ActiveAccount(None));
+        }
+    });
+    crate::brands::forget(ctx, account);
 }
 
-/// What Google says about `email`, from whichever account knows them.
-pub fn person(ctx: &egui::Context, email: &str) -> Option<Person> {
+/// What Google says about `email` in `account`.
+pub(crate) fn person_for(ctx: &egui::Context, account: &str, email: &str) -> Option<Person> {
     let shared = registry(ctx);
     let registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    let (_, people) = registry.accounts.get(&account.to_lowercase())?;
+    people.get(&email.to_lowercase()).cloned()
+}
+
+/// What Google says about `email` in the active account (or the lone registered account when no
+/// active account has been marked yet).
+pub fn person(ctx: &egui::Context, email: &str) -> Option<Person> {
+    if let Some(active) = active_account(ctx) {
+        return person_for(ctx, &active, email);
+    }
+    let shared = registry(ctx);
+    let registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    if registry.accounts.len() != 1 {
+        return None;
+    }
     let email = email.to_lowercase();
     registry
         .accounts
         .values()
-        .find_map(|(_, people)| people.get(&email).cloned())
+        .next()
+        .and_then(|(_, people)| people.get(&email).cloned())
 }
 
-/// `email`'s photo, once it's loaded. The first ask starts loading it.
+/// `email`'s photo in `account`, once it's loaded. The first ask starts loading it.
+pub(crate) fn photo_for(ctx: &egui::Context, account: &str, email: &str) -> Option<AvatarPhoto> {
+    let (photos, url) = {
+        let shared = registry(ctx);
+        let registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let (photos, people) = registry.accounts.get(&account.to_lowercase())?;
+        let url = people.get(&email.to_lowercase())?.photo.as_deref()?;
+        (photos.clone(), sized(url))
+    };
+    photo_from_cache(ctx, photos, url)
+}
+
+/// `email`'s photo in the active account (or the lone registered account when no active account
+/// has been marked yet), once it's loaded. The first ask starts loading it.
 pub fn photo(ctx: &egui::Context, email: &str) -> Option<AvatarPhoto> {
-    let shared = registry(ctx);
-    let mut registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
-    let email = email.to_lowercase();
-    let (photos, url) = registry.accounts.values().find_map(|(photos, people)| {
-        let url = people.get(&email)?.photo.as_deref()?;
-        Some((photos.clone(), sized(url)))
-    })?;
-    match registry.photos.get(&url) {
-        Some(Slot::Shown(photo)) => return Some(photo.clone()),
-        Some(Slot::Loading | Slot::Missing) => return None,
-        None => {}
+    if let Some(active) = active_account(ctx) {
+        return photo_for(ctx, &active, email);
     }
-    registry.photos.insert(url.clone(), Slot::Loading);
-    drop(registry);
-    load(&shared, photos, url);
-    None
+    let (photos, url) = {
+        let shared = registry(ctx);
+        let registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if registry.accounts.len() != 1 {
+            return None;
+        }
+        let email = email.to_lowercase();
+        let (photos, people) = registry.accounts.values().next()?;
+        let url = people.get(&email)?.photo.as_deref()?;
+        (photos.clone(), sized(url))
+    };
+    photo_from_cache(ctx, photos, url)
+}
+
+fn photo_from_cache(ctx: &egui::Context, photos: Photos, url: String) -> Option<AvatarPhoto> {
+    let cache = photo_cache(ctx);
+    match cache.get_or_claim(url.clone()) {
+        Lookup::Shown(photo) => Some(photo),
+        Lookup::Claimed => {
+            load(cache, photos, url);
+            None
+        }
+        Lookup::Unavailable => None,
+    }
 }
 
 /// Paints `email`'s avatar filling `rect`: the default avatar (a `small` one's colours, as the
-/// calendar's guests have), with their photo (else their brand's logo) over it once it's loaded,
-/// snapped to the screen's pixels as a browser paints a background.
+/// calendar's guests have), with their photo (else the on-screen account's logo for their brand)
+/// over it once it's loaded, snapped to the screen's pixels as a browser paints a background.
 pub(crate) fn paint_avatar(painter: &egui::Painter, rect: egui::Rect, email: &str, small: bool) {
+    let brand = crate::brands::active_logo(painter.ctx(), email);
+    let photo = photo(painter.ctx(), email);
+    paint_avatar_photo(painter, rect, photo.or(brand), small);
+}
+
+/// [`paint_avatar`] scoped explicitly to `account`, with an explicit brand logo fallback (`None`
+/// when the message on screen didn't pass DMARC).
+pub(crate) fn paint_avatar_with_brand_for(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    account: &str,
+    email: &str,
+    brand: Option<&AvatarPhoto>,
+    small: bool,
+) {
+    let photo = photo_for(painter.ctx(), account, email).or_else(|| brand.cloned());
+    paint_avatar_photo(painter, rect, photo, small);
+}
+
+fn paint_avatar_photo(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    photo: Option<AvatarPhoto>,
+    small: bool,
+) {
     exo_ui::paint_default_avatar(painter, rect, small);
-    // Without a photo of the person, their brand's logo.
-    let ctx = painter.ctx();
-    if let Some(photo) = photo(ctx, email).or_else(|| crate::brands::logo(ctx, email)) {
+    if let Some(photo) = photo {
         let rect = egui::emath::GuiRounding::round_to_pixels(rect, painter.pixels_per_point());
         exo_ui::paint_photo(painter, rect, &photo);
     }
@@ -216,38 +308,33 @@ pub(crate) fn notification_copy(photo: &[u8], key: &str) -> Option<PathBuf> {
 /// `email`'s photo, if Google has one of them: the saved copy, else Google's within
 /// [`NOTIFICATION_WAIT`], which is saved and shows wherever they're drawn.
 async fn contact_photo(ctx: &egui::Context, email: &str) -> Option<Vec<u8>> {
-    let shared = registry(ctx);
     let email = email.to_lowercase();
-    let (photos, url, shown) = {
+    let (photos, url) = {
+        let shared = registry(ctx);
         let registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        let (photos, url) = registry.accounts.values().find_map(|(photos, people)| {
+        registry.accounts.values().find_map(|(photos, people)| {
             let url = people.get(&email)?.photo.as_deref()?;
             Some((photos.clone(), sized(url)))
-        })?;
-        let shown = matches!(registry.photos.get(&url), Some(Slot::Shown(_)));
-        (photos, url, shown)
+        })?
     };
+    let cache = photo_cache(ctx);
+    let shown = cache.is_shown(&url);
     let photo = tokio::time::timeout(NOTIFICATION_WAIT, fetch(&photos, &url))
         .await
         .inspect_err(|_| log::info!("a notification goes without its photo, which is slow to come"))
         .ok()??;
     if !shown {
-        show(&shared, ctx, &url, &photo);
+        cache.finish_decode(url, "contact photo", &photo);
     }
     Some(photo)
 }
 
-/// Loads the photo at `url` into `shared`, or marks it missing.
-fn load(shared: &Shared, photos: Photos, url: String) {
-    let (shared, ctx, source, asked) = (
-        shared.clone(),
-        photos.ctx.clone(),
-        photos.clone(),
-        url.clone(),
-    );
+/// Loads the photo at `url` into `cache`, or marks it missing.
+fn load(cache: AvatarCache<String>, photos: Photos, url: String) {
+    let (source, asked) = (photos.clone(), url.clone());
     photos.loader.run(
         move |_| async move { fetch(&source, &asked).await },
-        move |photo| show(&shared, &ctx, &url, &photo.unwrap_or_default()),
+        move |photo| cache.finish_decode(url, "contact photo", &photo.unwrap_or_default()),
     );
 }
 
@@ -270,34 +357,10 @@ async fn fetch(photos: &Photos, url: &str) -> Option<Vec<u8>> {
     Some(photo)
 }
 
-/// Shows `bytes` as the photo at `url`, or none when they aren't an image.
-fn show(shared: &Shared, ctx: &egui::Context, url: &str, bytes: &[u8]) {
-    let slot = match image::load_from_memory(bytes) {
-        Ok(image) => {
-            let image = image.into_rgb8();
-            let size = [image.width() as usize, image.height() as usize];
-            Slot::Shown(AvatarPhoto::new(
-                ctx,
-                "contact photo",
-                egui::ColorImage::from_rgb(size, image.as_raw()),
-            ))
-        }
-        Err(_) => Slot::Missing,
-    };
-    let mut registry = shared.lock().unwrap_or_else(PoisonError::into_inner);
-    registry.photos.insert(url.to_owned(), slot);
-    drop(registry);
-    ctx.request_repaint();
-}
-
-/// Writes `bytes` to `file` through a temporary file, so a crash never leaves half a photo.
+/// Writes `bytes` to `file` through a unique temporary file, so concurrent saves never race and a
+/// crash never leaves half a photo.
 pub(crate) fn save(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let partial = file.with_extension("partial");
-    std::fs::write(&partial, bytes)?;
-    std::fs::rename(&partial, file)
+    fastframe_file::write(file, bytes)
 }
 
 /// `url` asking for [`SIZE`] pixels in place of the size Google lists (`=s100`).
@@ -312,14 +375,17 @@ fn sized(url: &str) -> String {
 
 /// A file name for `text` (a photo's or logo's URL, a notification's key).
 pub(crate) fn file_name(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Whether `url` is one of Google's photos (`https://lh3.googleusercontent.com/…`), or, with
-/// `local`, from this Mac (gmail-mock serves its own).
+/// `local`, from this Mac (mock-servers serves its own).
 fn is_google_photo(url: &str, local: bool) -> bool {
     let Ok(url) = url::Url::parse(url) else {
         return false;
@@ -371,5 +437,147 @@ mod tests {
             sized("https://lh3.googleusercontent.com/a/photo.jpg"),
             "https://lh3.googleusercontent.com/a/photo.jpg"
         );
+        assert_eq!(
+            file_name("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn notification_copies_keep_their_image_extension_without_partial_races() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("png");
+        let png = png.into_inner();
+        let key = format!(
+            "notice-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let written = notification_copy(&png, &key).expect("copied");
+        assert_eq!(
+            written.extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+        assert_eq!(std::fs::read(&written).expect("read"), png);
+        let _ = std::fs::remove_file(written);
+    }
+
+    #[test]
+    fn contacts_and_photos_stay_isolated_per_active_account() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!(
+            "exo-people-isolation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = crate::account::Account::open(
+            &dir,
+            crate::account::Credentials {
+                email: "alice@work.example".into(),
+                endpoints,
+                tokens: Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([40, 80, 120, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("png");
+        let png = png.into_inner();
+
+        let secret_url = "https://lh3.googleusercontent.com/secret=s100";
+        let friend_url = "https://lh3.googleusercontent.com/friend=s100";
+        let cache = photo_cache(&ctx);
+        cache.finish_decode(sized(secret_url), "contact photo", &png);
+        cache.finish_decode(sized(friend_url), "contact photo", &png);
+
+        let photos_a = Photos::new(
+            &ctx,
+            "Alice@Work.Example",
+            account.loader(),
+            dir.join("a"),
+            false,
+        );
+        let photos_b = Photos::new(
+            &ctx,
+            "bob@personal.example",
+            account.loader(),
+            dir.join("b"),
+            false,
+        );
+
+        let secret = GoogleContact {
+            person: "people/c1".into(),
+            email: "secret@client.example".into(),
+            name: Some("Secret Client".into()),
+            photo: Some(secret_url.into()),
+            company: Some("ClientCo".into()),
+            title: Some("CEO".into()),
+        };
+        let friend = GoogleContact {
+            person: "people/c2".into(),
+            email: "friend@home.example".into(),
+            name: Some("Best Friend".into()),
+            photo: Some(friend_url.into()),
+            company: Some("HomeCo".into()),
+            title: None,
+        };
+
+        // Single registered account without explicit active account still resolves (unit-test compat).
+        photos_a.publish([&secret]);
+        assert_eq!(
+            person(&ctx, "secret@client.example")
+                .and_then(|p| p.company)
+                .as_deref(),
+            Some("ClientCo")
+        );
+        assert!(photo(&ctx, "secret@client.example").is_some());
+
+        // With two accounts and no active account marked, unscoped lookups refuse to guess.
+        photos_b.publish([&friend]);
+        assert!(person(&ctx, "secret@client.example").is_none());
+        assert!(photo(&ctx, "secret@client.example").is_none());
+
+        // Scoping to account B hides account A's contacts and photos.
+        set_active_account(&ctx, "bob@personal.example");
+        assert!(person(&ctx, "secret@client.example").is_none());
+        assert!(photo(&ctx, "secret@client.example").is_none());
+        assert_eq!(
+            person(&ctx, "friend@home.example")
+                .and_then(|p| p.company)
+                .as_deref(),
+            Some("HomeCo")
+        );
+        assert!(photo(&ctx, "friend@home.example").is_some());
+
+        // Explicit account-scoped lookups work regardless of which account is active.
+        assert_eq!(
+            person_for(&ctx, "alice@work.example", "secret@client.example")
+                .and_then(|p| p.company)
+                .as_deref(),
+            Some("ClientCo")
+        );
+        assert!(photo_for(&ctx, "alice@work.example", "secret@client.example").is_some());
+        assert!(person_for(&ctx, "bob@personal.example", "secret@client.example").is_none());
+        assert!(photo_for(&ctx, "bob@personal.example", "secret@client.example").is_none());
+
+        // Switching active account to A flips visibility cleanly, and forget clears active.
+        set_active_account(&ctx, "alice@work.example");
+        assert!(person(&ctx, "secret@client.example").is_some());
+        assert!(person(&ctx, "friend@home.example").is_none());
+
+        forget(&ctx, "alice@work.example");
+        assert!(active_account(&ctx).is_none());
+        assert!(person_for(&ctx, "alice@work.example", "secret@client.example").is_none());
+
+        drop(account);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

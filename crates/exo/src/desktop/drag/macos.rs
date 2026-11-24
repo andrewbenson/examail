@@ -75,9 +75,16 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|state| f(&mut state.borrow_mut()))
 }
 
+/// How winit declared `draggingEntered:` (`NSDragOperation` integer vs `BOOL`).
+#[derive(Clone, Copy)]
+enum Entered {
+    Operation(unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> usize),
+    Bool(unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> Bool),
+}
+
 /// winit's own destination methods, which Exo's methods call for files.
 struct Winit {
-    entered: unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> Bool,
+    entered: Entered,
     perform: unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> Bool,
     exited: unsafe extern "C-unwind" fn(&AnyObject, Sel, Option<&AnyObject>),
 }
@@ -187,19 +194,40 @@ fn install() -> Option<Winit> {
     type Operation = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> usize;
     type Perform = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> Bool;
     type Exited = unsafe extern "C-unwind" fn(&AnyObject, Sel, Option<&AnyObject>);
+    enum EnteredEncoding {
+        Operation,
+        Bool,
+    }
+    let entered_encoding = match entered.return_type().to_bytes() {
+        b"Q" | b"L" | b"I" => EnteredEncoding::Operation,
+        b"B" | b"c" => EnteredEncoding::Bool,
+        other => {
+            log::warn!(
+                "drags: unexpected draggingEntered: return encoding {:?}",
+                String::from_utf8_lossy(other)
+            );
+            return None;
+        }
+    };
     // SAFETY: each replacement has the signature AppKit calls the method with (`Q@:@`, `B@:@`,
-    // `v@:@`). winit declared `draggingEntered:` returning a BOOL, which is how Exo calls it.
-    // `draggingUpdated:` is added because winit has none.
+    // `v@:@`), and winit's `draggingEntered:` is called with the return ABI its own Objective-C
+    // encoding declares. `draggingUpdated:` is added because winit has none.
     unsafe {
         let set = |method: &objc2::runtime::Method, imp: Imp| method.set_implementation(imp);
+        let entered_imp = set(
+            entered,
+            std::mem::transmute::<Operation, Imp>(dragging_entered),
+        );
+        let entered = match entered_encoding {
+            EnteredEncoding::Operation => {
+                Entered::Operation(std::mem::transmute::<Imp, Operation>(entered_imp))
+            }
+            EnteredEncoding::Bool => {
+                Entered::Bool(std::mem::transmute::<Imp, Perform>(entered_imp))
+            }
+        };
         let winit = Winit {
-            entered: std::mem::transmute::<
-                Imp,
-                unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> Bool,
-            >(set(
-                entered,
-                std::mem::transmute::<Operation, Imp>(dragging_entered),
-            )),
+            entered,
             perform: std::mem::transmute::<Imp, Perform>(set(
                 perform,
                 std::mem::transmute::<Perform, Imp>(perform_drag),
@@ -241,11 +269,16 @@ unsafe extern "C-unwind" fn dragging_entered(
         let Some(Some(winit)) = WINIT.get() else {
             return 0;
         };
-        // SAFETY: winit's implementation, with AppKit's arguments.
-        let files = if unsafe { (winit.entered)(delegate, sel, info) }.as_bool() {
-            NSDragOperation::Copy
-        } else {
-            NSDragOperation::None
+        // SAFETY: winit's implementation, with AppKit's arguments and winit's declared return ABI.
+        let files = match winit.entered {
+            Entered::Operation(entered) => NSDragOperation(unsafe { entered(delegate, sel, info) }),
+            Entered::Bool(entered) => {
+                if unsafe { entered(delegate, sel, info) }.as_bool() {
+                    NSDragOperation::Copy
+                } else {
+                    NSDragOperation::None
+                }
+            }
         };
         with(|state| state.files = files.0);
         return files.0;
@@ -318,10 +351,14 @@ fn place(info: &AnyObject) -> Option<Place> {
     };
     let view = window?.contentView()?;
     let in_view = view.convertPoint_fromView(location, None);
-    let height = view.frame().size.height;
+    let y = if view.isFlipped() {
+        in_view.y
+    } else {
+        view.frame().size.height - in_view.y
+    };
     with(|state| {
         let window = state.window.as_ref()?;
-        let at = pos2(in_view.x as f32, (height - in_view.y) as f32) / window.zoom;
+        let at = pos2(in_view.x as f32, y as f32) / window.zoom;
         let target = window.targets.iter().any(|target| target.contains(at));
         let ours = state.session.as_ref().filter(|session| {
             source.as_deref().is_some_and(|source| {
@@ -512,14 +549,16 @@ fn start(mtm: MainThreadMarker, ctx: &egui::Context, outgoing: Outgoing) -> bool
         NSDraggingItem::alloc(),
         ProtocolObject::from_ref(&*source),
     );
-    // The content view's coordinates start at its bottom left, in Mac points.
+    let flipped = view.isFlipped();
     let height = view.frame().size.height;
     let to_view = |rect: Rect| {
+        let y = if flipped {
+            f64::from(rect.min.y * zoom)
+        } else {
+            height - f64::from(rect.max.y * zoom)
+        };
         NSRect::new(
-            NSPoint::new(
-                f64::from(rect.min.x * zoom),
-                height - f64::from(rect.max.y * zoom),
-            ),
+            NSPoint::new(f64::from(rect.min.x * zoom), y),
             NSSize::new(
                 f64::from(rect.width() * zoom),
                 f64::from(rect.height() * zoom),
@@ -537,10 +576,12 @@ fn start(mtm: MainThreadMarker, ctx: &egui::Context, outgoing: Outgoing) -> bool
             egui::Vec2::splat(1.0),
         ))),
     }
-    let point = NSPoint::new(
-        f64::from(pointer.x * zoom),
-        height - f64::from(pointer.y * zoom),
-    );
+    let y = if flipped {
+        f64::from(pointer.y * zoom)
+    } else {
+        height - f64::from(pointer.y * zoom)
+    };
+    let point = NSPoint::new(f64::from(pointer.x * zoom), y);
     // AppKit wants the mouse event that the drag comes from. egui has had that event already, so a
     // dragged event at the pointer stands in for it.
     let Some(event) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(

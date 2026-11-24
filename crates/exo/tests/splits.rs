@@ -377,7 +377,7 @@ fn an_empty_split_offers_to_hide_empty_splits_and_a_new_hidden_one_says_so() {
     app.key(Key::Enter);
     app.settle();
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Split 'Nothing' created."),
         "it shows while empty, so it doesn't say so"
     );
@@ -399,7 +399,7 @@ fn an_empty_split_offers_to_hide_empty_splits_and_a_new_hidden_one_says_so() {
             .hides_when_empty()
             && app.mail().account().settings().hides_other_when_empty()
     );
-    assert_eq!(app.mail().toast(), Some("Split Inboxes updated."));
+    assert_eq!(app.mail().toast_text(), Some("Split Inboxes updated."));
     // `z` is Undo, which shows them while empty again.
     app.key(Key::Escape);
     app.key(Key::Z);
@@ -418,7 +418,7 @@ fn an_empty_split_offers_to_hide_empty_splits_and_a_new_hidden_one_says_so() {
     app.key(Key::Enter);
     app.settle();
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("This Split Inbox is hidden when empty.")
     );
 }
@@ -468,7 +468,11 @@ fn vip_picks_senders_from_the_address_book_and_refuses_what_isnt_an_address() {
             true
         )
     );
-    assert!(app.mail().settings_dialog_open(), "back on the library");
+    assert!(
+        !app.mail().settings_dialog_open(),
+        "turning on the split closes the dialog"
+    );
+    assert_eq!(*app.mail().list(), ListId::Split(vip.id));
 }
 
 #[test]

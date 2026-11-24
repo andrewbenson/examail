@@ -145,26 +145,65 @@ fn week_of(date: Date) -> Date {
 }
 
 impl Recurrence {
-    /// The rule of a series' `recurrence` lines (its `RRULE`, else its first line), when it's
-    /// one the event form can make.
+    /// The rule of a series' `recurrence` lines (its `RRULE`, else its first line) in `tz`, when
+    /// it's one the event form can make.
     #[must_use]
-    pub fn from_rules(lines: &[String]) -> Option<Self> {
+    pub fn from_rules(lines: &[String], tz: &TimeZone) -> Option<Self> {
+        Self::parse_rules(lines, tz, None)
+    }
+
+    /// [`from_rules`](Self::from_rules), also verifying that a monthly `BYDAY` weekday matches
+    /// `start`'s weekday so expansion and splits cannot silently shift the rule to another day.
+    #[must_use]
+    pub(crate) fn from_rules_for(lines: &[String], start: &Zoned) -> Option<Self> {
+        Self::parse_rules(lines, start.time_zone(), Some(start.weekday()))
+    }
+
+    fn parse_rules(
+        lines: &[String],
+        tz: &TimeZone,
+        start_weekday: Option<Weekday>,
+    ) -> Option<Self> {
+        if lines
+            .iter()
+            .any(|line| line.starts_with("EXDATE") || line.starts_with("RDATE"))
+            || lines
+                .iter()
+                .filter(|line| line.starts_with("RRULE"))
+                .count()
+                > 1
+        {
+            return None;
+        }
         let line = lines
             .iter()
             .find(|line| line.starts_with("RRULE"))
             .or(lines.first())?;
         let rule = line.strip_prefix("RRULE:").unwrap_or(line);
         let (mut frequency, mut interval, mut end, mut by_day) =
-            (None, 1, End::Never, None::<Vec<(Option<i8>, Weekday)>>);
+            (None, 1, None, None::<Vec<(Option<i8>, Weekday)>>);
         for part in rule.split(';') {
             let (key, value) = part.split_once('=')?;
             match key {
                 "FREQ" => frequency = Some(value),
                 "INTERVAL" => interval = value.parse().ok().filter(|interval| *interval > 0)?,
-                "COUNT" => end = End::After(value.parse().ok()?),
-                "UNTIL" => end = End::On(until_date(value)?),
+                "COUNT" => {
+                    if end.is_some() {
+                        return None;
+                    }
+                    end = Some(End::After(value.parse().ok()?));
+                }
+                "UNTIL" => {
+                    if end.is_some() {
+                        return None;
+                    }
+                    end = Some(End::On(until_date(value, tz)?));
+                }
                 "BYDAY" => {
                     let days = value.split(',').map(|token| {
+                        if !token.is_ascii() {
+                            return None;
+                        }
                         let at = token.len().checked_sub(2)?;
                         let ordinal = if at == 0 {
                             None
@@ -175,7 +214,8 @@ impl Recurrence {
                     });
                     by_day = Some(days.collect::<Option<_>>()?);
                 }
-                _ => {}
+                "WKST" if value == "SU" => {}
+                _ => return None,
             }
         }
         let frequency = match (frequency?, by_day) {
@@ -188,7 +228,12 @@ impl Recurrence {
             ),
             ("MONTHLY", None) => Frequency::MonthlyOnDay,
             ("MONTHLY", Some(days)) => match days.as_slice() {
-                [(Some(ordinal), _)] => {
+                [(Some(ordinal), weekday)] => {
+                    if let Some(expected) = start_weekday
+                        && *weekday != expected
+                    {
+                        return None;
+                    }
                     Frequency::MonthlyOnWeekday(Some(Nth::from_ordinal(*ordinal)?))
                 }
                 _ => return None,
@@ -199,7 +244,7 @@ impl Recurrence {
         Some(Self {
             frequency,
             interval,
-            end,
+            end: end.unwrap_or(End::Never),
         })
     }
 
@@ -366,7 +411,8 @@ impl Recurrence {
 }
 
 /// A series' start or end as a time in its zone, and whether it's all-day. The zone is
-/// `calendar_tz` for an all-day time or when none is given.
+/// `calendar_tz` for an all-day time or when none is given (falling back to an RFC 3339 offset
+/// when `calendar_tz` is UTC).
 pub(crate) fn zoned(time: &EventDateTime, calendar_tz: &TimeZone) -> Option<(Zoned, bool)> {
     if let Some(date) = &time.date {
         return Some((
@@ -377,19 +423,78 @@ pub(crate) fn zoned(time: &EventDateTime, calendar_tz: &TimeZone) -> Option<(Zon
             true,
         ));
     }
+    let date_time = time.date_time.as_deref()?;
     let tz = time
         .time_zone
         .as_deref()
         .and_then(|name| TimeZone::get(name).ok())
+        .or_else(|| (calendar_tz != &TimeZone::UTC).then(|| calendar_tz.clone()))
+        .or_else(|| rfc3339_zone(date_time))
         .unwrap_or_else(|| calendar_tz.clone());
-    Some((
-        time.date_time
-            .as_deref()?
-            .parse::<Timestamp>()
-            .ok()?
-            .to_zoned(tz),
-        false,
-    ))
+    Some((date_time.parse::<Timestamp>().ok()?.to_zoned(tz), false))
+}
+
+/// Fixed-offset [`TimeZone`] parsed from an RFC 3339 timestamp's trailing `Z` or `±HH:MM`.
+pub(crate) fn rfc3339_zone(text: &str) -> Option<TimeZone> {
+    let trimmed = text.trim();
+    if trimmed.ends_with(['Z', 'z']) {
+        return Some(TimeZone::UTC);
+    }
+    let tail = trimmed.get(trimmed.len().checked_sub(6)?..)?;
+    if !tail.is_ascii() {
+        return None;
+    }
+    let sign = match tail.as_bytes().first()? {
+        b'+' => 1_i32,
+        b'-' => -1_i32,
+        _ => return None,
+    };
+    if tail.as_bytes().get(3) != Some(&b':') {
+        return None;
+    }
+    let hours: i32 = tail[1..3].parse().ok()?;
+    let minutes: i32 = tail[4..6].parse().ok()?;
+    let seconds = sign * (hours * 3600 + minutes * 60);
+    jiff::tz::Offset::from_seconds(seconds)
+        .ok()
+        .map(TimeZone::fixed)
+}
+
+/// Rewrites any `UNTIL=` in `lines` to match `all_day` (date `YYYYMMDD` for all-day, else UTC
+/// date-time at the end of that day in `start`'s zone), reading existing `UNTIL` values in
+/// `old_tz`.
+pub(crate) fn retime_until(
+    lines: &[String],
+    start: &Zoned,
+    all_day: bool,
+    old_tz: &TimeZone,
+) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| match line.strip_prefix("RRULE:") {
+            Some(rule) => {
+                let parts: Vec<String> = rule
+                    .split(';')
+                    .map(|part| match part.strip_prefix("UNTIL=") {
+                        Some(value) => match until_date(value, old_tz) {
+                            Some(day) if all_day => format!("UNTIL={}", day.strftime("%Y%m%d")),
+                            Some(day) => {
+                                let last = day
+                                    .at(23, 59, 59, 0)
+                                    .to_zoned(start.time_zone().clone())
+                                    .map_or(Timestamp::MAX, |at| at.timestamp());
+                                format!("UNTIL={}", last.strftime("%Y%m%dT%H%M%SZ"))
+                            }
+                            None => part.to_owned(),
+                        },
+                        None => part.to_owned(),
+                    })
+                    .collect();
+                format!("RRULE:{}", parts.join(";"))
+            }
+            None => line.clone(),
+        })
+        .collect()
 }
 
 /// An instance's start in Calendar's form, which is `2026-11-17` for all-day, else the time with
@@ -411,9 +516,6 @@ fn instance_time(at: &Zoned, all_day: bool, like: &EventDateTime) -> EventDateTi
 /// Calendar would list them. Each has the id `{series}_{start}` and the series' id as its
 /// `recurringEventId`, and keeps the series' rule so it can be described.
 pub(crate) fn instances(event: &Event, from: Timestamp, to: Timestamp) -> Vec<Event> {
-    let Some(rule) = Recurrence::from_rules(&event.recurrence) else {
-        return vec![event.clone()];
-    };
     let (Some(start), Some(end), Some(id)) = (
         event.start.as_ref(),
         event.end.as_ref(),
@@ -424,6 +526,9 @@ pub(crate) fn instances(event: &Event, from: Timestamp, to: Timestamp) -> Vec<Ev
     let (Some((first, all_day)), Some((last, _))) =
         (zoned(start, &TimeZone::UTC), zoned(end, &TimeZone::UTC))
     else {
+        return vec![event.clone()];
+    };
+    let Some(rule) = Recurrence::from_rules_for(&event.recurrence, &first) else {
         return vec![event.clone()];
     };
     let length = last.timestamp().duration_since(first.timestamp());
@@ -460,13 +565,18 @@ pub(crate) fn instances(event: &Event, from: Timestamp, to: Timestamp) -> Vec<Ev
         .collect()
 }
 
-/// The day of `UNTIL`, as written for a date, else the UTC day of the time.
-fn until_date(value: &str) -> Option<Date> {
+/// The day of `UNTIL`, as written for a date, else the time's day in `tz`.
+fn until_date(value: &str, tz: &TimeZone) -> Option<Date> {
     if value.len() == 8 {
         return Date::strptime("%Y%m%d", value).ok();
     }
-    let at = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%SZ", value).ok()?;
-    Some(at.to_zoned(TimeZone::UTC).ok()?.date())
+    if let Some(utc) = value.strip_suffix('Z') {
+        let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", utc).ok()?;
+        let at = civil.to_zoned(TimeZone::UTC).ok()?.timestamp();
+        return Some(at.to_zoned(tz.clone()).date());
+    }
+    let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", value).ok()?;
+    Some(civil.date())
 }
 
 #[cfg(test)]
@@ -530,7 +640,8 @@ mod tests {
 
     #[test]
     fn rules_read_back_when_the_form_could_make_them() {
-        let read = |line: &str| Recurrence::from_rules(&[line.to_owned()]);
+        let ny = TimeZone::get("America/New_York").expect("zone");
+        let read = |line: &str| Recurrence::from_rules(&[line.to_owned()], &ny);
         assert_eq!(
             read("RRULE:FREQ=WEEKLY;BYDAY=TU;WKST=SU"),
             Some(rule(
@@ -553,8 +664,38 @@ mod tests {
         );
         assert_eq!(
             read("RRULE:FREQ=YEARLY;UNTIL=20270218T045959Z"),
-            Some(rule(Frequency::Yearly, 1, End::On(date(2027, 2, 18)))),
-            "a time's UTC day"
+            Some(rule(Frequency::Yearly, 1, End::On(date(2027, 2, 17)))),
+            "UNTIL in UTC converts to the series zone without +1 day drift"
+        );
+        let la = TimeZone::get("America/Los_Angeles").expect("zone");
+        let la_start: Zoned = "2026-11-17T09:00[America/Los_Angeles]"
+            .parse()
+            .expect("time");
+        let rrule = rule(Frequency::Daily, 1, End::On(date(2026, 11, 20))).rule(&la_start, false);
+        assert_eq!(
+            Recurrence::from_rules(std::slice::from_ref(&rrule), &la),
+            Some(rule(Frequency::Daily, 1, End::On(date(2026, 11, 20))))
+        );
+        let series = Event {
+            id: Some("s1".into()),
+            start: Some(EventDateTime {
+                date_time: Some("2026-11-18T09:00:00-08:00".into()),
+                time_zone: Some("America/Los_Angeles".into()),
+                ..EventDateTime::default()
+            }),
+            end: Some(EventDateTime {
+                date_time: Some("2026-11-18T09:30:00-08:00".into()),
+                time_zone: Some("America/Los_Angeles".into()),
+                ..EventDateTime::default()
+            }),
+            recurrence: vec![rrule],
+            ..Event::default()
+        };
+        let expanded = instances(&series, Timestamp::MIN, Timestamp::MAX);
+        assert_eq!(
+            expanded.len(),
+            3,
+            "Nov 18, 19 and 20 only — never spills onto Nov 21"
         );
         assert_eq!(
             read("RRULE:FREQ=MONTHLY;BYDAY=TU"),
@@ -642,5 +783,47 @@ mod tests {
         );
         let from_dec = fridays.from_day(&at("2026-11-20T15:00"), date(2026, 11, 30));
         assert_eq!(from_dec.end, End::After(3), "Nov 20, 23 and 27 came before");
+    }
+
+    #[test]
+    fn non_ascii_byday_and_unsupported_rrule_keys_return_none_without_panicking() {
+        let ny = TimeZone::get("America/New_York").expect("zone");
+        let read = |line: &str| Recurrence::from_rules(&[line.to_owned()], &ny);
+
+        // Multi-byte UTF-8 tokens in BYDAY must never panic on byte-index slicing.
+        assert_eq!(read("RRULE:FREQ=WEEKLY;BYDAY=éa"), None);
+        assert_eq!(read("RRULE:FREQ=WEEKLY;BYDAY=1é"), None);
+        assert_eq!(read("RRULE:FREQ=MONTHLY;BYDAY=é1"), None);
+        assert_eq!(read("RRULE:FREQ=WEEKLY;BYDAY=MO,éa"), None);
+
+        // Unrecognized/unrepresentable RRULE clauses and EXDATE/RDATE are rejected.
+        assert_eq!(read("RRULE:FREQ=MONTHLY;BYMONTHDAY=15"), None);
+        assert_eq!(read("RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=4TH"), None);
+        assert_eq!(read("RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2"), None);
+        assert_eq!(read("RRULE:FREQ=WEEKLY;BYDAY=MO;WKST=MO"), None);
+        assert_eq!(
+            Recurrence::from_rules(
+                &[
+                    "RRULE:FREQ=WEEKLY;BYDAY=TU".to_owned(),
+                    "EXDATE:20261117T150000Z".to_owned(),
+                ],
+                &ny,
+            ),
+            None
+        );
+
+        // Monthly BYDAY weekday must match start's weekday in `from_rules_for`.
+        let tuesday = at("2026-11-17T09:00");
+        let friday = at("2026-11-27T09:00");
+        let last_friday = ["RRULE:FREQ=MONTHLY;BYDAY=-1FR;COUNT=4".to_owned()];
+        assert_eq!(Recurrence::from_rules_for(&last_friday, &tuesday), None);
+        assert_eq!(
+            Recurrence::from_rules_for(&last_friday, &friday),
+            Some(rule(
+                Frequency::MonthlyOnWeekday(Some(Nth::Last)),
+                1,
+                End::After(4),
+            ))
+        );
     }
 }

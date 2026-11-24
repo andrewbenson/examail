@@ -146,7 +146,7 @@ impl Mail {
     /// list can't be acted on in bulk, says why it can't be done. Where the list can't but every
     /// row is loaded, the triage is left to act row by row. Returns whether it took the triage.
     pub(crate) fn bulk_instead(&mut self, ids: &[String], mutation: &Mutation) -> bool {
-        let Some(name) = name(mutation) else {
+        let Some(name) = crate::triage_copy::bulk_name(mutation) else {
             return false;
         };
         if self.thread.is_some() || !self.inbox.is_selecting() || self.inbox.selection() != ids {
@@ -188,7 +188,12 @@ impl Mail {
                 .map(ThreadId::new)
                 .collect(),
         };
-        let toast = self.bulk_toast(mutation);
+        let toast = crate::triage_copy::bulk_toast(
+            mutation,
+            &self.list,
+            &self.snapshot.labels,
+            self.account.settings().splits(),
+        );
         let request = Request {
             name,
             query: None,
@@ -424,7 +429,12 @@ impl Mail {
             vec!["Got it"],
             Plan {
                 request,
-                toast: "Marking as Done.".into(),
+                toast: crate::triage_copy::bulk_toast(
+                    &Mutation::MarkDone,
+                    &self.list,
+                    &self.snapshot.labels,
+                    self.account.settings().splits(),
+                ),
             },
         );
     }
@@ -471,52 +481,6 @@ impl Mail {
                     self.bulk_run(action);
                 }
             }
-        }
-    }
-
-    /// The toast for a bulk action, saying what it's doing.
-    fn bulk_toast(&self, mutation: &Mutation) -> String {
-        let label = |id: &str| crate::pickers::label_name(id, &self.snapshot.labels).to_owned();
-        match mutation {
-            Mutation::MarkDone => "Marking as Done.".into(),
-            Mutation::MarkNotDone => "Marking not Done.".into(),
-            Mutation::Star => "Starring.".into(),
-            Mutation::Unstar => "Unstarring.".into(),
-            Mutation::MarkRead => "Marking as Read.".into(),
-            Mutation::MarkUnread => "Marking as Unread.".into(),
-            Mutation::Trash => "Moving to Trash.".into(),
-            Mutation::Untrash => "Moving to Inbox.".into(),
-            Mutation::Spam => "Marking as Spam.".into(),
-            Mutation::NotSpam => "Marking as Not Spam.".into(),
-            Mutation::Mute => "Muting.".into(),
-            Mutation::Unmute => "Unmuting.".into(),
-            Mutation::AddLabel(id) => format!("Adding to label {}.", label(id)),
-            // `Y` names the list it takes threads out of.
-            Mutation::RemoveLabel(id) => {
-                let name = if crate::pickers::removable_label(&self.list).as_ref() == Some(id) {
-                    crate::lists::name(
-                        &self.list,
-                        &self.snapshot.labels,
-                        self.account.settings().splits(),
-                    )
-                    .to_owned()
-                } else {
-                    label(id)
-                };
-                if name.is_empty() {
-                    "Removing from label.".into()
-                } else {
-                    format!("Removing from label {name}.")
-                }
-            }
-            Mutation::Move { from, to } => {
-                crate::pickers::move_text(from.as_deref(), to, &self.snapshot.labels, true)
-            }
-            // Never bulk, because these need loaded conversations.
-            Mutation::RemoveLabels(_)
-            | Mutation::Remind { .. }
-            | Mutation::CancelReminder { .. }
-            | Mutation::ReturnFromReminder => String::new(),
         }
     }
 
@@ -575,31 +539,5 @@ pub(crate) fn status(actions: &[Summary]) -> Option<String> {
             "Updating: {done} of {}",
             crate::format::thousands(action.total)
         )
-    })
-}
-
-/// What a bulk action of `mutation` is called. `None` for one that only runs on loaded
-/// conversations.
-fn name(mutation: &Mutation) -> Option<&'static str> {
-    Some(match mutation {
-        Mutation::MarkDone => "Mark Done",
-        Mutation::MarkNotDone => "Mark not Done",
-        Mutation::Star => "Star",
-        Mutation::Unstar => "Unstar",
-        Mutation::MarkRead => "Mark Read",
-        Mutation::MarkUnread => "Mark Unread",
-        Mutation::Move { .. } => "Move to Label",
-        Mutation::Mute => "Mute",
-        Mutation::Unmute => "Unmute",
-        Mutation::AddLabel(_) => "Add Label",
-        Mutation::RemoveLabel(_) => "Remove Label",
-        Mutation::Spam => "Mark Spam",
-        Mutation::NotSpam => "Mark not Spam",
-        Mutation::Trash => "Trash",
-        Mutation::Untrash => "Remove from Trash",
-        Mutation::RemoveLabels(_)
-        | Mutation::Remind { .. }
-        | Mutation::CancelReminder { .. }
-        | Mutation::ReturnFromReminder => return None,
     })
 }

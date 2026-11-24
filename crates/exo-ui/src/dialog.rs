@@ -313,9 +313,8 @@ impl<'a> Dialog<'a> {
     }
 }
 
-/// The close ×: two 1px bars corner to corner of its 12×13 box, in `color` (black, or white under
-/// the dark themes' `filter: invert(1)`, at some opacity).
-pub fn paint_close(painter: &Painter, top_left: Pos2, color: Color32) {
+/// Paints the two diagonal bars of the 12×13 close × at `top_left`, scaled by `scale`, in `color`.
+pub(crate) fn paint_close_glyph(painter: &Painter, top_left: Pos2, scale: f32, color: Color32) {
     let bars = [
         [
             [0.697, 0.49],
@@ -331,7 +330,146 @@ pub fn paint_close(painter: &Painter, top_left: Pos2, color: Color32) {
         ],
     ];
     for bar in bars {
-        let points = bar.iter().map(|[x, y]| top_left + vec2(*x, *y)).collect();
+        let points = bar
+            .iter()
+            .map(|[x, y]| top_left + vec2(*x, *y) * scale)
+            .collect();
         painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
     }
+}
+
+/// The close ×: two 1px bars corner to corner of its 12×13 box, in `color` (black, or white under
+/// the dark themes' `filter: invert(1)`, at some opacity).
+pub fn paint_close(painter: &Painter, top_left: Pos2, color: Color32) {
+    paint_close_glyph(painter, top_left, 1.0, color);
+}
+
+/// The focused row's fill inside a dialog (`#f4f6fb` in Snow, `#eaeaea` in Carbon), used by
+/// Blocked Senders and Bulk Actions.
+pub fn dialog_highlight(ctx: &egui::Context) -> Color32 {
+    match crate::app_theme(ctx) {
+        Theme::Snow => Theme::Snow.palette().fill_hover_default,
+        Theme::Carbon => Color32::from_rgb(0xea, 0xea, 0xea),
+    }
+}
+
+/// The surface highlight inside Split Inbox Library and Split Template dialogs (`#f2f4fa` in Snow,
+/// `#dee3f2` in Carbon).
+pub fn dialog_surface_highlight(ctx: &egui::Context) -> Color32 {
+    match crate::app_theme(ctx) {
+        Theme::Snow => Color32::from_rgb(0xf2, 0xf4, 0xfa),
+        Theme::Carbon => Color32::from_rgb(0xde, 0xe3, 0xf2),
+    }
+}
+
+const FOOTER_TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
+const FOOTER_INK: Color32 = Color32::from_black_alpha(153);
+
+/// Builder for a dialog's `12px/20px` footer line with inline shortcut keycaps.
+#[must_use]
+pub struct DialogFooter<'a> {
+    keys: &'a [&'a str],
+    first_gap: f32,
+    after_keys: f32,
+    cap_height: f32,
+    baseline: Option<f32>,
+}
+
+impl<'a> DialogFooter<'a> {
+    /// A dialog footer showing `keys` as 19px shortcut caps in the app's theme.
+    pub const fn new(keys: &'a [&'a str]) -> Self {
+        Self {
+            keys,
+            first_gap: crate::KEYCAP_GAP,
+            after_keys: 0.0,
+            cap_height: 19.0,
+            baseline: None,
+        }
+    }
+
+    /// Sets the space before the first cap (`first_gap`) and after the last cap (`after_keys`).
+    pub const fn gaps(mut self, first_gap: f32, after_keys: f32) -> Self {
+        self.first_gap = first_gap;
+        self.after_keys = after_keys;
+        self
+    }
+
+    /// Overrides the keycaps' label baseline inside the 19px cap.
+    pub const fn baseline(mut self, baseline: f32) -> Self {
+        self.baseline = Some(baseline);
+        self
+    }
+
+    /// Paints `lead`, the keycaps with their tops at `top` (dropping the text 1px to `top + 1.0`),
+    /// and `rest`.
+    pub fn paint(self, ui: &Ui, left: f32, top: f32, lead: &str, rest: &str) {
+        let painter = ui.painter();
+        let mut x =
+            left + FOOTER_TEXT.paint_line(painter, pos2(left, top + 1.0), lead, FOOTER_INK, None);
+        let mut caps = crate::Keycaps::new(
+            ui.ctx(),
+            self.keys,
+            crate::KeycapColors::shortcuts_pane(crate::app_theme(ui.ctx()).palette()),
+        )
+        .height(self.cap_height);
+        if let Some(baseline) = self.baseline {
+            caps = caps.baseline(baseline);
+        }
+        x += self.first_gap - crate::KEYCAP_GAP;
+        caps.paint(painter, x, top);
+        x += caps.width() + self.after_keys;
+        FOOTER_TEXT.paint_line(painter, pos2(x, top + 1.0), rest, FOOTER_INK, None);
+    }
+}
+
+/// Paints a dialog's footer line with `⌘ K` in it, with the caps' tops at `top`.
+pub fn paint_dialog_footer(
+    ui: &Ui,
+    left: f32,
+    top: f32,
+    lead: &str,
+    first_gap: f32,
+    after_keys: f32,
+    rest: &str,
+) {
+    DialogFooter::new(&["⌘", "K"])
+        .gaps(first_gap, after_keys)
+        .paint(ui, left, top, lead, rest);
+}
+
+/// Paints a dialog footer containing a literal square 18px `#abb7c5` cap (such as the Emoji
+/// dialog's `:` cap) flanked by `margin` on either side, with the text line at `line_top`.
+pub fn paint_dialog_literal_footer(
+    ui: &Ui,
+    left: f32,
+    line_top: f32,
+    lead: &str,
+    cap_text: &str,
+    margin: f32,
+    rest: &str,
+) {
+    const CAP_SIZE: f32 = 18.0;
+    const CAP_FILL: Color32 = Color32::from_rgb(0xab, 0xb7, 0xc5);
+    let painter = ui.painter();
+    let lead_width = FOOTER_TEXT.paint_line(painter, pos2(left, line_top), lead, FOOTER_INK, None);
+    let cap = Rect::from_min_size(
+        pos2(left + lead_width + margin, line_top + 1.0),
+        vec2(CAP_SIZE, CAP_SIZE),
+    );
+    painter.rect_filled(pixel_snap(cap), CornerRadius::same(3), CAP_FILL);
+    let glyph_width = FOOTER_TEXT.width(ui.ctx(), cap_text);
+    FOOTER_TEXT.paint_line(
+        painter,
+        pos2(cap.center().x - glyph_width / 2.0, line_top),
+        cap_text,
+        Color32::WHITE,
+        None,
+    );
+    FOOTER_TEXT.paint_line(
+        painter,
+        pos2(cap.right() + margin, line_top),
+        rest,
+        FOOTER_INK,
+        None,
+    );
 }

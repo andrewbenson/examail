@@ -196,6 +196,22 @@ fn the_link_input_ignores_what_the_sanitizer_strips() {
     editor.type_text("x");
     editor.set_selection(Selection::new(Pos::new(0, 0), Pos::new(0, 1)));
     editor.set_link("data:text/html,<script>alert(1)</script>");
+    editor.set_link("DATA:text/html,<script>alert(1)</script>");
+    editor.set_link("CHROME://settings");
+    editor.set_link("CHROME-EXTENSION://abc/page.html");
+    assert_eq!(editor.html(), r#"<div class="">x</div>"#);
+    editor.set_link("HTTPS://Example.com/docs");
+    assert_eq!(
+        editor.html(),
+        r#"<div class=""><a href="HTTPS://Example.com/docs" target="_blank">x</a></div>"#
+    );
+    editor.set_selection(Selection::new(Pos::new(0, 0), Pos::new(0, 1)));
+    editor.paste_text("HTTPS://New.org/path");
+    assert_eq!(
+        editor.html(),
+        r#"<div class=""><a href="HTTPS://New.org/path" target="_blank">x</a></div>"#
+    );
+    editor.set_selection(Selection::new(Pos::new(0, 0), Pos::new(0, 1)));
     editor.set_link("javascript:alert(1)");
     assert_eq!(
         editor.html(),

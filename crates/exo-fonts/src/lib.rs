@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Exo's fonts, compiled into the binary so nothing has to sit beside it.
 //!
 //! Each is an OFL font (Public Sans, Fira Mono, Inconsolata), instanced, sized, tracked and given

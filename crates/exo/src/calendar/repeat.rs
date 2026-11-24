@@ -448,7 +448,7 @@ impl Custom {
                 let left = card.left() + BODY_X;
                 TITLE.paint_line(&painter, pos2(left, card.top() + TOP), "Repeat", ink, None);
                 let mut y = card.top() + TOP + TITLE.line_height + FIELDS_TOP;
-                let mut lists: Vec<(Open, Pos2, Vec<String>, usize)> = Vec::new();
+                let mut lists: Vec<(Open, Pos2, Vec<String>, usize, bool)> = Vec::new();
 
                 // Every [n] [unit].
                 FIELD.paint_line(&painter, pos2(left, y + TEXT_TOP), "Every", ink, None);
@@ -490,6 +490,7 @@ impl Custom {
                         pos2(frequency.rect.left() - 12.0, frequency.rect.bottom() + 12.0),
                         ["day", "week", "month", "year"].map(str::to_owned).to_vec(),
                         highlighted,
+                        frequency.hovered(),
                     ));
                 }
                 y += ROW + FIELDS_GAP;
@@ -533,6 +534,7 @@ impl Custom {
                             pos2(button.rect.left() - 20.0, button.rect.bottom() + 12.0),
                             patterns.into_iter().map(|(_, name)| name).collect(),
                             highlighted,
+                            button.hovered(),
                         ));
                     }
                     y += ROW + FIELDS_GAP;
@@ -655,7 +657,7 @@ impl Custom {
                             Color32::from_black_alpha(13),
                         );
                     }
-                    paint_radio(&painter, pos2(radios, line), self.ends == ends, carbon);
+                    exo_ui::paint_radio(&painter, pos2(radios, line), self.ends == ends);
                     FIELD.paint_line(&painter, pos2(radios + RADIO + 8.0, line), label, ink, None);
                     if response.clicked() {
                         self.ends = ends;
@@ -691,12 +693,13 @@ impl Custom {
                                 self.end_text = end_text(self.end_date);
                             }
                             if let Some((Open::EndDate, _)) = self.open {
+                                let picker_id = exo_ui::id(ctx, "calendar-repeat-end-picker");
                                 ctx.move_to_top(egui::LayerId::new(
                                     egui::Order::Tooltip,
-                                    Id::new("calendar-repeat-end-picker"),
+                                    picker_id,
                                 ));
                                 let pick = exo_ui::DatePicker {
-                                    id: exo_ui::id(ctx, "calendar-repeat-end-picker"),
+                                    id: picker_id,
                                     month: &mut self.month,
                                     selected: Some(self.end_date),
                                     today,
@@ -776,7 +779,7 @@ impl Custom {
                     }
                 }
 
-                for (which, at, items, highlighted) in lists {
+                for (which, at, items, highlighted, trigger_hovered) in lists {
                     let labels: Vec<&str> = items.iter().map(String::as_str).collect();
                     let id = exo_ui::id(ctx, ("calendar-repeat-list", which as u8));
                     ctx.move_to_top(egui::LayerId::new(egui::Order::Tooltip, id));
@@ -796,9 +799,7 @@ impl Custom {
                         self.pick(which, index);
                     } else if let Some(index) = menu.hovered {
                         self.open = Some((which, index));
-                    } else if ui.input(|input| input.pointer.any_released())
-                        && !ui.rect_contains_pointer(menu.rect)
-                    {
+                    } else if menu.outside_released(ui, trigger_hovered) {
                         self.open = None;
                     }
                 }
@@ -908,21 +909,6 @@ const RADIO: f32 = 12.0;
 /// The title: 16px/24px; the fields 12px/16px.
 const TITLE: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 16.0, 24.0);
 const FIELD: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 16.0);
-
-/// A Classic radio: a ring of black at `.4` (Carbon's white), and when selected a 3px dot of
-/// `#57adda`, the dialog's radios' own.
-fn paint_radio(painter: &egui::Painter, at: Pos2, selected: bool, carbon: bool) {
-    let center = at + Vec2::splat(RADIO / 2.0);
-    let ring = if carbon {
-        Color32::from_white_alpha(102)
-    } else {
-        Color32::from_black_alpha(102)
-    };
-    painter.circle_stroke(center, 5.5, Stroke::new(1.0, ring));
-    if selected {
-        painter.circle_filled(center, 3.0, Color32::from_rgb(0x57, 0xad, 0xda));
-    }
-}
 
 /// A dropdown's button: `value`, then 10px on its caret (a 12px icon, black, Carbon's white at
 /// `.6`), 3px down the line and fitted to its 12×6.7 viewBox. It takes the keyboard on Tab.

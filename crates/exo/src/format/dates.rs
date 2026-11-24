@@ -142,54 +142,142 @@ pub fn tooltip(at: Timestamp, now: &Zoned) -> String {
     )
 }
 
+/// Civil-date classification shared between thread invite cards and calendar event details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventSpan {
+    SingleAllDay(Date),
+    MultiAllDay(Date, Date),
+    SameDayTimed,
+    MultiDayTimed,
+}
+
+impl EventSpan {
+    fn of(start: &Zoned, end: &Zoned, all_day: bool) -> Self {
+        if all_day {
+            let last = end
+                .date()
+                .yesterday()
+                .ok()
+                .filter(|day| *day >= start.date())
+                .unwrap_or_else(|| start.date());
+            if start.date() == last {
+                Self::SingleAllDay(start.date())
+            } else {
+                Self::MultiAllDay(start.date(), last)
+            }
+        } else if start.date() == end.date() {
+            Self::SameDayTimed
+        } else {
+            Self::MultiDayTimed
+        }
+    }
+}
+
+/// Formats an invite card's When row from display-zoned `start` and `end`, respecting explicit
+/// `all_day` so `>=24h` or midnight-to-midnight timed invites never masquerade as `(all day)`.
+pub fn invite_range(start: &Zoned, end: &Zoned, all_day: bool, recurring: bool) -> String {
+    let weekday = |date: Date| {
+        WEEKDAYS[usize::try_from(date.weekday().to_monday_zero_offset()).expect("weekdays are 0–6")]
+    };
+    let day = |date: Date| {
+        format!(
+            "{}, {} {}, {}",
+            weekday(date),
+            month_name(date),
+            ordinal(date.day()),
+            date.year()
+        )
+    };
+    let mut text = match EventSpan::of(start, end, all_day) {
+        EventSpan::SingleAllDay(date) => format!(
+            "{}, {} {} {} (all day)",
+            weekday(date),
+            month_name(date),
+            ordinal(date.day()),
+            date.year()
+        ),
+        EventSpan::MultiAllDay(first, last) => format!("{} – {} (all day)", day(first), day(last)),
+        EventSpan::SameDayTimed => format!(
+            "{} at {} – {} {}",
+            day(start.date()),
+            time(start),
+            time(end),
+            zone_abbreviation(end)
+        ),
+        EventSpan::MultiDayTimed => {
+            let full = |at: &Zoned| {
+                format!(
+                    "{} at {} {}",
+                    day(at.date()),
+                    time(at),
+                    zone_abbreviation(at)
+                )
+            };
+            format!("{} – {}", full(start), full(end))
+        }
+    };
+    if recurring {
+        text.push_str(" (recurring)");
+    }
+    text
+}
+
+/// Formats a calendar details popover's When row from `start` and `end`, respecting explicit
+/// `all_day` so multi-day timed events render both dates and times rather than `(all day)`.
+pub fn event_details_range(
+    start: &Zoned,
+    end: &Zoned,
+    all_day: bool,
+    recurring: bool,
+    now: &Zoned,
+) -> String {
+    let span = EventSpan::of(start, end, all_day);
+    let last_date = match span {
+        EventSpan::SingleAllDay(day) | EventSpan::MultiAllDay(_, day) => day,
+        EventSpan::SameDayTimed | EventSpan::MultiDayTimed => end.date(),
+    };
+    let this_year = start.year() == now.year() && last_date.year() == now.year();
+    let fmt_date = |day: Date| {
+        day.strftime(if this_year {
+            "%a, %b %-d"
+        } else {
+            "%a, %b %-d, %Y"
+        })
+        .to_string()
+    };
+    let mut text = match span {
+        EventSpan::SingleAllDay(day) => format!("{} (all day)", fmt_date(day)),
+        EventSpan::MultiAllDay(first, last) => {
+            format!("{} \u{2004}–\u{2004}{} ", fmt_date(first), fmt_date(last))
+        }
+        EventSpan::SameDayTimed => format!(
+            "{} \u{2004}·\u{2004}{}\u{2004}–\u{2004}{}",
+            fmt_date(start.date()),
+            time(start),
+            time(end)
+        ),
+        EventSpan::MultiDayTimed => format!(
+            "{} \u{2004}·\u{2004}{}\u{2004}–\u{2004}{} \u{2004}·\u{2004}{}",
+            fmt_date(start.date()),
+            time(start),
+            fmt_date(end.date()),
+            time(end)
+        ),
+    };
+    if recurring {
+        text.push_str(" (recurring)");
+    }
+    text
+}
+
 /// An invite's When: `Wednesday, November 25th, 2026 at 9:00 AM – 9:45 AM EST` on one day,
 /// `Monday, December 7th 2026 (all day)` for an all-day day, and both ends in full otherwise.
 pub fn calendar_range(start: Timestamp, end: Timestamp, now: &Zoned) -> String {
     let zone = now.time_zone().clone();
     let (start, end) = (start.to_zoned(zone.clone()), end.to_zoned(zone));
-    let weekday = |at: &Zoned| {
-        WEEKDAYS[usize::try_from(at.weekday().to_monday_zero_offset()).expect("weekdays are 0–6")]
-    };
-    let day = |at: &Zoned| {
-        format!(
-            "{}, {} {}, {}",
-            weekday(at),
-            month_name(at.date()),
-            ordinal(at.day()),
-            at.year()
-        )
-    };
-    if start.date() == end.date() {
-        return format!(
-            "{} at {} – {} {}",
-            day(&start),
-            time(&start),
-            time(&end),
-            zone_abbreviation(&end)
-        );
-    }
-    let midnight = |at: &Zoned| at.hour() == 0 && at.minute() == 0;
-    let all_day = midnight(&start) && midnight(&end);
-    if all_day && start.date().tomorrow().ok() == Some(end.date()) {
-        return format!(
-            "{}, {} {} {} (all day)",
-            weekday(&start),
-            month_name(start.date()),
-            ordinal(start.day()),
-            start.year()
-        );
-    }
-    if all_day {
-        let last = end
-            .date()
-            .yesterday()
-            .ok()
-            .and_then(|date| date.to_zoned(end.time_zone().clone()).ok())
-            .unwrap_or(end);
-        return format!("{} – {} (all day)", day(&start), day(&last));
-    }
-    let full = |at: &Zoned| format!("{} at {} {}", day(at), time(at), zone_abbreviation(at));
-    format!("{} – {}", full(&start), full(&end))
+    let midnight = |at: &Zoned| at.hour() == 0 && at.minute() == 0 && at.second() == 0;
+    let all_day = start.date() != end.date() && midnight(&start) && midnight(&end);
+    invite_range(&start, &end, all_day, false)
 }
 
 /// A calendar notification's times: `10:00 – 10:30AM` on one day, else both ends as
@@ -581,6 +669,32 @@ mod tests {
         assert_eq!(
             calendar_range(at("2026-12-09T00:00"), at("2026-12-12T00:00"), &now()),
             "Wednesday, December 9th, 2026 – Friday, December 11th, 2026 (all day)"
+        );
+        let zoned = |text: &str| {
+            format!("{text}[America/New_York]")
+                .parse::<Zoned>()
+                .expect("valid time")
+        };
+        assert_eq!(
+            event_details_range(
+                &zoned("2026-12-09T09:00:00"),
+                &zoned("2026-12-10T11:00:00"),
+                false,
+                false,
+                &now(),
+            ),
+            "Wed, Dec 9 \u{2004}·\u{2004}9:00 AM\u{2004}–\u{2004}Thu, Dec 10 \u{2004}·\u{2004}11:00 AM",
+            "26-hour timed event shows both dates and times rather than (all day)"
+        );
+        assert_eq!(
+            invite_range(
+                &zoned("2026-12-07T00:00:00"),
+                &zoned("2026-12-08T00:00:00"),
+                false,
+                true,
+            ),
+            "Monday, December 7th, 2026 at 12:00 AM EST – Tuesday, December 8th, 2026 at 12:00 AM EST (recurring)",
+            "midnight-to-midnight timed invite is not treated as all-day"
         );
     }
 

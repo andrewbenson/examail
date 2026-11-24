@@ -8,12 +8,7 @@
 //! line of its own. Reading doesn't sanitize, so the editor runs what it loads or pastes through
 //! `exo_mail::sanitize_fragment` first.
 
-use html5ever::{
-    parse_document,
-    serialize::{SerializeOpts, TraversalScope, serialize},
-    tendril::TendrilSink as _,
-};
-use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
+use exo_mail::dom::{self, NodeRef, Style};
 
 use crate::model::{Block, Container, Content, Document, Element, Piece, Run};
 
@@ -88,50 +83,43 @@ const MAX_DEPTH: usize = 512;
 
 /// Reads a draft body as the editor holds it once loaded. It doesn't sanitize.
 pub fn parse(html: &str) -> Document {
-    let (_document, root) = fragment(html);
+    let (document, root) = fragment(html);
     let mut reader = Reader::default();
-    reader.container(&root, &[]);
+    reader.container(&root);
+    dom::drop_tree(document);
     Document::new(reader.blocks)
 }
 
 /// Whether every top-level node of `html` is a `<blockquote>` or has no text.
 pub(crate) fn is_blockquoted(html: &str) -> bool {
-    fn text(node: &Handle) -> String {
-        match &node.data {
-            NodeData::Text { contents } => contents.borrow().to_string(),
-            _ => node.children.borrow().iter().map(text).collect(),
-        }
-    }
-    let (_document, root) = fragment(html);
-    let children = root.children.borrow();
-    children.iter().all(|child| {
-        matches!(&child.data, NodeData::Element { name, .. } if &*name.local == "blockquote")
-            || text(child).is_empty()
-    })
+    let (document, root) = fragment(html);
+    let result = dom::children(&root)
+        .iter()
+        .all(|child| dom::is(child, "blockquote") || dom::text_content(child).is_empty());
+    dom::drop_tree(document);
+    result
 }
 
 /// Reads pasted HTML with the paste cleanup. Only colour, weight, style and decoration survive as
 /// inline styles, and the result is normalized the way the editor cleans what it inserts. It
 /// doesn't sanitize.
 pub(crate) fn parse_paste(html: &str) -> Document {
-    let (_document, root) = fragment(html);
+    let (document, root) = fragment(html);
     let mut reader = Reader {
         paste: true,
         ..Reader::default()
     };
-    reader.container(&root, &[]);
+    reader.container(&root);
+    dom::drop_tree(document);
     Document::new(reader.blocks)
 }
 
 /// Parses `html` as a page's body would be (a `div`'s `innerHTML` parses the same way for the
-/// content the editor holds). Returns the document, which must outlive any use of the tree
-/// (dropping it empties every node), and its `<body>`.
-fn fragment(html: &str) -> (Handle, Handle) {
-    let document = parse_document(RcDom::default(), Default::default())
-        .one(html)
-        .document;
-    let root = find(&document, "html").unwrap_or_else(|| document.clone());
-    let body = find(&root, "body").unwrap_or(root);
+/// content the editor holds). Returns the document, which must outlive any use of the tree, and
+/// its `<body>`.
+fn fragment(html: &str) -> (NodeRef, NodeRef) {
+    let document = dom::parse(html);
+    let body = dom::body(&document).unwrap_or_else(|| document.clone());
     prune(&body);
     (document, body)
 }
@@ -139,22 +127,20 @@ fn fragment(html: &str) -> (Handle, Handle) {
 /// Takes [`DROPPED_TAGS`] out of `root`, tables included, and gives elements deeper than
 /// [`MAX_DEPTH`] their children as siblings. Iterative, so hostile nesting can't overflow the
 /// stack.
-fn prune(root: &Handle) {
+fn prune(root: &NodeRef) {
     let mut levels = vec![(root.clone(), 0)];
     while let Some((node, depth)) = levels.pop() {
-        let mut pending: std::collections::VecDeque<Handle> =
-            std::mem::take(&mut *node.children.borrow_mut()).into();
+        let mut pending: std::collections::VecDeque<NodeRef> = dom::take_children(&node).into();
         let mut kept = Vec::with_capacity(pending.len());
         while let Some(child) = pending.pop_front() {
-            if let NodeData::Element { name, .. } = &child.data {
-                if DROPPED_TAGS.contains(&&*name.local) {
+            if let Some(tag) = dom::tag(&child) {
+                dom::clear_template_contents(&child);
+                if DROPPED_TAGS.contains(&tag) {
+                    dom::drop_tree(child);
                     continue;
                 }
                 if depth >= MAX_DEPTH {
-                    for grandchild in std::mem::take(&mut *child.children.borrow_mut())
-                        .into_iter()
-                        .rev()
-                    {
+                    for grandchild in dom::take_children(&child).into_iter().rev() {
                         pending.push_front(grandchild);
                     }
                 } else {
@@ -163,120 +149,129 @@ fn prune(root: &Handle) {
             }
             kept.push(child);
         }
-        *node.children.borrow_mut() = kept;
+        dom::set_children(&node, kept);
     }
-}
-
-fn find(node: &Handle, tag: &str) -> Option<Handle> {
-    node.children
-        .borrow()
-        .iter()
-        .find(|child| matches!(&child.data, NodeData::Element { name, .. } if &*name.local == tag))
-        .cloned()
 }
 
 #[derive(Default)]
 struct Reader {
     blocks: Vec<Block>,
+    path: Vec<Container>,
+    marks: Vec<Element>,
     next_id: u32,
     paste: bool,
 }
 
 impl Reader {
-    fn container(&mut self, node: &Handle, path: &[Container]) {
+    fn container(&mut self, node: &NodeRef) {
         let mut inline: Vec<Run> = Vec::new();
-        for child in node.children.borrow().iter() {
-            match &child.data {
-                NodeData::Element { name, .. }
-                    if is_block(&name.local) || OPAQUE_TAGS.contains(&&*name.local) =>
-                {
-                    self.flush_loose(&mut inline, path);
-                    self.block(child, path);
+        for child in dom::children(node) {
+            if let Some(tag) = dom::tag(&child) {
+                if is_block(tag) || OPAQUE_TAGS.contains(&tag) {
+                    self.flush_loose(&mut inline);
+                    self.block(&child);
+                } else if !DROPPED_TAGS.contains(&tag) {
+                    self.inline(&child, &mut inline);
                 }
-                NodeData::Element { name, .. } if DROPPED_TAGS.contains(&&*name.local) => {}
-                NodeData::Element { .. } | NodeData::Text { .. } => {
-                    self.inline(child, &[], &mut inline)
-                }
-                _ => {}
+            } else if dom::is_text(&child) {
+                self.inline(&child, &mut inline);
             }
         }
-        self.flush_loose(&mut inline, path);
+        self.flush_loose(&mut inline);
     }
 
     /// Text and inline elements directly inside a container, read as a line with no block
     /// element.
-    fn flush_loose(&mut self, inline: &mut Vec<Run>, path: &[Container]) {
+    fn flush_loose(&mut self, inline: &mut Vec<Run>) {
+        if inline.is_empty() {
+            return;
+        }
         let runs = std::mem::take(inline);
-        let mut block = Block::div(path.to_vec(), runs);
+        let mut block = Block::div(self.path.clone(), runs);
         block.element = Element::new("");
         if finish(&mut block) || block.trailing_break {
             self.blocks.push(block);
         }
     }
 
-    fn block(&mut self, node: &Handle, path: &[Container]) {
+    fn block(&mut self, node: &NodeRef) {
         let element = element_of(node, self.paste);
         if OPAQUE_TAGS.contains(&element.tag.as_str()) {
-            let mut block = Block::div(path.to_vec(), Vec::new());
+            let mut block = Block::div(self.path.clone(), Vec::new());
             block.element = Element::new("");
             block.content = Content::Raw {
-                html: outer_html(node),
+                html: dom::outer_html(node),
                 text: text_of(node),
             };
             self.blocks.push(block);
             return;
         }
         if element.is("hr") {
-            let mut block = Block::div(path.to_vec(), Vec::new());
+            let mut block = Block::div(self.path.clone(), Vec::new());
             block.element = Element::new("");
             block.content = Content::Rule;
             self.blocks.push(block);
             return;
         }
-        let children = node.children.borrow();
-        let has_blocks = children.iter().any(|child| matches!(&child.data, NodeData::Element { name, .. } if is_block(&name.local) || OPAQUE_TAGS.contains(&&*name.local)));
+        let children = dom::children(node);
+        let has_blocks = children.iter().any(|child| {
+            dom::tag(child).is_some_and(|tag| is_block(tag) || OPAQUE_TAGS.contains(&tag))
+        });
         // `<div><hr></div>`: the editor's rule line.
-        let only_rule = children
-            .iter()
-            .filter(|child| !is_blank(child))
-            .collect::<Vec<_>>();
-        if let [single] = only_rule.as_slice()
-            && matches!(&single.data, NodeData::Element { name, .. } if &*name.local == "hr")
+        let mut non_blank = children.iter().filter(|child| !is_blank(child));
+        if let (Some(single), None) = (non_blank.next(), non_blank.next())
+            && dom::is(single, "hr")
         {
             self.blocks.push(Block {
-                path: path.to_vec(),
+                path: self.path.clone(),
                 element,
                 content: Content::Rule,
                 trailing_break: false,
             });
             return;
         }
-        drop(children);
         let is_container =
             has_blocks || matches!(element.tag.as_str(), "blockquote" | "ul" | "ol" | "dl");
         if is_container {
+            drop(children);
             self.next_id += 1;
-            let mut inner = path.to_vec();
-            inner.push(Container {
+            self.path.push(Container {
                 id: self.next_id,
                 element,
             });
             let before = self.blocks.len();
-            self.container(node, &inner);
+            self.container(node);
             if self.blocks.len() == before {
                 // An empty container still holds an empty line, as the browser shows it.
-                let mut block = Block::empty(inner);
+                let mut block = Block::empty(self.path.clone());
                 block.element = Element::new("");
                 self.blocks.push(block);
             }
+            self.path.pop();
             return;
         }
+        let before = self.blocks.len();
         let mut runs = Vec::new();
-        for child in node.children.borrow().iter() {
-            self.inline(child, &[], &mut runs);
+        for child in &children {
+            self.inline(child, &mut runs);
+        }
+        if self.blocks.len() > before {
+            // An inline wrapper inside this block held nested blocks or tables: flush any trailing
+            // loose runs and promote this element to a container around what it emitted.
+            self.flush_loose(&mut runs);
+            self.next_id += 1;
+            let container = Container {
+                id: self.next_id,
+                element,
+            };
+            let depth = self.path.len();
+            for block in &mut self.blocks[before..] {
+                block.path.insert(depth, container.clone());
+            }
+            return;
         }
         let mut block = Block {
-            path: path.to_vec(),
+            path: self.path.clone(),
             element,
             content: Content::Inline(runs),
             trailing_break: false,
@@ -285,44 +280,49 @@ impl Reader {
         self.blocks.push(block);
     }
 
-    fn inline(&mut self, node: &Handle, marks: &[Element], out: &mut Vec<Run>) {
-        match &node.data {
-            NodeData::Text { contents } => {
-                let text = contents.borrow().replace('\u{FEFF}', "");
-                if !text.is_empty() {
-                    out.push(Run::text(text, marks.to_vec()));
-                }
+    fn inline(&mut self, node: &NodeRef, out: &mut Vec<Run>) {
+        if let Some(contents) = dom::text(node) {
+            let text = contents.replace('\u{FEFF}', "");
+            if !text.is_empty() {
+                out.push(Run::text(text, self.marks.clone()));
             }
-            NodeData::Element { name, .. } => {
-                let tag = &*name.local;
-                if DROPPED_TAGS.contains(&tag) {
-                    return;
-                }
-                match tag {
-                    "br" => out.push(Run {
-                        piece: Piece::Break,
-                        marks: marks.to_vec(),
-                    }),
-                    "img" => out.push(Run {
-                        piece: Piece::Image(element_of(node, false)),
-                        marks: marks.to_vec(),
-                    }),
-                    "wbr" => {}
-                    _ => {
-                        let mut inner = marks.to_vec();
-                        let element = element_of(node, self.paste);
-                        if !element.tag.is_empty()
-                            && !(self.paste && element.is("span") && element.attrs.is_empty())
-                        {
-                            inner.push(element);
-                        }
-                        for child in node.children.borrow().iter() {
-                            self.inline(child, &inner, out);
-                        }
+        } else if let Some(tag) = dom::tag(node) {
+            if DROPPED_TAGS.contains(&tag) {
+                return;
+            }
+            // Blocks and opaque elements (like `<table>` or `<hr>`) nested inside inline wrappers
+            // emit as real blocks with the inline marks distributed onto them rather than pushing
+            // block/table tags into `Run::marks`.
+            if is_block(tag) || OPAQUE_TAGS.contains(&tag) {
+                self.flush_loose(out);
+                self.block(node);
+                return;
+            }
+            match tag {
+                "br" => out.push(Run {
+                    piece: Piece::Break,
+                    marks: self.marks.clone(),
+                }),
+                "img" => out.push(Run {
+                    piece: Piece::Image(element_of(node, false)),
+                    marks: self.marks.clone(),
+                }),
+                "wbr" => {}
+                _ => {
+                    let element = element_of(node, self.paste);
+                    let pushed = !element.tag.is_empty()
+                        && !(self.paste && element.is("span") && element.attrs.is_empty());
+                    if pushed {
+                        self.marks.push(element);
+                    }
+                    for child in dom::children(node) {
+                        self.inline(&child, out);
+                    }
+                    if pushed {
+                        self.marks.pop();
                     }
                 }
             }
-            _ => {}
         }
     }
 }
@@ -331,17 +331,17 @@ fn is_block(tag: &str) -> bool {
     BLOCK_TAGS.contains(&tag)
 }
 
-fn is_blank(node: &Handle) -> bool {
-    matches!(&node.data, NodeData::Text { contents } if contents.borrow().chars().all(char::is_whitespace))
+fn is_blank(node: &NodeRef) -> bool {
+    dom::text(node).is_some_and(|contents| contents.chars().all(char::is_whitespace))
 }
 
 /// The element `node` is, with the editor's tag normalization (`strong` → `b`, `em` → `i`, `ins`
 /// → `u`, `strike` → `s`) and, for pastes, the attribute cleanup.
-fn element_of(node: &Handle, paste: bool) -> Element {
-    let NodeData::Element { name, attrs, .. } = &node.data else {
+fn element_of(node: &NodeRef, paste: bool) -> Element {
+    let Some(raw_tag) = dom::tag(node) else {
         return Element::new("");
     };
-    let tag = match &*name.local {
+    let tag = match raw_tag {
         "strong" => "b",
         "em" => "i",
         "ins" => "u",
@@ -349,11 +349,7 @@ fn element_of(node: &Handle, paste: bool) -> Element {
         other => other,
     };
     let mut element = Element::new(tag);
-    for attr in attrs.borrow().iter() {
-        element
-            .attrs
-            .push((attr.name.local.to_string(), attr.value.to_string()));
-    }
+    element.attrs = dom::attrs(node);
     if paste {
         clean_pasted(&mut element);
     }
@@ -392,22 +388,21 @@ fn clean_pasted(element: &mut Element) {
     }
     let style = element.attr("style").unwrap_or_default().to_owned();
     {
-        let mut kept: Vec<String> = style
-            .split(';')
-            .filter_map(|declaration| {
-                let (property, value) = declaration.split_once(':')?;
-                let (property, value) = (property.trim().to_ascii_lowercase(), value.trim());
-                match property.as_str() {
-                    "color" => Some(format!("color:{value}")),
-                    "font-style" if value != "normal" => Some(format!("font-style:{value}")),
+        let mut kept: Vec<String> = Style::parse(&style)
+            .iter()
+            .filter_map(|(property, value, important)| {
+                let bang = if important { " !important" } else { "" };
+                match property {
+                    "color" => Some(format!("color:{value}{bang}")),
+                    "font-style" if value != "normal" => Some(format!("font-style:{value}{bang}")),
                     "font-weight"
                         if matches!(value, "bold" | "bolder")
                             || value.parse::<u16>().is_ok_and(|weight| weight > 500) =>
                     {
-                        Some("font-weight:700".to_owned())
+                        Some(format!("font-weight:700{bang}"))
                     }
                     property if property.starts_with("text-decoration") => {
-                        Some(format!("{property}:{value}"))
+                        Some(format!("{property}:{value}{bang}"))
                     }
                     _ => None,
                 }
@@ -531,25 +526,19 @@ fn collapse_whitespace(runs: &mut [Run]) {
     }
 }
 
-fn text_of(node: &Handle) -> String {
+fn text_of(node: &NodeRef) -> String {
     let mut out = String::new();
-    fn walk(node: &Handle, out: &mut String) {
-        match &node.data {
-            NodeData::Text { contents } => out.push_str(&contents.borrow()),
-            NodeData::Element { name, .. } if &*name.local == "tr" && !out.is_empty() => {
+    let mut stack = vec![node.clone()];
+    while let Some(current) = stack.pop() {
+        if let Some(text) = dom::text(&current) {
+            out.push_str(&text);
+        } else {
+            if dom::is(&current, "tr") && !out.is_empty() {
                 out.push('\n');
-                for child in node.children.borrow().iter() {
-                    walk(child, out);
-                }
             }
-            _ => {
-                for child in node.children.borrow().iter() {
-                    walk(child, out);
-                }
-            }
+            stack.extend(dom::children(&current).into_iter().rev());
         }
     }
-    walk(node, &mut out);
     out.split('\n')
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|line| !line.is_empty())
@@ -557,117 +546,59 @@ fn text_of(node: &Handle) -> String {
         .join("\n")
 }
 
-fn outer_html(node: &Handle) -> String {
-    let mut out = Vec::new();
-    let options = SerializeOpts {
-        traversal_scope: TraversalScope::IncludeNode,
-        ..SerializeOpts::default()
-    };
-    serialize(&mut out, &SerializableHandle::from(node.clone()), options)
-        .expect("writing to a Vec doesn't fail");
-    String::from_utf8(out).expect("the serializer writes UTF-8")
-}
-
 /// `html` parsed as a document and written back, which is how an outgoing message wraps each part
 /// (`<html><head></head><body>…</body></html>`).
 pub fn as_document(html: &str) -> String {
-    let dom = parse_document(RcDom::default(), Default::default()).one(html);
-    let document = dom.document;
-    let root = document
-        .children
-        .borrow()
-        .iter()
-        .find(|child| matches!(child.data, NodeData::Element { .. }))
-        .cloned();
-    root.map_or_else(String::new, |root| outer_html(&root))
+    let document = dom::parse(html);
+    let out = dom::element_children(&document)
+        .first()
+        .map_or_else(String::new, dom::outer_html);
+    dom::drop_tree(document);
+    out
 }
 
 /// [`as_document`] with its inline images pointed at their Content-IDs, as the quote appended to a
 /// sent message is. A `src-cid` image's `src` becomes `cid:{id}`, and the image loses Exo's class.
 pub(crate) fn as_sent_document(html: &str) -> String {
-    let dom = parse_document(RcDom::default(), Default::default()).one(html);
-    let mut pending = vec![dom.document.clone()];
-    while let Some(node) = pending.pop() {
-        if let NodeData::Element { attrs, .. } = &node.data {
-            let mut attrs = attrs.borrow_mut();
-            for (attr, target) in [
-                ("src-cid", "src"),
-                ("poster-cid", "poster"),
-                ("background-cid", "background"),
-            ] {
-                let Some(cid) = attrs
-                    .iter()
-                    .find(|a| &*a.name.local == attr && !a.value.is_empty())
-                    .map(|a| a.value.to_string())
-                else {
-                    continue;
+    let document = dom::parse(html);
+    for node in dom::descendants(&document) {
+        if let Some(tag) = dom::tag(&node) {
+            dom::clear_template_contents(&node);
+            if crate::outgoing::CID_ATTRS
+                .iter()
+                .any(|(attr, _)| dom::has_attr(&node, attr))
+            {
+                let mut element = Element {
+                    tag: tag.to_owned(),
+                    attrs: dom::attrs(&node),
                 };
-                match attrs.iter_mut().find(|a| &*a.name.local == target) {
-                    Some(existing) => existing.value = format!("cid:{cid}").into(),
-                    None => attrs.push(html5ever::Attribute {
-                        name: html5ever::QualName::new(None, html5ever::ns!(), target.into()),
-                        value: format!("cid:{cid}").into(),
-                    }),
-                }
-                if let Some(class) = attrs.iter_mut().find(|a| &*a.name.local == "class") {
-                    let kept: Vec<&str> = class
-                        .value
-                        .split_whitespace()
-                        .filter(|name| *name != crate::image::CLASS)
-                        .collect();
-                    class.value = kept.join(" ").into();
-                }
+                crate::outgoing::clean_image(&mut element);
+                dom::set_attrs(&node, &element.attrs);
             }
         }
-        pending.extend(node.children.borrow().iter().cloned());
     }
-    let root = dom
-        .document
-        .children
-        .borrow()
-        .iter()
-        .find(|child| matches!(child.data, NodeData::Element { .. }))
-        .cloned();
-    root.map_or_else(String::new, |root| outer_html(&root))
+    let out = dom::element_children(&document)
+        .first()
+        .map_or_else(String::new, dom::outer_html);
+    dom::drop_tree(document);
+    out
 }
 
 /// `html` (a kept table's markup) with each `<img>` handed to `image` to rewrite. A kept table's
 /// drawing loads its images from the result (`view::table`).
 pub(crate) fn map_images(html: &str, mut image: impl FnMut(&mut Element)) -> String {
-    let (_document, body) = fragment(html);
-    let mut pending = vec![body.clone()];
-    while let Some(node) = pending.pop() {
-        if let NodeData::Element { name, attrs, .. } = &node.data
-            && &*name.local == "img"
-        {
-            let mut attrs = attrs.borrow_mut();
-            let mut element = Element {
-                tag: "img".to_owned(),
-                attrs: attrs
-                    .iter()
-                    .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
-                    .collect(),
-            };
-            image(&mut element);
-            *attrs = element
-                .attrs
-                .into_iter()
-                .map(|(name, value)| html5ever::Attribute {
-                    name: html5ever::QualName::new(None, html5ever::ns!(), name.into()),
-                    value: value.into(),
-                })
-                .collect();
-        }
-        pending.extend(node.children.borrow().iter().rev().cloned());
+    let (document, body) = fragment(html);
+    for node in dom::select(&body, |node| dom::is(node, "img")) {
+        let mut element = Element {
+            tag: "img".to_owned(),
+            attrs: dom::attrs(&node),
+        };
+        image(&mut element);
+        dom::set_attrs(&node, &element.attrs);
     }
-    let mut out = Vec::new();
-    let options = SerializeOpts {
-        traversal_scope: TraversalScope::ChildrenOnly(None),
-        ..SerializeOpts::default()
-    };
-    serialize(&mut out, &SerializableHandle::from(body), options)
-        .expect("writing to a Vec doesn't fail");
-    String::from_utf8(out).expect("the serializer writes UTF-8")
+    let out = dom::inner_html(&body);
+    dom::drop_tree(document);
+    out
 }
 
 /// `html` (a kept table) inside the containers of `path`, outermost first, as the editor's DOM
@@ -849,16 +780,7 @@ fn open_tag(element: &Element, out: &mut String) {
         out.push(' ');
         out.push_str(name);
         out.push_str("=\"");
-        for ch in value.chars() {
-            match ch {
-                '&' => out.push_str("&amp;"),
-                '"' => out.push_str("&quot;"),
-                '\u{A0}' => out.push_str("&nbsp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                ch => out.push(ch),
-            }
-        }
+        dom::push_inner_html_attr(out, value);
         out.push('"');
     }
     out.push('>');
@@ -874,4 +796,62 @@ fn close_tag(element: &Element, out: &mut String) {
     out.push_str("</");
     out.push_str(&element.tag);
     out.push('>');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_inline_styles_ignore_semicolons_inside_urls_and_quotes() {
+        let doc = parse_paste(
+            r#"<span style="background: url(data:image/png;color:blue;base64,iVBORw0K); font-family: 'Foo;color:green'; color: red; font-weight: 600">ok</span>"#,
+        );
+        assert_eq!(
+            write(&doc),
+            r#"<span style="color:red;font-weight:700">ok</span>"#
+        );
+    }
+
+    #[test]
+    fn inline_wrapper_around_blocks_distributes_marks_without_flattening() {
+        let doc = parse(r#"<a href="https://example.com"><div>Line 1</div><div>Line 2</div></a>"#);
+        assert_eq!(doc.blocks.len(), 2);
+        assert_eq!(doc.blocks[0].text(), "Line 1");
+        assert_eq!(doc.blocks[1].text(), "Line 2");
+        assert_eq!(
+            write(&doc),
+            r#"<div><a href="https://example.com">Line 1</a></div><div><a href="https://example.com">Line 2</a></div>"#
+        );
+
+        // Also when nested inside an enclosing block element.
+        let nested = parse(
+            r#"<div class="card"><a href="https://example.com"><div>Line 1</div><div>Line 2</div></a></div>"#,
+        );
+        assert_eq!(nested.blocks.len(), 2);
+        assert_eq!(
+            write(&nested),
+            r#"<div class="card"><div><a href="https://example.com">Line 1</a></div><div><a href="https://example.com">Line 2</a></div></div>"#
+        );
+    }
+
+    #[test]
+    fn inline_wrapper_around_table_keeps_table_opaque() {
+        let doc = parse("<span><table><tbody><tr><td>cell</td></tr></tbody></table></span>");
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(matches!(doc.blocks[0].content, Content::Raw { .. }));
+        assert_eq!(
+            write(&doc),
+            "<table><tbody><tr><td>cell</td></tr></tbody></table>"
+        );
+
+        let wrapped =
+            parse("<div><span><table><tbody><tr><td>cell</td></tr></tbody></table></span></div>");
+        assert_eq!(wrapped.blocks.len(), 1);
+        assert!(matches!(wrapped.blocks[0].content, Content::Raw { .. }));
+        assert_eq!(
+            write(&wrapped),
+            "<div><table><tbody><tr><td>cell</td></tr></tbody></table></div>"
+        );
+    }
 }

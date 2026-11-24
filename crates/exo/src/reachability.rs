@@ -24,15 +24,62 @@ impl Reachability {
     }
 }
 
+/// Tracks IPv4 and IPv6 default-route reachability together: the Mac is online whenever *either*
+/// protocol family has a usable route (covering IPv6-only / NAT64 networks).
+// Off macOS `Reachability::watch` returns `None`, so only `tests` exercises `DualStack`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct DualStack {
+    v4: bool,
+    v6: bool,
+    online: bool,
+}
+
+// Off macOS `Reachability::watch` returns `None`, so only `tests` exercises `DualStack`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl DualStack {
+    fn new(v4: bool, v6: bool) -> Self {
+        Self {
+            v4,
+            v6,
+            online: v4 || v6,
+        }
+    }
+
+    fn is_online(&self) -> bool {
+        self.online
+    }
+
+    fn update_v4(&mut self, v4: bool) -> bool {
+        self.v4 = v4;
+        self.settle()
+    }
+
+    fn update_v6(&mut self, v6: bool) -> bool {
+        self.v6 = v6;
+        self.settle()
+    }
+
+    fn settle(&mut self) -> bool {
+        let now = self.v4 || self.v6;
+        if self.online != now {
+            self.online = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
-    // SCNetworkReachability is deprecated in favour of Network.framework's path monitor, which
-    // has no bindings in the objc2 family Exo uses. It still works.
-    #![allow(deprecated)]
+    #![expect(
+        deprecated,
+        reason = "SCNetworkReachability is deprecated in favour of Network.framework's path monitor, which has no bindings in the objc2 family Exo uses"
+    )]
 
     use std::ffi::c_void;
     use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     use dispatch2::{DispatchQueue, DispatchRetained};
     use objc2_core_foundation::CFRetained;
@@ -40,47 +87,67 @@ mod macos {
         SCNetworkReachability, SCNetworkReachabilityContext, SCNetworkReachabilityFlags,
     };
 
-    /// What the callback reaches through its `info` pointer.
+    use super::DualStack;
+
+    /// What the callbacks reach through their `info` pointer.
     struct State {
         changed: Box<dyn Fn() + Send + Sync>,
-        online: AtomicBool,
+        stack: Mutex<DualStack>,
     }
 
     pub(super) struct Watch {
-        target: CFRetained<SCNetworkReachability>,
+        v4: CFRetained<SCNetworkReachability>,
+        v6: CFRetained<SCNetworkReachability>,
         queue: DispatchRetained<DispatchQueue>,
-        /// Owned, and freed once the callback can no longer run.
+        /// Owned, and freed once the callbacks can no longer run.
         state: NonNull<State>,
     }
 
     /// Whether `flags` mean online, which is reachable without first having to bring a
     /// connection up.
-    fn online(flags: SCNetworkReachabilityFlags) -> bool {
+    pub(super) fn online(flags: SCNetworkReachabilityFlags) -> bool {
         flags.contains(SCNetworkReachabilityFlags::Reachable)
             && !flags.contains(SCNetworkReachabilityFlags::ConnectionRequired)
     }
 
+    fn probe(target: &SCNetworkReachability) -> Option<bool> {
+        let mut flags = SCNetworkReachabilityFlags(0);
+        // SAFETY: `flags` is valid for writes.
+        let known = unsafe { target.flags(NonNull::from(&mut flags)) };
+        known.then(|| online(flags))
+    }
+
     impl Watch {
         pub(super) fn start(changed: Box<dyn Fn() + Send + Sync>) -> Option<Self> {
-            // The default route, 0.0.0.0.
-            // SAFETY: `sockaddr_in` is plain data. All zeros is the any address.
-            let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            address.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-            address.sin_family = libc::AF_INET as u8;
-            // SAFETY: `address` is a valid `sockaddr_in`, which the call copies.
-            let target = unsafe {
-                SCNetworkReachability::with_address(None, NonNull::from(&address).cast())
+            // The IPv4 (`0.0.0.0`) and IPv6 (`::`) default routes.
+            // SAFETY: `sockaddr_in` and `sockaddr_in6` are plain data; all zeros is the
+            // unspecified/default-route address in each family.
+            let mut v4_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            v4_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            v4_addr.sin_family = libc::AF_INET as u8;
+            let mut v6_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            v6_addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            v6_addr.sin6_family = libc::AF_INET6 as u8;
+            // SAFETY: both addresses are valid socket addresses, which the calls copy.
+            let v4 = unsafe {
+                SCNetworkReachability::with_address(None, NonNull::from(&v4_addr).cast())
             }?;
-            let mut flags = SCNetworkReachabilityFlags(0);
-            // SAFETY: `flags` is valid for writes.
-            let known = unsafe { target.flags(NonNull::from(&mut flags)) };
-            let now_online = !known || online(flags);
+            let v6 = unsafe {
+                SCNetworkReachability::with_address(None, NonNull::from(&v6_addr).cast())
+            }?;
+            let (v4_online, v6_online) = match (probe(&v4), probe(&v6)) {
+                (None, None) => (true, true),
+                (v4_state, v6_state) => (v4_state.unwrap_or(false), v6_state.unwrap_or(false)),
+            };
+            let stack = DualStack::new(v4_online, v6_online);
+            let now_online = stack.is_online();
             let state = NonNull::from(Box::leak(Box::new(State {
                 changed,
-                online: AtomicBool::new(now_online),
+                stack: Mutex::new(stack),
             })));
             let watch = Self {
-                target,
+                v4,
+                v6,
                 queue: DispatchQueue::new("exo.reachability", None),
                 state,
             };
@@ -91,11 +158,13 @@ mod macos {
                 release: None,
                 copyDescription: None,
             };
-            // SAFETY: `callback` only reads `State` through `info`, which outlives the callback's
-            // registration (`Drop` unregisters before freeing it). The context is copied.
+            // SAFETY: callbacks only read `State` through `info`, which outlives their
+            // registration (`Drop` unregisters both targets and drains `queue` before freeing it).
             let watching = unsafe {
-                watch.target.set_callback(Some(callback), &mut context)
-                    && watch.target.set_dispatch_queue(Some(&watch.queue))
+                watch.v4.set_callback(Some(callback_v4), &mut context)
+                    && watch.v4.set_dispatch_queue(Some(&watch.queue))
+                    && watch.v6.set_callback(Some(callback_v6), &mut context)
+                    && watch.v6.set_dispatch_queue(Some(&watch.queue))
             };
             if !watching {
                 return None;
@@ -108,15 +177,36 @@ mod macos {
         }
     }
 
-    unsafe extern "C-unwind" fn callback(
+    unsafe extern "C-unwind" fn callback_v4(
         _: NonNull<SCNetworkReachability>,
         flags: SCNetworkReachabilityFlags,
         info: *mut c_void,
     ) {
         // SAFETY: `info` is the `State` `start` registered, alive while the callback is.
         let state = unsafe { &*info.cast::<State>() };
-        let now = online(flags);
-        if state.online.swap(now, Ordering::SeqCst) != now {
+        let flipped = state
+            .stack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update_v4(online(flags));
+        if flipped {
+            (state.changed)();
+        }
+    }
+
+    unsafe extern "C-unwind" fn callback_v6(
+        _: NonNull<SCNetworkReachability>,
+        flags: SCNetworkReachabilityFlags,
+        info: *mut c_void,
+    ) {
+        // SAFETY: `info` is the `State` `start` registered, alive while the callback is.
+        let state = unsafe { &*info.cast::<State>() };
+        let flipped = state
+            .stack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update_v6(online(flags));
+        if flipped {
             (state.changed)();
         }
     }
@@ -125,13 +215,53 @@ mod macos {
         fn drop(&mut self) {
             // SAFETY: unregistering takes no pointers.
             unsafe {
-                self.target.set_dispatch_queue(None);
-                self.target.set_callback(None, std::ptr::null_mut());
+                self.v4.set_dispatch_queue(None);
+                self.v4.set_callback(None, std::ptr::null_mut());
+                self.v6.set_dispatch_queue(None);
+                self.v6.set_callback(None, std::ptr::null_mut());
             }
-            // A callback already on the queue runs before this does.
+            // Any callback already on the queue runs before this does.
             self.queue.exec_sync(|| {});
             // SAFETY: `state` came from `Box::leak`, and nothing can reach it any more.
             drop(unsafe { Box::from_raw(self.state.as_ptr()) });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DualStack;
+
+    #[test]
+    fn ipv6_only_and_dual_stack_transitions_report_online_when_either_route_is_up() {
+        let mut stack = DualStack::new(false, true);
+        assert!(stack.is_online(), "IPv6-only / NAT64 starts online");
+        assert!(!stack.update_v4(false));
+        assert!(
+            stack.update_v6(false),
+            "losing the last route flips offline"
+        );
+        assert!(!stack.is_online());
+        assert!(stack.update_v4(true), "gaining IPv4 flips back online");
+        assert!(
+            !stack.update_v6(true),
+            "adding IPv6 while online does not re-fire"
+        );
+        assert!(
+            !stack.update_v4(false),
+            "dropping IPv4 while IPv6 stays up keeps online"
+        );
+        assert!(stack.is_online());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reachable_flags_require_no_connection_needed() {
+        use objc2_system_configuration::SCNetworkReachabilityFlags as Flags;
+        assert!(super::macos::online(Flags::Reachable));
+        assert!(!super::macos::online(Flags(0)));
+        assert!(!super::macos::online(
+            Flags::Reachable | Flags::ConnectionRequired
+        ));
     }
 }

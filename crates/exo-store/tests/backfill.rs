@@ -87,9 +87,36 @@ async fn a_draft_exo_wrote_routes_as_a_message_being_written() {
     let thread = ThreadId::new(drafts.first().unwrap().clone());
     assert!(!harness.ids(&ListId::Inbox).await.contains(thread.as_str()));
     let detail = harness.store.thread(&thread).await.unwrap().unwrap();
+    let record = exo_store::DraftRecord {
+        action: exo_store::DraftAction::Compose,
+        from: None,
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: detail.subject.clone(),
+        body: "Draft body".into(),
+        quoted_content: None,
+        quoted_inlined: false,
+        in_reply_to: None,
+        in_reply_to_rfc822: None,
+        references: Vec::new(),
+        rfc822_id: "adopted@exo".into(),
+        fingerprint: String::new(),
+        attachments: Vec::new(),
+        send_later: None,
+        reminder: None,
+    };
     harness
         .store
-        .record_draft(&detail.messages[0].id)
+        .save_draft(exo_store::Draft {
+            id: "draft00000000000001".into(),
+            thread: Some(thread.clone()),
+            adopted: Some(detail.messages[0].id.clone()),
+            record,
+            raw: String::new(),
+            complete: true,
+            sending: false,
+        })
         .await
         .unwrap();
     assert!(

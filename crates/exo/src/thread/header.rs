@@ -9,7 +9,10 @@ use exo_ui::{
 };
 
 use super::{Action, Layout};
-use crate::body::Bodies;
+use crate::{
+    body::Bodies,
+    triage_copy::{TriageButton, TriageRemind},
+};
 
 /// The header's padding: `24px 4rem 20px`.
 pub(super) const PADDING_TOP: f32 = 24.0;
@@ -470,100 +473,61 @@ pub(super) fn show(
     // Previous and Next thread, each in its place either way.
     let id = ui.id().with("thread-header");
     let right = label.right();
+    let icon_top = label.top() + 11.0;
     let done = detail.labels.iter().all(|label| label != "INBOX");
     let reminded = matches!(detail.reminder, Some(exo_store::ReminderStatus::Set { .. }));
-    // The legacy glyphs, 11px down: the 16×14 check, the 14px clock and command, the 16px
-    // chevrons. A done thread's check is `#8892b9` and 2 units wide, `#5f74aa` when hovered. A
-    // reminded thread's clock is the bolder one in `#e0bfe0`, `#cd7acf` when hovered.
-    let remind = if reminded {
-        crate::inbox::REMIND_SET_ICON
+    let remind_status = detail
+        .reminder
+        .as_ref()
+        .map(|reminder| crate::remind::status(reminder, now));
+    // While one of the thread's drafts is being written, Remind Me's key is ⌘⇧H, as in compose.
+    let remind_keys: &[&str] = if typing {
+        &["⌘", "shift", "H"]
     } else {
-        crate::inbox::REMIND_ICON
+        &["H"]
     };
-    let buttons: [(&str, f32, Vec2, Action); 5] = [
+    let triage: [(bool, TriageButton<'_>, f32, Vec2, f32, Action); 3] = [
         (
-            "legacy/DEPRECATED_threadActionsDone",
+            archivable,
+            TriageButton::Done { done },
             110.0,
             vec2(16.0, 14.0),
+            4.0,
             Action::ToggleDone,
         ),
-        (remind, 86.0, Vec2::splat(14.0), Action::Remind),
         (
-            "legacy/DEPRECATED_threadActionsCommand",
+            true,
+            TriageButton::Remind(TriageRemind {
+                set: reminded,
+                status: remind_status.as_deref(),
+                keys: remind_keys,
+                within: egui::Rangef::EVERYTHING,
+            }),
+            86.0,
+            Vec2::splat(14.0),
+            5.0,
+            Action::Remind,
+        ),
+        (
+            true,
+            TriageButton::Command,
             63.0,
             Vec2::splat(14.0),
+            4.0,
             Action::CommandPalette,
         ),
-        (CHEVRON_UP, 40.0, Vec2::splat(16.0), Action::Navigate(-1)),
-        (CHEVRON_DOWN, 16.0, Vec2::splat(16.0), Action::Navigate(1)),
     ];
-    for (icon, from_right, size, action) in buttons
-        .into_iter()
-        .filter(|(.., action)| archivable || *action != Action::ToggleDone)
-    {
-        let icon_rect = Rect::from_min_size(pos2(right - from_right, label.top() + 11.0), size);
-        // A focused button lights its glyph as hovering does.
-        let lit = focus.is_some_and(|focus| focus.action(status) == action);
-        let response = if done && action == Action::ToggleDone {
-            let response = ui
-                .interact(icon_rect.expand(4.0), id.with(icon), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            let color = if response.hovered() || lit {
-                Color32::from_rgb(0x5f, 0x74, 0xaa)
-            } else {
-                palette.actions_done_default
-            };
-            exo_ui::paint_icon_stroked(ui, icon, exo_ui::pixel_snap(icon_rect), color, 2.0);
-            response
-        } else if action == Action::Remind {
-            // Its tooltip hangs off the button's 24px box (5px around the glyph).
-            let button = IconButton::new(icon).lit(lit);
-            let button = if reminded {
-                button.colors(
-                    Color32::from_rgb(0xe0, 0xbf, 0xe0),
-                    Color32::from_rgb(0xcd, 0x7a, 0xcf),
-                )
-            } else {
-                button
-            };
-            button.show(ui, id.with(icon), icon_rect.expand(5.0), icon_rect)
-        } else {
-            IconButton::new(icon)
-                .lit(lit)
-                .show(ui, id.with(icon), icon_rect.expand(4.0), icon_rect)
-        };
-        // While one of the thread's drafts is being written, Remind Me's key is ⌘⇧H, as in
-        // compose.
-        let remind_keys: &[&str] = if typing {
-            &["⌘", "shift", "H"]
-        } else {
-            &["H"]
-        };
-        // The buttons' tooltips also show while the buttons have the keyboard.
-        match (action == Action::Remind).then_some(detail.reminder.as_ref()) {
-            Some(reminder) => {
-                let status = reminder.map(|reminder| crate::remind::status(reminder, now));
-                KeyTooltip {
-                    text: "Remind Me",
-                    keys: remind_keys,
-                }
-                .show_at_focused(
-                    ui,
-                    &response,
-                    Placement::Below {
-                        gap: 8.0,
-                        shift: 10.0,
-                    },
-                    lit,
-                    status.as_deref(),
-                );
-            }
-            None => action_tooltip(ui, &response, &action, done, lit),
+    for (shown, button, from_right, size, expand, action) in triage {
+        if !shown {
+            continue;
         }
-        if response.clicked() {
+        let glyph = Rect::from_min_size(pos2(right - from_right, icon_top), size);
+        let lit = focus.is_some_and(|focus| focus.action(status) == action);
+        if button.show(ui, id, glyph.expand(expand), glyph, lit) {
             actions.push(action);
         }
     }
+    paint_nav_arrows(ui, id, label, &mut actions);
 
     // The subject, its star and its labels.
     let arrangement = arrange(ui, layout, detail, chips, archivable);
@@ -708,21 +672,7 @@ pub(super) fn show_title(ui: &Ui, layout: &Layout, title: &str) -> Vec<Action> {
     let label = layout.label;
     let id = ui.id().with("thread-header");
     let mut actions = Vec::new();
-    for (icon, from_right, action) in [
-        (CHEVRON_UP, 40.0, Action::Navigate(-1)),
-        (CHEVRON_DOWN, 16.0, Action::Navigate(1)),
-    ] {
-        let icon_rect = Rect::from_min_size(
-            pos2(label.right() - from_right, label.top() + 11.0),
-            Vec2::splat(16.0),
-        );
-        let response =
-            IconButton::new(icon).show(ui, id.with(icon), icon_rect.expand(4.0), icon_rect);
-        action_tooltip(ui, &response, &action, false, false);
-        if response.clicked() {
-            actions.push(action);
-        }
-    }
+    paint_nav_arrows(ui, id, label, &mut actions);
     SUBJECT.paint_line(
         ui.painter(),
         pos2(label.left(), label.top() + SUBJECT_NUDGE),
@@ -733,63 +683,31 @@ pub(super) fn show_title(ui: &Ui, layout: &Layout, title: &str) -> Vec<Action> {
     actions
 }
 
-/// The tooltip under one of the header's actions: Mark Done and ⌘K 8px under and 10px right of
-/// centre, the conversation arrows 10px under.
-fn action_tooltip(ui: &Ui, response: &egui::Response, action: &Action, done: bool, focused: bool) {
-    let (tooltip, placement) = match action {
-        Action::ToggleDone if done => (
-            KeyTooltip {
-                text: "Mark not Done",
-                keys: &["shift", "E"],
-            },
-            Placement::Below {
-                gap: 8.0,
-                shift: 10.0,
-            },
-        ),
-        Action::ToggleDone => (
-            KeyTooltip {
-                text: "Mark Done",
-                keys: &["E"],
-            },
-            Placement::Below {
-                gap: 8.0,
-                shift: 10.0,
-            },
-        ),
-        Action::CommandPalette => (
-            KeyTooltip {
-                text: "Exo Command",
-                keys: &["⌘", "K"],
-            },
-            Placement::Below {
-                gap: 8.0,
-                shift: 10.0,
-            },
-        ),
-        Action::Navigate(-1) => (
-            KeyTooltip {
-                text: "Previous Conversation",
-                keys: &["K"],
-            },
+/// Paints the Previous and Next conversation chevrons at the right of `label`, with their
+/// tooltips centered 10px below.
+fn paint_nav_arrows(ui: &Ui, id: egui::Id, label: Rect, actions: &mut Vec<Action>) {
+    for (icon, from_right, text, key, delta) in [
+        (CHEVRON_UP, 40.0, "Previous Conversation", "K", -1),
+        (CHEVRON_DOWN, 16.0, "Next Conversation", "J", 1),
+    ] {
+        let icon_rect = Rect::from_min_size(
+            pos2(label.right() - from_right, label.top() + 11.0),
+            Vec2::splat(16.0),
+        );
+        let response =
+            IconButton::new(icon).show(ui, id.with(icon), icon_rect.expand(4.0), icon_rect);
+        KeyTooltip { text, keys: &[key] }.show_at(
+            ui,
+            &response,
             Placement::Below {
                 gap: 10.0,
                 shift: 0.0,
             },
-        ),
-        Action::Navigate(_) => (
-            KeyTooltip {
-                text: "Next Conversation",
-                keys: &["J"],
-            },
-            Placement::Below {
-                gap: 10.0,
-                shift: 0.0,
-            },
-        ),
-        _ => return,
-    };
-    tooltip.show_at_focused(ui, response, placement, focused, None);
+        );
+        if response.clicked() {
+            actions.push(Action::Navigate(delta));
+        }
+    }
 }
 
 /// The height of a new message's header: one line, no status, and a 4px `margin-bottom`.

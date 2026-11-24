@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! The compose body editor, an HTML editing model with its egui widget.
 //!
 //! # The model

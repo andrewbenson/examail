@@ -1,4 +1,4 @@
-//! The triage settings end to end on gmail-mock: Auto Advance (its dialog, and where triage goes
+//! The triage settings end to end on mock-servers: Auto Advance (its dialog, and where triage goes
 //! next), Send + Mark Done with Undo send, the palette's RSVP rows and RSVP + Mark Done, and Show
 //! Sender Full Names.
 
@@ -183,7 +183,7 @@ fn send_and_mark_done_marks_a_reply_done_and_undo_send_brings_it_back() {
     app.settle();
     assert!(listed(&app, CRIT), "back in the inbox");
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Sending undone and conversation moved to Inbox.")
     );
     assert!(app.mail().compose_focus().is_some(), "the reply reopens");
@@ -202,7 +202,7 @@ fn the_palette_answers_the_open_invitation() {
     assert_eq!(app.mail().invite_answer(), Some("needsAction"));
     palette(&mut app, "rsvp maybe");
     app.settle();
-    assert_eq!(app.mail().toast(), Some("Responded Maybe."));
+    assert_eq!(app.mail().toast_text(), Some("Responded Maybe."));
     assert_eq!(
         app.mail().invite_answer(),
         Some("tentative"),
@@ -224,7 +224,10 @@ fn rsvp_and_mark_done_marks_the_invitation_done_and_undo_brings_it_back() {
     app.key(Key::Tab);
     app.key(Key::Enter);
     app.settle();
-    assert_eq!(app.mail().toast(), Some("Responded Yes and Marked Done."));
+    assert_eq!(
+        app.mail().toast_text(),
+        Some("Responded Yes and Marked Done.")
+    );
     assert_eq!(calendar_answer(&app).as_deref(), Some("accepted"));
     assert!(!listed(&app, INVITATION), "marked done");
     assert_eq!(open_subject(&app), "1:1 agenda", "Auto Advance");
@@ -234,7 +237,10 @@ fn rsvp_and_mark_done_marks_the_invitation_done_and_undo_brings_it_back() {
     // From the palette, its rows say so.
     palette(&mut app, "rsvp no and mark done");
     app.settle();
-    assert_eq!(app.mail().toast(), Some("Responded No and Marked Done."));
+    assert_eq!(
+        app.mail().toast_text(),
+        Some("Responded No and Marked Done.")
+    );
     assert_eq!(calendar_answer(&app).as_deref(), Some("declined"));
 }
 

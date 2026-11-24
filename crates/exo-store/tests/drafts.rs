@@ -1042,7 +1042,7 @@ async fn a_new_messages_saves_cost_as_much_and_leave_sync_nothing_to_fetch() {
         (1, 1),
         "the latest version alone"
     );
-    // gmail-mock starts a new thread for each version of a message that isn't a reply. History
+    // mock-servers starts a new thread for each version of a message that isn't a reply. History
     // records the earlier ones as added and since gone, and sync fetches nothing for them.
     let spent = units(&harness).await;
     harness.store.sync().await.expect("syncs");

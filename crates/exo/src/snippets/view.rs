@@ -3,22 +3,22 @@
 //! is, by a body renderer of its own) and files (a message's cards), and a footer with `Edit` and
 //! Discard.
 
-use egui::{Color32, Rect, Sense, Ui, pos2, vec2};
+use egui::{Rect, Ui, pos2};
 use exo_commands::Region;
-use exo_store::{Contact, MessageDetail, Snippet};
-use exo_ui::{Family, Font, IconButton, KeyTooltip, ShortcutTooltip, TextStyle};
+use exo_store::{MessageDetail, Snippet};
+use exo_ui::{Family, Font, TextStyle};
 
 use super::Action;
-use crate::body::{Bodies, Look};
+use crate::{
+    body::{Bodies, Look},
+    compose::{
+        FOOTER_ACTION_DOWN, FOOTER_ACTION_HEIGHT, ReadOnlyHeader, SNIPPET_NAME_ROOM,
+        discard_button, draft_attachments_to_parts, paint_rule, submit_button, synthetic_message,
+    },
+};
 
 /// The snippet's name: 14px/20px, weight 600, `top: 3px`.
 const NAME: TextStyle = TextStyle::new(Font::new(Family::Sans, 600), 14.0, 20.0);
-/// The subject: 14px/20px bold, `top: 2px`.
-const SUBJECT: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 14.0, 20.0);
-/// The footer's `Edit`: 12px/16px bold, `top: 1px`.
-const SUBMIT: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 12.0, 16.0);
-/// The room kept above the card for the name, as the editor keeps it for its name field.
-const NAME_ROOM: f32 = 36.0;
 /// The name's line, above the card's top (`margin: -40px 0 20px`, `top: -1px`, the name's 3px).
 const NAME_ABOVE: f32 = 26.0;
 /// The view's `padding-top: 16px`. The recipients' header starts 4px higher.
@@ -33,12 +33,7 @@ const BODY_PLACEHOLDER: f32 = 24.0;
 /// The footer: 16px under the body, a 1px rule, `Edit` 20px down, 36px tall, then the card's
 /// 20px.
 const FOOTER_MARGIN: f32 = 16.0;
-const FOOTER_HEIGHT: f32 = 36.0;
 const FOOTER_BOTTOM: f32 = 20.0;
-const SUBMIT_DOWN: f32 = 20.0;
-/// The Discard icon, centred on a 16px line 2.5px above `Edit`'s.
-const ICON_LINE_UP: f32 = 2.5;
-const DISCARD: &str = "legacy/DEPRECATED_discard";
 
 /// The view's own body renderer, made when a snippet opens and dropped when the view closes,
 /// and what its file cards show.
@@ -62,67 +57,21 @@ fn body_id(id: &str) -> String {
 
 /// `snippet` as a message, for the body renderer and the recipients' header.
 fn message(snippet: &Snippet) -> MessageDetail {
-    let contact = |address: &exo_store::Address| Contact {
-        name: address.name.clone(),
-        email: address.email.clone(),
-        is_me: false,
-    };
-    MessageDetail {
-        id: body_id(&snippet.id),
-        labels: Vec::new(),
-        date: jiff::Timestamp::UNIX_EPOCH,
-        from: None,
-        to: snippet.to.iter().map(contact).collect(),
-        cc: snippet.cc.iter().map(contact).collect(),
-        bcc: snippet.bcc.iter().map(contact).collect(),
-        reply_to: Vec::new(),
-        subject: snippet.subject.clone(),
-        snippet: String::new(),
-        rfc822_id: None,
-        in_reply_to: None,
-        references: Vec::new(),
-        list_id: None,
-        list_unsubscribe: None,
-        list_unsubscribe_post: None,
-        headers: Vec::new(),
-        body: exo_store::Body {
-            html: Some(format!(
-                "<html><head></head><body>{}</body></html>",
-                snippet.body
-            )),
-            text: None,
-        },
-        // The snippet's files that aren't inline, as the message's parts, each with its `uuid`
-        // as the part's id.
-        attachments: snippet
-            .attachments
-            .iter()
-            .filter(|file| file.content_id.is_none())
-            .map(|file| exo_store::Attachment {
-                message_id: body_id(&snippet.id),
-                attachment_id: None,
-                part_id: file.uuid.clone(),
-                filename: file.name.clone(),
-                mime_type: file.mime_type.clone(),
-                size: u32::try_from(file.size).unwrap_or(u32::MAX),
-                content_id: None,
-                inline: false,
-            })
-            .collect(),
-        failure: None,
-        scheduled: None,
-        sending: false,
-    }
+    let id = body_id(&snippet.id);
+    let mut detail = synthetic_message(
+        id.clone(),
+        [&snippet.to, &snippet.cc, &snippet.bcc],
+        &[],
+        &snippet.subject,
+        &snippet.body,
+    );
+    detail.attachments = draft_attachments_to_parts(&id, &snippet.attachments);
+    detail
 }
 
 /// Where the card's parts sit, from the content's top (the card's plus `message::PADDING_TOP`).
 struct Parts {
-    /// The recipients' rows (label, people, lines), from the top.
-    rows: Vec<(&'static str, Vec<Contact>, f32)>,
-    rows_top: f32,
-    /// The subject's line (under its padding), from the top.
-    subject_top: Option<f32>,
-    body_top: f32,
+    header: ReadOnlyHeader,
     /// The file cards' list, under the body.
     files_top: f32,
     footer_top: f32,
@@ -135,54 +84,25 @@ fn parts(ui: &Ui, message: &MessageDetail, body: f32, width: f32) -> Parts {
     // The content starts the card's own padding down, and the view's spacing replaces that
     // padding.
     let padding = crate::thread::CARD_PADDING_TOP;
-    let painter = ui.painter();
-    let ink = Color32::BLACK;
-    let rows: Vec<(&'static str, Vec<Contact>, f32)> = [
-        ("To", &message.to),
-        ("Cc", &message.cc),
-        ("Bcc", &message.bcc),
-    ]
-    .into_iter()
-    .filter(|(_, people)| !people.is_empty())
-    .map(|(label, people)| {
-        let galley = painter.layout_job(crate::thread::header_job(people, width, ink, ink));
-        (label, people.clone(), galley.rows.len().max(1) as f32)
-    })
-    .collect();
-    let has_rows = !rows.is_empty();
-    let rows_top = HEADER_TOP - padding;
-    let mut top = if has_rows {
-        rows_top
-            + rows
-                .iter()
-                .map(|(_, _, lines)| lines * crate::thread::HEADER_ROW)
-                .sum::<f32>()
-    } else {
-        SPACING_TOP - padding
-    };
-    let subject_top = (!message.subject.is_empty()).then(|| {
-        let box_top = top + if has_rows { SUBJECT_SPACING } else { 0.0 };
-        top = box_top + SUBJECT.line_height;
-        box_top
-    });
-    // No margin over a body with nothing above it.
-    let body_top = if has_rows || subject_top.is_some() {
-        top + BODY_MARGIN_TOP
-    } else {
-        top
-    };
-    let files_top = body_top + body;
+    let header = ReadOnlyHeader::layout(
+        ui,
+        message,
+        width,
+        HEADER_TOP - padding,
+        SPACING_TOP - padding,
+        SUBJECT_SPACING,
+        BODY_MARGIN_TOP,
+    );
+    let files_top = header.body_top() + body;
     let files = crate::thread::attachments::height(
         crate::thread::attachments::listed(message).count(),
         width,
     );
     let footer_top = files_top + files + FOOTER_MARGIN;
-    let height = footer_top + FOOTER_HEIGHT + FOOTER_BOTTOM - crate::thread::CARD_PADDING_BOTTOM;
+    let height =
+        footer_top + FOOTER_ACTION_HEIGHT + FOOTER_BOTTOM - crate::thread::CARD_PADDING_BOTTOM;
     Parts {
-        rows,
-        rows_top,
-        subject_top,
-        body_top,
+        header,
         files_top,
         footer_top,
         height,
@@ -305,7 +225,7 @@ impl crate::Mail {
         let pane = crate::thread::PaneCard {
             title: "Edit Private Snippet",
             height: parts.height,
-            above: NAME_ROOM,
+            above: SNIPPET_NAME_ROOM,
             pop_out_hint: false,
             read_only: true,
         };
@@ -339,45 +259,18 @@ impl crate::Mail {
                     palette.ink(0.8, 0.8),
                     Some(content.width()),
                 );
-                // The recipients' header: labels and addresses `rgba(0,0,0,.5)`, names `.8`.
-                let (label, contact) = (palette.ink(0.5, 0.5), palette.ink(0.8, 0.8));
-                let mut row_top = top + parts.rows_top;
-                for (row, people, lines) in &parts.rows {
-                    crate::thread::HEADER_TEXT.paint_line(
-                        &painter,
-                        pos2(left, row_top),
-                        row,
-                        label,
-                        None,
-                    );
-                    let galley = painter.layout_job(crate::thread::header_job(
-                        people,
-                        content.width(),
-                        label,
-                        contact,
-                    ));
-                    exo_ui::paint_text(
-                        &painter,
-                        pos2(left, row_top),
-                        galley,
-                        &crate::thread::HEADER_TEXT,
-                    );
-                    row_top += lines * crate::thread::HEADER_ROW;
-                }
-                if let Some(subject_top) = parts.subject_top {
-                    SUBJECT.paint_line(
-                        &painter,
-                        pos2(left, top + subject_top + 2.0),
-                        &snippet.subject,
-                        palette.ink(0.8, 0.8),
-                        Some(content.width()),
-                    );
-                }
+                parts.header.paint(
+                    &painter,
+                    palette,
+                    content.min,
+                    content.width(),
+                    &snippet.subject,
+                );
                 if let Some(bodies) = &mut preview.bodies {
                     bodies.paint(
                         &painter,
                         &message.id,
-                        pos2(left, top + parts.body_top),
+                        pos2(left, top + parts.header.body_top()),
                         ui.clip_rect(),
                         1.0,
                     );
@@ -410,73 +303,26 @@ impl crate::Mail {
                 // The footer: the rule, `Edit` (underlined while the view has the keyboard) and
                 // Discard.
                 let footer = top + parts.footer_top;
-                let rule = Rect::from_min_size(pos2(left, footer), vec2(content.width(), 1.0));
-                let dark = exo_ui::theme(ui.ctx()) == exo_ui::Theme::Carbon;
-                painter.rect_filled(
-                    exo_ui::pixel_snap(rule),
-                    0.0,
-                    if dark {
-                        Color32::from_rgb(0x5f, 0x61, 0x65)
-                    } else {
-                        Color32::from_rgb(0xed, 0xed, 0xed)
-                    },
-                );
-                let pane_top = footer + SUBMIT_DOWN;
-                let edit_width = SUBMIT.paint_line(
-                    &painter,
-                    pos2(left, pane_top + 1.0),
+                paint_rule(ui, left, footer, content.width());
+                let pane_top = footer + FOOTER_ACTION_DOWN;
+                let (edit, _) = submit_button(
+                    ui,
+                    ui.id().with("snippet-view-edit"),
+                    pos2(left, pane_top),
                     "Edit",
-                    palette.ink(0.8, 0.8),
                     None,
+                    focused,
                 );
-                // `Edit` takes clicks 10px around its text.
-                let edit = Rect::from_min_size(
-                    pos2(left - 10.0, pane_top - 10.0),
-                    vec2(edit_width + 20.0, FOOTER_HEIGHT),
-                );
-                if ui
-                    .interact(edit, ui.id().with("snippet-view-edit"), Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+                if edit.clicked() {
                     asked.push(Action::Edit(Some(snippet.id.clone())));
                 }
-                if focused {
-                    // While focused, `Edit` is underlined with a 2px border under its text.
-                    painter.rect_filled(
-                        exo_ui::pixel_snap(Rect::from_min_max(
-                            pos2(left, pane_top + 17.0),
-                            pos2(left + edit_width, pane_top + 19.0),
-                        )),
-                        0.0,
-                        palette.border_base_active,
-                    );
-                }
-                let size = exo_ui::icon_size(ui.ctx(), DISCARD).unwrap_or(vec2(11.0, 12.0));
-                let line = pane_top - ICON_LINE_UP;
-                let icon = Rect::from_min_size(
-                    pos2(content.right() - size.x, line + (16.0 - size.y) / 2.0),
-                    size,
+                let button = discard_button(
+                    ui,
+                    ui.id().with("snippet-view-discard"),
+                    content.right(),
+                    pane_top,
+                    column,
                 );
-                let hit =
-                    Rect::from_center_size(icon.center(), vec2(icon.width(), 16.0)).expand(8.0);
-                let button = IconButton::new(DISCARD)
-                    .colors(palette.icon_base_default, palette.icon_base_hover)
-                    .show(
-                        ui,
-                        ui.id().with("snippet-view-discard"),
-                        hit,
-                        exo_ui::icon_rect(ui.ctx(), DISCARD, icon),
-                    );
-                let rows = [KeyTooltip {
-                    text: "Discard",
-                    keys: &["⌘", "shift", ","],
-                }];
-                ShortcutTooltip {
-                    rows: &rows,
-                    note: None,
-                }
-                .show_below(ui, &button, 9.0, false, column);
                 if button.clicked() {
                     asked.push(Action::Discard);
                 }

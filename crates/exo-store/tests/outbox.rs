@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use exo_store::{Error, ListId, Mutation, Store, ThreadId, ThreadSummary};
 use gmail::{TokenFuture, TokenProvider};
-use gmail_mock::DEV_ACCESS_TOKEN;
+use mock_servers::DEV_ACCESS_TOKEN;
 use serde_json::json;
 use support::{ACCOUNT, Harness, options};
 

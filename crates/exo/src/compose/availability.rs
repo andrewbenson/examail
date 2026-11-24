@@ -2,10 +2,10 @@
 //! one row, `Insert free times`, opens the week to pick times, and Insert writes them where the
 //! draft's caret was, or into a new Reply All or message.
 
-use egui::{Color32, CornerRadius, Id, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, Id, Rect, Ui, pos2, vec2};
 use exo_editor::{Editor, Pos, Selection};
 use exo_store::{Address, DraftAction};
-use exo_ui::{Family, Font, TextStyle, Theme};
+use exo_ui::{AnchoredCard, AnchoredList, Family, Font, TextStyle, Theme};
 use jiff::Timestamp;
 
 use super::{Fields, PendingReply, draft::Open, factory};
@@ -120,46 +120,29 @@ pub(super) fn show(ui: &Ui, caret: Rect, id: Id) -> (bool, Rect) {
             Color32::WHITE,
         ),
     };
-    let mut clicked = false;
-    egui::Area::new(id)
+    let list = AnchoredList::new(id, card, AnchoredCard::tooltip(fill, selected))
         .order(egui::Order::Foreground)
-        .fixed_pos(card.min)
-        .constrain(false)
-        .show(&ctx, |area| {
-            let painter = area.painter().clone();
-            let snapped = exo_ui::pixel_snap(card);
-            // `0 2px 4px rgba(0,0,0,.1), 0 2px 12px rgba(0,0,0,.05)`, 4px corners.
-            exo_ui::BoxShadow::new([0.0, 2.0], 4.0, 0.0, Color32::from_black_alpha(26)).paint(
-                &painter,
-                snapped,
-                CornerRadius::same(4),
-            );
-            exo_ui::BoxShadow::new([0.0, 2.0], 12.0, 0.0, Color32::from_black_alpha(13)).paint(
-                &painter,
-                snapped,
-                CornerRadius::same(4),
-            );
-            painter.rect_filled(snapped, CornerRadius::same(4), fill);
-            painter.rect_filled(
-                Rect::from_min_size(pos2(card.left(), card.top() + 4.0), vec2(WIDTH, 1.0)),
-                0.0,
-                separator,
-            );
-            let row = Rect::from_min_size(pos2(card.left(), card.top() + 5.0), vec2(WIDTH, 32.0));
-            painter.rect_filled(row, 0.0, selected);
-            TEXT.paint_line(
-                &painter,
-                pos2(row.left() + 12.0, row.top() + 4.0),
-                ROW,
-                text,
-                None,
-            );
-            clicked = area
-                .interact(row, id.with("row"), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked();
-        });
-    (clicked, card)
+        .padding(4.0, 0.0)
+        .highlighted(Some(1))
+        .show_variable(
+            &ctx,
+            &[1.0, 32.0],
+            |index| index == 1,
+            |painter, row, index| {
+                if index == 0 {
+                    painter.rect_filled(row, 0.0, separator);
+                } else {
+                    TEXT.paint_line(
+                        painter,
+                        pos2(row.left() + 12.0, row.top() + 4.0),
+                        ROW,
+                        text,
+                        None,
+                    );
+                }
+            },
+        );
+    (list.clicked == Some(1), list.rect)
 }
 
 /// Writes `html` into `open` where its caret is. When the body is empty, `html` becomes the whole
@@ -269,6 +252,7 @@ impl crate::Mail {
                     pop_out: false,
                     body: Some(html.to_owned()),
                     quote: None,
+                    snippet: None,
                 });
                 self.create_pending_reply();
             }
@@ -288,11 +272,11 @@ impl crate::Mail {
         if let Some(draft) = self.compose.focused_mut() {
             if open {
                 draft.state.field = super::Field::Body;
-                if draft.availability_menu.is_none() {
-                    draft.availability_menu = Some(Menu::at(draft.editor.selection().focus));
+                if draft.popups.availability.is_none() {
+                    draft.popups.availability = Some(Menu::at(draft.editor.selection().focus));
                 }
             } else {
-                draft.availability_menu = None;
+                draft.popups.availability = None;
             }
         }
     }
@@ -322,14 +306,14 @@ impl crate::Mail {
     /// The focused draft's Share Availability menu, when it's open: what's typed into it, and
     /// whether its row shows (for tests).
     pub fn compose_availability_query(&self) -> Option<(String, bool)> {
-        let menu = self.compose.focused()?.availability_menu.as_ref()?;
+        let menu = self.compose.focused()?.popups.availability.as_ref()?;
         Some((menu.query.clone(), menu.shows_row()))
     }
 
     /// A press outside the menu closes it, and the query typed into it goes.
     pub(super) fn compose_availability_dismiss(&mut self) {
         if let Some(draft) = self.compose.focused_mut()
-            && let Some(menu) = draft.availability_menu.take()
+            && let Some(menu) = draft.popups.availability.take()
             && !menu.query.is_empty()
         {
             draft.editor.replace(menu.start, menu.end(), "");

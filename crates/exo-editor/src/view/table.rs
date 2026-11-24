@@ -14,7 +14,7 @@
 use std::{
     collections::HashMap,
     hash::{Hash as _, Hasher as _},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
 };
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2, vec2};
@@ -29,12 +29,6 @@ use crate::{
 
 /// The prefix a table's document loads an image by, followed by its place in [`Table::images`].
 const IMAGE_URL: &str = "cid:exo-table-image-";
-
-thread_local! {
-    /// The message bodies' fonts, loaded the first time a table is drawn (the editor lives on the
-    /// UI thread).
-    static FONTS: exo_mail::Fonts = exo_mail::Fonts::load();
-}
 
 /// Which table a block holds, by its markup.
 pub(crate) fn key(html: &str) -> u64 {
@@ -126,14 +120,13 @@ impl Table {
             ..ViewOptions::default()
         };
         let render = exo_mail::render_fragment(&markup);
-        let view = FONTS.with(|fonts| {
-            BodyView::new(
-                &render,
-                options,
-                fonts,
-                Some(requests.clone() as Arc<dyn Fetch>),
-            )
-        });
+        let fonts = exo_mail::Fonts::shared().clone();
+        let view = BodyView::new(
+            &render,
+            options,
+            &fonts,
+            Some(requests.clone() as Arc<dyn Fetch>),
+        );
         Self {
             view,
             requests,
@@ -155,12 +148,18 @@ impl Table {
     }
 }
 
+/// A batch of ready table images handed to the reusable decode worker thread.
+type DecodeBatch = (Vec<(Done, Arc<[u8]>)>, egui::Context);
+
 /// Every kept table an editor shows, by [`key`].
 #[derive(Default)]
 pub(crate) struct Tables {
     tables: HashMap<u64, Table>,
     /// Bumped whenever a table is built or what one shows changes, so the layout looks again.
     pub(crate) revision: u64,
+    /// Single reusable worker thread for decoding table images off the UI thread; lazily spawned
+    /// on first use and cleanly exited when dropped.
+    worker: Option<mpsc::Sender<DecodeBatch>>,
 }
 
 impl Tables {
@@ -217,13 +216,13 @@ impl Tables {
         self.tables.values().flat_map(|table| table.images.iter())
     }
 
-    /// Hands the tables' documents the images that have loaded (decoded on a thread of their
-    /// own, which repaints `ctx` once done), and applies what they decoded. Returns whether a
+    /// Hands the tables' documents the images that have loaded (decoded on a reusable worker
+    /// thread, which repaints `ctx` once done), and applies what they decoded. Returns whether a
     /// table changed.
     pub(crate) fn update(&mut self, pictures: &Pictures, ctx: &egui::Context) -> bool {
         let mut changed = false;
+        let mut ready = Vec::new();
         for table in self.tables.values_mut() {
-            let mut ready = Vec::new();
             if let Ok(mut pending) = table.requests.0.lock() {
                 for (asked, done) in std::mem::take(&mut *pending) {
                     let source = match &asked {
@@ -247,20 +246,6 @@ impl Tables {
                     }
                 }
             }
-            if !ready.is_empty() {
-                let ctx = ctx.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("exo-editor-table-images".into())
-                    .spawn(move || {
-                        for (done, file) in ready {
-                            done.finish(file.to_vec());
-                        }
-                        ctx.request_repaint();
-                    });
-                if let Err(error) = spawned {
-                    log::warn!("decoding a table's images: {error}");
-                }
-            }
             if table.view.poll() {
                 table.laid_out = table
                     .laid_out
@@ -269,10 +254,45 @@ impl Tables {
                 changed = true;
             }
         }
+        if !ready.is_empty() {
+            self.decode((ready, ctx.clone()));
+        }
         if changed {
             self.revision += 1;
         }
         changed
+    }
+
+    /// Routes ready table images onto the single reusable decode worker thread.
+    fn decode(&mut self, batch: DecodeBatch) {
+        let batch = match &self.worker {
+            Some(tx) => match tx.send(batch) {
+                Ok(()) => return,
+                Err(mpsc::SendError(batch)) => {
+                    self.worker = None;
+                    batch
+                }
+            },
+            None => batch,
+        };
+        let (tx, rx) = mpsc::channel::<DecodeBatch>();
+        match std::thread::Builder::new()
+            .name("exo-editor-table-images".into())
+            .spawn(move || {
+                while let Ok((ready, ctx)) = rx.recv() {
+                    for (done, file) in ready {
+                        done.finish(file.to_vec());
+                    }
+                    ctx.request_repaint();
+                }
+            }) {
+            Ok(_) => {
+                if tx.send(batch).is_ok() {
+                    self.worker = Some(tx);
+                }
+            }
+            Err(error) => log::warn!("decoding a table's images: {error}"),
+        }
     }
 
     /// Paints the bands of table `key` that `shown` reaches and that aren't up to date. The table
@@ -293,6 +313,10 @@ impl Tables {
         let Some((_, _, height)) = table.laid_out else {
             return;
         };
+        if shown.end <= 0.0 || shown.start >= height || shown.start >= shown.end || height <= 0.0 {
+            table.bands.clear();
+            return;
+        }
         let painted = (
             table.generation,
             width.to_bits(),
@@ -379,5 +403,43 @@ impl Tables {
                 .iter()
                 .map(|(index, (texture, _))| (*index as f32 * BAND, texture))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn off_screen_table_skips_rasterization_and_clears_cached_bands() {
+        let ctx = egui::Context::default();
+        let mut tables = Tables::default();
+        let (key, size) = tables.lay_out(
+            "<table><tbody><tr><td>cell</td></tr></tbody></table>",
+            300.0,
+            1.0,
+            Theme::Snow,
+            &Pictures::default(),
+        );
+        assert!(size.y > 0.0);
+
+        // Table below the viewport (`shown.end <= 0.0`) must not rasterize band 0.
+        tables.paint(key, size.x, 0.0, 1.0, -500.0..-100.0, &ctx);
+        assert_eq!(tables.bands(key).count(), 0);
+        tables.paint(key, size.x, 0.0, 1.0, -500.0..0.0, &ctx);
+        assert_eq!(tables.bands(key).count(), 0);
+
+        // Visible table rasterizes band 0.
+        tables.paint(key, size.x, 0.0, 1.0, 0.0..size.y, &ctx);
+        assert_eq!(tables.bands(key).count(), 1);
+
+        // Scrolling back so the table is below or above the viewport clears cached bands.
+        tables.paint(key, size.x, 0.0, 1.0, -200.0..-10.0, &ctx);
+        assert_eq!(tables.bands(key).count(), 0);
+
+        tables.paint(key, size.x, 0.0, 1.0, 0.0..size.y, &ctx);
+        assert_eq!(tables.bands(key).count(), 1);
+        tables.paint(key, size.x, 0.0, 1.0, size.y..size.y + 200.0, &ctx);
+        assert_eq!(tables.bands(key).count(), 0);
     }
 }

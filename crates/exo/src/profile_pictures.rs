@@ -9,9 +9,8 @@
 //! nothing.
 
 use std::{
-    collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -21,6 +20,8 @@ use std::{
 use exo_auth::Auth;
 use exo_ui::AvatarPhoto;
 
+use crate::avatar_cache::{self, AvatarCache};
+
 /// How long the photo may take to download.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// People is asked again while it can't be reached, up to 7 tries, a second apart and twice as
@@ -29,38 +30,28 @@ const ATTEMPTS: u32 = 7;
 const FIRST_WAIT: Duration = Duration::from_secs(1);
 const LONGEST_WAIT: Duration = Duration::from_secs(32);
 
-/// The photos decoded so far, by address, which the avatars draw, with the files they were
-/// decoded from. It lives in the context's data, so whatever draws an avatar can find it
-/// ([`photo`]), and so can a notification ([`saved`]).
-type Shown = Arc<Mutex<HashMap<String, (AvatarPhoto, Arc<[u8]>)>>>;
-
-fn shown_id() -> egui::Id {
-    egui::Id::new("exo::profile_pictures")
-}
+const CACHE_ID: &str = "exo::profile_pictures";
 
 /// `email`'s profile photo, once there's one to show.
 pub fn photo(ctx: &egui::Context, email: &str) -> Option<AvatarPhoto> {
-    let shown = ctx.data(|data| data.get_temp::<Shown>(shown_id()))?;
-    let shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-    shown.get(email).map(|(photo, _)| photo.clone())
+    AvatarCache::<String, Arc<[u8]>>::of(ctx, CACHE_ID).photo(email)
 }
 
 /// The file `email`'s profile photo was decoded from, once there's one to show.
 pub(crate) fn saved(ctx: &egui::Context, email: &str) -> Option<Arc<[u8]>> {
-    let shown = ctx.data(|data| data.get_temp::<Shown>(shown_id()))?;
-    let shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-    shown.get(email).map(|(_, file)| file.clone())
+    AvatarCache::<String, Arc<[u8]>>::of(ctx, CACHE_ID).extra(email)
 }
 
 /// Shows saved photos, refreshes them from Google and lets them go.
 pub(crate) struct ProfilePictures {
     ctx: egui::Context,
-    shown: Shown,
-    /// The accounts whose saved photo was asked for.
-    loaded: HashSet<String>,
+    cache: AvatarCache<String, Arc<[u8]>>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Shows saved photos one after another, so the photo saved last is the one shown. It's
     /// started with the first.
     loader: Option<mpsc::Sender<Load>>,
+    /// Reused HTTP client for downloading avatar images, keyed by `serves_gmail_locally`.
+    http: Option<(bool, crate::remote_content::Client)>,
     /// Loads and fetches under way.
     busy: Arc<AtomicUsize>,
 }
@@ -101,14 +92,26 @@ enum Error {
 
 impl ProfilePictures {
     /// The photos `ctx`'s avatars draw.
+    #[cfg(test)]
     pub(crate) fn new(ctx: &egui::Context) -> Self {
-        let shown = Shown::default();
-        ctx.data_mut(|data| data.insert_temp(shown_id(), shown.clone()));
         Self {
             ctx: ctx.clone(),
-            shown,
-            loaded: HashSet::new(),
+            cache: AvatarCache::of(ctx, CACHE_ID),
+            runtime: None,
             loader: None,
+            http: None,
+            busy: Arc::default(),
+        }
+    }
+
+    /// The photos `ctx`'s avatars draw, fetching remote updates on `runtime`.
+    pub(crate) fn with_runtime(ctx: &egui::Context, runtime: Arc<tokio::runtime::Runtime>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            cache: AvatarCache::of(ctx, CACHE_ID),
+            runtime: Some(runtime),
+            loader: None,
+            http: None,
             busy: Arc::default(),
         }
     }
@@ -122,7 +125,7 @@ impl ProfilePictures {
     /// Shows the saved photos of `emails` that weren't asked for yet.
     pub(crate) fn load<'a>(&mut self, auth: &Auth, emails: impl IntoIterator<Item = &'a str>) {
         for email in emails {
-            if self.loaded.insert(email.to_owned()) {
+            if self.cache.claim(email.to_owned()) {
                 self.show_saved(auth, email);
             }
         }
@@ -130,7 +133,7 @@ impl ProfilePictures {
 
     /// `email` signed out, which deleted its photo, so its initial shows from now on.
     pub(crate) fn forget(&mut self, auth: &Auth, email: &str) {
-        self.loaded.remove(email);
+        self.cache.unclaim(email);
         self.show_saved(auth, email);
     }
 
@@ -139,10 +142,29 @@ impl ProfilePictures {
     /// Meanwhile, and when Google can't be reached, the saved one shows.
     pub(crate) fn refresh(&mut self, auth: &Auth, email: &str, tokens: exo_auth::Tokens) {
         self.load(auth, [email]);
+        let runtime = match &self.runtime {
+            Some(runtime) => runtime.clone(),
+            None => match crate::account::shared_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    log::error!("starting a profile photo's fetch: {error}");
+                    return;
+                }
+            },
+        };
+        let local_gmail = crate::remote_content::serves_gmail_locally(auth.endpoints());
+        let http = match &self.http {
+            Some((cached_local, client)) if *cached_local == local_gmail => client.clone(),
+            _ => {
+                let client = crate::remote_content::Client::new(DOWNLOAD_TIMEOUT, local_gmail);
+                self.http = Some((local_gmail, client.clone()));
+                client
+            }
+        };
         let (loader, busy) = (self.loader().clone(), Busy::new(&self.busy));
         let (auth, email) = (auth.clone(), email.to_owned());
-        let refresh = move || {
-            if fetch_and_save(&auth, &email, tokens, &busy.0) {
+        runtime.spawn(async move {
+            if fetch_and_save(&auth, &email, tokens, &http, &busy.0).await {
                 // Busy until it shows.
                 let _ = loader.send(Load {
                     _busy: Busy::new(&busy.0),
@@ -150,13 +172,7 @@ impl ProfilePictures {
                     email,
                 });
             }
-        };
-        if let Err(error) = std::thread::Builder::new()
-            .name("exo-profile-photo".into())
-            .spawn(refresh)
-        {
-            log::error!("fetching a profile photo: {error}");
-        }
+        });
     }
 
     fn show_saved(&mut self, auth: &Auth, email: &str) {
@@ -173,7 +189,7 @@ impl ProfilePictures {
     fn loader(&mut self) -> &mpsc::Sender<Load> {
         self.loader.get_or_insert_with(|| {
             let (sender, loads) = mpsc::channel::<Load>();
-            let (ctx, shown) = (self.ctx.clone(), self.shown.clone());
+            let (ctx, cache) = (self.ctx.clone(), self.cache.clone());
             let load = move || {
                 for Load { auth, email, _busy } in loads {
                     let photo = auth
@@ -181,14 +197,15 @@ impl ProfilePictures {
                         .inspect_err(|error| log::warn!("reading a profile photo: {error}"))
                         .ok()
                         .flatten();
-                    let texture =
-                        photo.and_then(|photo| Some((decode(&ctx, &photo)?, Arc::from(photo))));
-                    let mut shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-                    match texture {
-                        Some(texture) => shown.insert(email, texture),
-                        None => shown.remove(&email),
-                    };
-                    ctx.request_repaint();
+                    let texture = photo.and_then(|photo| {
+                        let decoded = avatar_cache::try_decode(&ctx, "profile photo", &photo)
+                            .inspect_err(|error| {
+                                log::warn!("a saved profile photo isn't an image: {error}")
+                            })
+                            .ok()?;
+                        Some((decoded, Arc::from(photo)))
+                    });
+                    cache.set(email, texture);
                 }
             };
             if let Err(error) = std::thread::Builder::new()
@@ -203,49 +220,47 @@ impl ProfilePictures {
 }
 
 /// Fetches `email`'s photo and saves it. Returns whether that changed the saved one.
-fn fetch_and_save(
+async fn fetch_and_save(
     auth: &Auth,
     email: &str,
     tokens: exo_auth::Tokens,
+    http: &crate::remote_content::Client,
     busy: &Arc<AtomicUsize>,
 ) -> bool {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            log::error!("starting a profile photo's fetch: {error}");
-            return false;
-        }
-    };
     let google = gmail::Client::new(auth.endpoints().clone(), tokens);
-    let http = crate::remote_content::Client::new(
-        DOWNLOAD_TIMEOUT,
-        crate::remote_content::serves_gmail_locally(auth.endpoints()),
-    );
-    let photo = match runtime.block_on(fetch(&google, &http, busy)) {
+    let photo = match fetch(&google, http, busy).await {
         Ok(photo) => photo,
         Err(error) => {
             log::warn!("fetching a profile photo: {error}");
             return false;
         }
     };
-    if auth
-        .profile_picture(email)
-        .is_ok_and(|saved| saved == photo)
-    {
-        return false;
-    }
-    match auth.set_profile_picture(email, photo.as_deref()) {
-        Ok(()) => true,
-        // It signed out meanwhile.
-        Err(exo_auth::Error::UnknownAccount(_)) => false,
-        Err(error) => {
-            log::error!("saving a profile photo: {error}");
-            false
+    let (auth, email) = (auth.clone(), email.to_owned());
+    tokio::task::spawn_blocking(move || {
+        if let Some(bytes) = &photo
+            && let Err(error) = image::load_from_memory(bytes)
+        {
+            log::warn!("fetching a profile photo: {}", Error::Image(error));
+            return false;
         }
-    }
+        if auth
+            .profile_picture(&email)
+            .is_ok_and(|saved| saved == photo)
+        {
+            return false;
+        }
+        match auth.set_profile_picture(&email, photo.as_deref()) {
+            Ok(()) => true,
+            // It signed out meanwhile.
+            Err(exo_auth::Error::UnknownAccount(_)) => false,
+            Err(error) => {
+                log::error!("saving a profile photo: {error}");
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The account's photo, which is People's primary photo unless it's Google's generated default.
@@ -279,8 +294,6 @@ async fn fetch(
         .await
         .map_err(crate::remote_content::Error::from)?
         .to_vec();
-    // An answer that isn't an image doesn't replace a saved photo.
-    image::load_from_memory(&photo)?;
     Ok(Some(photo))
 }
 
@@ -302,18 +315,4 @@ async fn people_photos(
             result => return result,
         }
     }
-}
-
-/// `photo` decoded into textures. Google serves photos as JPEGs, which are opaque.
-fn decode(ctx: &egui::Context, photo: &[u8]) -> Option<AvatarPhoto> {
-    let image = image::load_from_memory(photo)
-        .inspect_err(|error| log::warn!("a saved profile photo isn't an image: {error}"))
-        .ok()?
-        .into_rgb8();
-    let size = [image.width() as usize, image.height() as usize];
-    Some(AvatarPhoto::new(
-        ctx,
-        "profile photo",
-        egui::ColorImage::from_rgb(size, image.as_raw()),
-    ))
 }

@@ -34,14 +34,6 @@ const FOOTER_HEIGHT: f32 = 72.0;
 /// A sender row: 32px, 4px apart.
 const SENDER_ROW: f32 = 32.0;
 
-/// The fill of the hero and sender rows, `#f2f4fa` or `#dee3f2` in Carbon.
-fn highlight(ctx: &egui::Context) -> Color32 {
-    match exo_ui::app_theme(ctx) {
-        exo_ui::Theme::Snow => Color32::from_rgb(0xf2, 0xf4, 0xfa),
-        exo_ui::Theme::Carbon => Color32::from_rgb(0xde, 0xe3, 0xf2),
-    }
-}
-
 /// Which kind of template it is, for what its screen shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -226,9 +218,40 @@ impl TemplateForm {
                 .iter()
                 .all(|sender| self.initial_senders.contains(sender));
         !self.input.is_empty()
+            || self.picker.has_pending()
             || self.leave != self.initial_leave
             || (self.kind != Kind::ImportantOther && self.hide != self.initial_hide)
             || (editable && !same)
+    }
+
+    /// Commits any pending text in the definition input or VIP contact picker before Save / Turn
+    /// On. Returns `false` (setting `self.error`) when pending text is invalid.
+    pub(super) fn commit_pending(&mut self, template: &Template) -> bool {
+        let editable = template
+            .properties
+            .senders
+            .as_ref()
+            .is_some_and(|senders| senders.is_editable);
+        if !editable {
+            return true;
+        }
+        if is_vip(template) {
+            match self.picker.commit_pending() {
+                Ok(Some(sender)) => {
+                    self.pick(sender);
+                    true
+                }
+                Ok(None) => true,
+                Err(()) => {
+                    self.error = Some("Please enter a valid email address or domain.");
+                    false
+                }
+            }
+        } else if !self.input.trim().is_empty() {
+            self.add(template)
+        } else {
+            true
+        }
     }
 
     /// Adds the definition field's sender, or says why it can't. Returns whether it did.
@@ -261,6 +284,7 @@ impl TemplateForm {
 
     /// Picks `sender` from the suggestions. It goes first, unless it's there already.
     pub(super) fn pick(&mut self, sender: String) {
+        self.error = None;
         if !self.senders.contains(&sender) {
             self.senders.insert(0, sender);
         }
@@ -547,7 +571,7 @@ impl TemplateForm {
                 ne: 4,
                 ..CornerRadius::ZERO
             },
-            highlight(&ctx).gamma_multiply(0.5),
+            exo_ui::dialog_surface_highlight(&ctx).gamma_multiply(0.5),
         );
 
         let mut content = ui.new_child(egui::UiBuilder::new().max_rect(viewport));
@@ -594,6 +618,7 @@ impl TemplateForm {
             if std::mem::take(&mut self.focus) {
                 self.picker.request_focus();
             }
+            let before = self.picker.text().to_owned();
             if let Some(sender) = self.picker.show(
                 &mut content,
                 exo_ui::id(&ctx, "split-template-picker"),
@@ -602,6 +627,9 @@ impl TemplateForm {
                 book,
             ) {
                 event = Some(TemplateEvent::Pick(sender));
+            }
+            if self.picker.text() != before {
+                self.error = None;
             }
             y += 20.0;
         } else if let Some(senders) = senders.filter(|senders| senders.is_editable) {
@@ -679,7 +707,11 @@ impl TemplateForm {
                     pos2(left - 8.0, y),
                     vec2(CONTENT_WIDTH + 16.0, SENDER_ROW),
                 );
-                painter.rect_filled(row, CornerRadius::same(4), highlight(&ctx));
+                painter.rect_filled(
+                    row,
+                    CornerRadius::same(4),
+                    exo_ui::dialog_surface_highlight(&ctx),
+                );
                 // An editable list's rows take the keyboard, in order after the field. The
                 // focused one is ringed (`box-shadow: 0 0 0 2px #bec1e4`) and shows its trash.
                 let focused = editable

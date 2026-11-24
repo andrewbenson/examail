@@ -4,9 +4,13 @@
 //! The dropdown has the keyboard from the start and lists its choice first, then the others by
 //! name. Metrics are at a 1280×800 window. In Carbon the card keeps Snow's colours.
 
-use egui::{Color32, Context, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, Context, Rect, Ui, pos2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::AutoAdvance;
-use exo_ui::{Dialog, DialogResponse, Family, Font, Menu, TextStyle};
+use exo_ui::{
+    Dialog, DialogMenuKind, DialogResponse, DialogSelect, DialogSelectEvent, DialogSelectState,
+    Family, Font, TextStyle,
+};
 
 /// The subheader and the dropdown's label: 12px/20px, 3px down their lines.
 const TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
@@ -22,8 +26,6 @@ const VALUE_LEFT: f32 = 5.0;
 /// The subheader is `rgba(0,0,0,.85)`, and the dropdown's label `.7`.
 const SUBHEADER_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 217);
 const LABEL_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 179);
-/// The open list: 18px left of the value and 26px under the button.
-const MENU_OFFSET: egui::Vec2 = vec2(-18.0, 26.0);
 const SUBHEADER: &str =
     "Choose where you go after triaging a conversation (e.g. Mark Done, Remind Me, Trash).";
 const LABEL: &str = "After triaging a conversation:";
@@ -55,35 +57,55 @@ pub enum Event {
 /// The open list's highlighted row, between frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    menu: Option<usize>,
+    menu: DialogSelectState,
 }
 
 impl State {
     /// Whether the list is open, in which case its keys are the dialog's.
     pub fn menu_open(&self) -> bool {
-        self.menu.is_some()
+        self.menu.is_open()
+    }
+
+    /// Registers the dialog's keyboard bindings in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::AutoAdvance(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        commands.add(key(
+            "AUTO_ADVANCE_DOWN",
+            Event::Move(1),
+            &["down", "j", "n"],
+        ));
+        commands.add(key("AUTO_ADVANCE_UP", Event::Move(-1), &["up", "k", "p"]));
+        if self.menu_open() {
+            commands.add(key("AUTO_ADVANCE_ENTER", Event::Enter, &["enter", "tab"]));
+            commands.add(key("AUTO_ADVANCE_ESCAPE", Event::MenuClose, &["esc"]));
+        } else {
+            commands.add(key("AUTO_ADVANCE_ENTER", Event::ToggleMenu, &["enter"]));
+        }
     }
 
     /// Applies `event` with `current` chosen, and returns a new choice to save.
     pub fn handle(&mut self, event: Event, current: AutoAdvance) -> Option<AutoAdvance> {
-        let count = CHOICES.len() as isize;
         match event {
             // The list opens on the choice, which it lists first.
-            Event::ToggleMenu => self.menu = if self.menu.is_some() { None } else { Some(0) },
-            Event::Move(step) => {
-                self.menu = Some(
-                    self.menu
-                        .map_or(0, |at| (at as isize + step).rem_euclid(count) as usize),
-                )
-            }
+            Event::ToggleMenu => self.menu.toggle(0),
+            Event::Move(step) => self.menu.step(step, CHOICES.len(), 0, true, true),
             Event::Enter => {
-                let at = self.menu.take()?;
+                let at = self.menu.confirm()?;
                 return Some(order(current)[at].0).filter(|chosen| *chosen != current);
             }
-            Event::MenuClose => self.menu = None,
-            Event::Highlight(row) => self.menu = Some(row),
+            Event::MenuClose => self.menu.close(),
+            Event::Highlight(row) => self.menu.open_at(row),
             Event::Choose(chosen) => {
-                self.menu = None;
+                self.menu.close();
                 return (chosen != current).then_some(chosen);
             }
         }
@@ -135,43 +157,22 @@ fn draw(ui: &mut Ui, body: Rect, state: &State, current: AutoAdvance) -> Option<
         LABEL_INK,
         None,
     );
-    let button = exo_ui::paint_dialog_dropdown(
-        ui,
+    let choices = order(current);
+    let names: Vec<&str> = choices.iter().map(|(_, name)| *name).collect();
+    let select = DialogSelect::new(
+        exo_ui::id(ui.ctx(), "auto-advance-dropdown"),
         pos2(left + label + VALUE_LEFT, top + VALUE_TOP),
         name(current),
-    );
-    let response = ui
-        .interact(
-            button,
-            exo_ui::id(ui.ctx(), "auto-advance-dropdown"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let mut event = response.clicked().then_some(Event::ToggleMenu);
-    if let Some(highlighted) = state.menu {
-        let choices = order(current);
-        let names: Vec<&str> = choices.iter().map(|(_, name)| *name).collect();
-        let list = Menu {
-            items: &names,
-            highlighted,
-        }
-        .show_fitted_in_dialog(
-            ui,
-            exo_ui::id(ui.ctx(), "auto-advance-list"),
-            button.left_top() + MENU_OFFSET,
-        );
-        if let Some(clicked) = list.clicked {
-            event = Some(Event::Choose(choices[clicked].0));
-        } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-            event = Some(Event::Highlight(hovered));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
-            event = Some(Event::MenuClose);
-        }
-    }
-    event
+        &names,
+        state.menu.highlighted(),
+    )
+    .kind(DialogMenuKind::Fitted);
+    select.show(ui).map(|ev| match ev {
+        DialogSelectEvent::Toggle => Event::ToggleMenu,
+        DialogSelectEvent::Highlight(row) => Event::Highlight(row),
+        DialogSelectEvent::Pick(row) => Event::Choose(choices[row].0),
+        DialogSelectEvent::Close => Event::MenuClose,
+    })
 }
 
 #[cfg(test)]
@@ -204,9 +205,13 @@ mod tests {
     fn arrows_open_the_list_and_go_round_and_enter_chooses() {
         let mut state = State::default();
         assert_eq!(state.handle(Event::Move(1), AutoAdvance::Down), None);
-        assert_eq!(state.menu, Some(0), "↓ opens the list on the choice");
+        assert_eq!(
+            state.menu.highlighted(),
+            Some(0),
+            "↓ opens the list on the choice"
+        );
         state.handle(Event::Move(-1), AutoAdvance::Down);
-        assert_eq!(state.menu, Some(2), "↑ wraps to the last row");
+        assert_eq!(state.menu.highlighted(), Some(2), "↑ wraps to the last row");
         assert_eq!(
             state.handle(Event::Enter, AutoAdvance::Down),
             Some(AutoAdvance::Up)

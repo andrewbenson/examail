@@ -1,4 +1,4 @@
-//! A conversation's files end to end on gmail-mock: the file notifications while a file
+//! A conversation's files end to end on mock-servers: the file notifications while a file
 //! downloads and once it has, the alert offline, `Download all`'s zip, and Copy
 //! Attachments pasted into a draft.
 

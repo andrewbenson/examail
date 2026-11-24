@@ -99,7 +99,7 @@ impl Document {
 
     /// `start..end` without the atoms (rules, tables) it only touches. A range that starts after
     /// an atom or ends before one doesn't take the atom.
-    fn trim_atoms(&self, start: Pos, end: Pos) -> (Pos, Pos) {
+    pub(crate) fn trim_atoms(&self, start: Pos, end: Pos) -> (Pos, Pos) {
         let atom = |pos: Pos| !self.blocks[pos.block].is_inline();
         let start = if atom(start) && start.offset > 0 && start.block < end.block {
             Pos::new(start.block + 1, 0)

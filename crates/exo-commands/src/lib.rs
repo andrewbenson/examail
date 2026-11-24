@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Exo's keyboard: key dispatch, the command registry, the ⌘K palette, the shortcuts sheet and
 //! toasts with undo.
 //!
@@ -87,6 +81,7 @@
 //! while [`Commands::go_menu_visible`].
 
 mod command;
+mod dropdown;
 mod feedback;
 mod keyboard;
 mod keys;
@@ -99,9 +94,10 @@ mod shortcuts;
 use egui::{Context, Event, Rect, os::OperatingSystem};
 
 pub use command::Command;
+pub use dropdown::{Dropdown, DropdownState};
 pub use exo_ui::ToastKind;
 pub use feedback::{Hint, Toast};
-pub use palette::{Dropdown, SubPalette};
+pub use palette::SubPalette;
 pub use region::{CONVERSATION, LIST_AND_THREAD, Region, Scope};
 pub use score::command_score;
 

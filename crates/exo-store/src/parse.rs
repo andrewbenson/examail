@@ -1,5 +1,8 @@
 //! Turning Gmail's messages into the rows the store keeps.
 
+use std::collections::HashSet;
+
+use gmail::mime::strip_angles;
 use gmail::{Message, MessagePart};
 use toasty::Json;
 
@@ -28,7 +31,12 @@ pub(crate) fn parse(message: &Message, full: bool) -> Option<Parsed> {
     let empty = MessagePart::default();
     let payload = message.payload.as_ref().unwrap_or(&empty);
     let header = |name: &str| payload.header(name).map(str::to_owned);
-    let mailboxes = |name: &str| payload.header(name).map(addresses).unwrap_or_default();
+    let mailboxes = |name: &str| {
+        payload
+            .header(name)
+            .map(Mailbox::parse_list)
+            .unwrap_or_default()
+    };
 
     let mut attachments = Vec::new();
     let mut calendar = false;
@@ -88,7 +96,11 @@ pub(crate) fn parse(message: &Message, full: bool) -> Option<Parsed> {
     let shown = shown_content_ids(&html);
     for attachment in &mut attachments {
         attachment.inline = attachment.content_id.as_deref().is_some_and(|cid| {
-            shown.contains(&cid) || cid.strip_suffix("@goomoji.gmail").is_some_and(is_lower_hex)
+            let lower = cid.to_ascii_lowercase();
+            shown.contains(&lower)
+                || lower
+                    .strip_suffix("@goomoji.gmail")
+                    .is_some_and(is_lower_hex)
         });
     }
     let joined = |parts: Vec<String>| (!parts.is_empty()).then(|| parts.join("\n"));
@@ -140,19 +152,52 @@ pub(crate) fn parse(message: &Message, full: bool) -> Option<Parsed> {
     })
 }
 
-/// The Content-IDs the HTML references. Each is what follows a `cid:`, up to a quote, a
-/// parenthesis or whitespace.
-fn shown_content_ids(html: &[String]) -> Vec<&str> {
-    html.iter()
-        .flat_map(|html| html.split("cid:").skip(1))
-        .map(|rest| {
-            let end = rest
-                .find(|c: char| matches!(c, '(' | '\'' | '"' | ')') || c.is_whitespace())
-                .unwrap_or(rest.len());
-            &rest[..end]
-        })
-        .filter(|cid| !cid.is_empty())
-        .collect()
+/// The Content-IDs the HTML references, normalized to ASCII lowercase with `%HH` escapes decoded.
+/// Each is what follows an ASCII-case-insensitive `cid:`, up to a quote, parenthesis, `>` or
+/// whitespace.
+fn shown_content_ids(html: &[String]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for part in html {
+        let bytes = part.as_bytes();
+        let mut i = 0;
+        while i + 4 <= bytes.len() {
+            if bytes[i..i + 4].eq_ignore_ascii_case(b"cid:") {
+                let rest = &part[i + 4..];
+                let end = rest
+                    .find(|c: char| matches!(c, '(' | '\'' | '"' | ')' | '>') || c.is_whitespace())
+                    .unwrap_or(rest.len());
+                let raw_cid = &rest[..end];
+                if !raw_cid.is_empty() {
+                    out.insert(percent_decode(raw_cid).to_ascii_lowercase());
+                }
+                i += 4 + end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = bytes.get(i + 1..i + 3)
+            && hex.iter().all(u8::is_ascii_hexdigit)
+            && let Ok(hex_str) = std::str::from_utf8(hex)
+            && let Ok(byte) = u8::from_str_radix(hex_str, 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The name of a file sent without one, from its MIME type.
@@ -180,46 +225,7 @@ fn is_lower_hex(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Splits an address-list header (`To`, `Cc`, ...) on the commas between addresses, not the
-/// ones inside quoted names. Entries without an address (`undisclosed-recipients:;`) are
-/// dropped.
-fn addresses(value: &str) -> Vec<Mailbox> {
-    let mut entries = Vec::new();
-    let (mut current, mut quoted, mut angle) = (String::new(), false, false);
-    for ch in value.chars() {
-        match ch {
-            '"' => quoted = !quoted,
-            '<' if !quoted => angle = true,
-            '>' if !quoted => angle = false,
-            ',' if !quoted && !angle => {
-                entries.push(std::mem::take(&mut current));
-                continue;
-            }
-            _ => {}
-        }
-        current.push(ch);
-    }
-    entries.push(current);
-    entries
-        .iter()
-        .map(|entry| gmail::mime::Mailbox::parse(entry.trim()))
-        .filter(|mailbox| mailbox.email.contains('@'))
-        .map(|mailbox| Mailbox {
-            name: mailbox.name,
-            email: mailbox.email,
-        })
-        .collect()
-}
-
-fn strip_angles(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .to_owned()
-}
-
-/// Decodes the HTML entities Gmail leaves in snippets (`&#39;`, `&amp;`, ...).
+/// Decodes HTML entities left in snippets and HTML bodies (`&#39;`, `&amp;`, `&mdash;`, ...).
 pub(crate) fn unescape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -228,21 +234,24 @@ pub(crate) fn unescape_html(text: &str) -> String {
         rest = &rest[start..];
         let decoded = rest.find(';').filter(|&end| end <= 10).and_then(|end| {
             let entity = &rest[1..end];
-            let ch = match entity {
-                "amp" => '&',
-                "lt" => '<',
-                "gt" => '>',
-                "quot" => '"',
-                "apos" => '\'',
-                "nbsp" => '\u{a0}',
-                _ => {
-                    let code = match entity.strip_prefix('#')? {
-                        hex if hex.starts_with(['x', 'X']) => u32::from_str_radix(&hex[1..], 16),
-                        decimal => decimal.parse(),
-                    };
-                    char::from_u32(code.ok()?)?
-                }
-            };
+            let ch = named_html_entity(entity).or_else(|| {
+                let digits = entity.strip_prefix('#')?;
+                let code = if let Some(hex) = digits
+                    .strip_prefix('x')
+                    .or_else(|| digits.strip_prefix('X'))
+                {
+                    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    u32::from_str_radix(hex, 16).ok()?
+                } else {
+                    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    digits.parse::<u32>().ok()?
+                };
+                char::from_u32(code)
+            })?;
             Some((ch, end))
         });
         match decoded {
@@ -260,14 +269,154 @@ pub(crate) fn unescape_html(text: &str) -> String {
     out
 }
 
+fn named_html_entity(entity: &str) -> Option<char> {
+    Some(match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{00A0}',
+        "mdash" => '\u{2014}',
+        "ndash" => '\u{2013}',
+        "lsquo" => '\u{2018}',
+        "rsquo" => '\u{2019}',
+        "ldquo" => '\u{201C}',
+        "rdquo" => '\u{201D}',
+        "hellip" => '\u{2026}',
+        "bull" => '\u{2022}',
+        "middot" => '\u{00B7}',
+        "copy" => '\u{00A9}',
+        "reg" => '\u{00AE}',
+        "trade" => '\u{2122}',
+        "euro" => '\u{20AC}',
+        "pound" => '\u{00A3}',
+        "yen" => '\u{00A5}',
+        "cent" => '\u{00A2}',
+        "sect" => '\u{00A7}',
+        "para" => '\u{00B6}',
+        "deg" => '\u{00B0}',
+        "plusmn" => '\u{00B1}',
+        "times" => '\u{00D7}',
+        "divide" => '\u{00F7}',
+        "laquo" => '\u{00AB}',
+        "raquo" => '\u{00BB}',
+        "lsaquo" => '\u{2039}',
+        "rsaquo" => '\u{203A}',
+        "sbquo" => '\u{201A}',
+        "bdquo" => '\u{201E}',
+        "dagger" => '\u{2020}',
+        "Dagger" => '\u{2021}',
+        "permil" => '\u{2030}',
+        "prime" => '\u{2032}',
+        "Prime" => '\u{2033}',
+        "larr" => '\u{2190}',
+        "uarr" => '\u{2191}',
+        "rarr" => '\u{2192}',
+        "darr" => '\u{2193}',
+        "harr" => '\u{2194}',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}',
+        "zwnj" => '\u{200C}',
+        "zwj" => '\u{200D}',
+        "shy" => '\u{00AD}',
+        "frac14" => '\u{00BC}',
+        "frac12" => '\u{00BD}',
+        "frac34" => '\u{00BE}',
+        "sup1" => '\u{00B9}',
+        "sup2" => '\u{00B2}',
+        "sup3" => '\u{00B3}',
+        "iexcl" => '\u{00A1}',
+        "iquest" => '\u{00BF}',
+        "brvbar" => '\u{00A6}',
+        "macr" => '\u{00AF}',
+        "acute" => '\u{00B4}',
+        "cedil" => '\u{00B8}',
+        "uml" => '\u{00A8}',
+        "ordf" => '\u{00AA}',
+        "ordm" => '\u{00BA}',
+        "not" => '\u{00AC}',
+        "micro" => '\u{00B5}',
+        "Agrave" => '\u{00C0}',
+        "Aacute" => '\u{00C1}',
+        "Acirc" => '\u{00C2}',
+        "Atilde" => '\u{00C3}',
+        "Auml" => '\u{00C4}',
+        "Aring" => '\u{00C5}',
+        "AElig" => '\u{00C6}',
+        "Ccedil" => '\u{00C7}',
+        "Egrave" => '\u{00C8}',
+        "Eacute" => '\u{00C9}',
+        "Ecirc" => '\u{00CA}',
+        "Euml" => '\u{00CB}',
+        "Igrave" => '\u{00CC}',
+        "Iacute" => '\u{00CD}',
+        "Icirc" => '\u{00CE}',
+        "Iuml" => '\u{00CF}',
+        "ETH" => '\u{00D0}',
+        "Ntilde" => '\u{00D1}',
+        "Ograve" => '\u{00D2}',
+        "Oacute" => '\u{00D3}',
+        "Ocirc" => '\u{00D4}',
+        "Otilde" => '\u{00D5}',
+        "Ouml" => '\u{00D6}',
+        "Oslash" => '\u{00D8}',
+        "Ugrave" => '\u{00D9}',
+        "Uacute" => '\u{00DA}',
+        "Ucirc" => '\u{00DB}',
+        "Uuml" => '\u{00DC}',
+        "Yacute" => '\u{00DD}',
+        "THORN" => '\u{00DE}',
+        "szlig" => '\u{00DF}',
+        "agrave" => '\u{00E0}',
+        "aacute" => '\u{00E1}',
+        "acirc" => '\u{00E2}',
+        "atilde" => '\u{00E3}',
+        "auml" => '\u{00E4}',
+        "aring" => '\u{00E5}',
+        "aelig" => '\u{00E6}',
+        "ccedil" => '\u{00E7}',
+        "egrave" => '\u{00E8}',
+        "eacute" => '\u{00E9}',
+        "ecirc" => '\u{00EA}',
+        "euml" => '\u{00EB}',
+        "igrave" => '\u{00EC}',
+        "iacute" => '\u{00ED}',
+        "icirc" => '\u{00EE}',
+        "iuml" => '\u{00EF}',
+        "eth" => '\u{00F0}',
+        "ntilde" => '\u{00F1}',
+        "ograve" => '\u{00F2}',
+        "oacute" => '\u{00F3}',
+        "ocirc" => '\u{00F4}',
+        "otilde" => '\u{00F5}',
+        "ouml" => '\u{00F6}',
+        "oslash" => '\u{00F8}',
+        "ugrave" => '\u{00F9}',
+        "uacute" => '\u{00FA}',
+        "ucirc" => '\u{00FB}',
+        "uuml" => '\u{00FC}',
+        "yacute" => '\u{00FD}',
+        "thorn" => '\u{00FE}',
+        "yuml" => '\u{00FF}',
+        "OElig" => '\u{0152}',
+        "oelig" => '\u{0153}',
+        "Scaron" => '\u{0160}',
+        "scaron" => '\u{0161}',
+        "Yuml" => '\u{0178}',
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn splits_address_lists_outside_quotes() {
-        let list = addresses(
-            r#""Lovelace, Ada" <ada@example.com>, bob@example.com, undisclosed-recipients:;"#,
+        let list = Mailbox::parse_list(
+            r#""Lovelace, Ada" <ada@example.com>, "Ada \"The, Boss\" \\" <boss@example.com> (Team, Lead), bob@example.com, undisclosed-recipients:;"#,
         );
         assert_eq!(
             list,
@@ -277,11 +426,73 @@ mod tests {
                     email: "ada@example.com".into()
                 },
                 Mailbox {
+                    name: Some(r#"Ada "The, Boss" \"#.into()),
+                    email: "boss@example.com".into()
+                },
+                Mailbox {
                     name: None,
                     email: "bob@example.com".into()
                 },
             ]
         );
+    }
+
+    #[test]
+    fn outlook_uppercase_and_percent_encoded_cids_are_inline() {
+        let part = |mime: &str, filename: &str, headers: &[(&str, &str)], data: &str| MessagePart {
+            mime_type: Some(mime.into()),
+            filename: Some(filename.into()),
+            headers: headers
+                .iter()
+                .map(|(name, value)| gmail::MessagePartHeader {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+            body: Some(gmail::MessagePartBody {
+                data: (!data.is_empty()).then(|| data.as_bytes().to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message = Message {
+            id: Some("m".into()),
+            thread_id: Some("t".into()),
+            payload: Some(MessagePart {
+                mime_type: Some("multipart/related".into()),
+                parts: vec![
+                    part(
+                        "text/html",
+                        "",
+                        &[],
+                        r#"<img src="CID:Banner.PNG@01DB.A0"><img src="cid:image001.png%4001DB3A10.12345670">"#,
+                    ),
+                    part(
+                        "image/png",
+                        "banner.png",
+                        &[
+                            ("Content-Disposition", "attachment"),
+                            ("Content-ID", "<banner.png@01db.a0>"),
+                        ],
+                        "",
+                    ),
+                    part(
+                        "image/png",
+                        "image001.png",
+                        &[
+                            ("Content-Disposition", "inline"),
+                            ("Content-ID", "<Image001.png@01DB3A10.12345670>"),
+                        ],
+                        "",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parsed = parse(&message, true).unwrap();
+        assert!(parsed.attachments.iter().all(|a| a.inline));
+        assert!(!parsed.message.has_attachments);
     }
 
     #[test]
@@ -439,5 +650,26 @@ mod tests {
             unescape_html("it&#39;s &lt;b&gt; &amp; &#x263A; &bogus; & done"),
             "it's <b> & ☺ &bogus; & done"
         );
+        assert_eq!(
+            unescape_html(
+                "&ldquo;caf&eacute;&rdquo; &mdash; &euro;5 &frac12; &copy; &rarr; &hellip;"
+            ),
+            "\u{201C}caf\u{00E9}\u{201D} \u{2014} \u{20AC}5 \u{00BD} \u{00A9} \u{2192} \u{2026}"
+        );
+        assert_eq!(
+            unescape_html("&Aacute;&ntilde;&Ccedil;&szlig;&OElig;&Yuml;"),
+            "\u{00C1}\u{00F1}\u{00C7}\u{00DF}\u{0152}\u{0178}"
+        );
+        // Leading signs in numeric entities must not be accepted.
+        assert_eq!(
+            unescape_html("&#+39; &#-39; &#x+27; &#X-27; &#; &#x;"),
+            "&#+39; &#-39; &#x+27; &#X-27; &#; &#x;"
+        );
+    }
+
+    #[test]
+    fn percent_decode_requires_hex_digits() {
+        assert_eq!(percent_decode("image%40host%2f1"), "image@host/1");
+        assert_eq!(percent_decode("%+a%-a%0g"), "%+a%-a%0g");
     }
 }

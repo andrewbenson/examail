@@ -155,10 +155,10 @@ fn differs(settings: &VacationSettings, copy: Option<&OutOfOfficeResponder>) -> 
         || copy.is_some_and(OutOfOfficeResponder::is_enabled)
             != (settings.enable_auto_reply == Some(true))
         || (plain.is_none()
-            && google.map(|google| google.response_body_html.as_str())
-                != settings.response_body_html.as_deref())
-        || google.map(|google| google.response_subject.as_str())
-            != settings.response_subject.as_deref()
+            && google.map_or("", |google| google.response_body_html.as_str())
+                != settings.response_body_html.as_deref().unwrap_or(""))
+        || google.map_or("", |google| google.response_subject.as_str())
+            != settings.response_subject.as_deref().unwrap_or("")
         || google.is_some_and(|google| google.restrict_to_contacts)
             != (settings.restrict_to_contacts == Some(true))
         || google.is_some_and(|google| google.restrict_to_domain)
@@ -633,6 +633,34 @@ mod tests {
             OutOfOfficeResponder::synced(&VacationSettings::default(), None, now),
             None,
             "nothing, and nothing kept"
+        );
+
+        // Omitted (`None`) subject or HTML body from Gmail normalizes to `""` and does not
+        // trigger spurious rewrites on subsequent syncs.
+        let no_subject = VacationSettings {
+            response_subject: None,
+            ..gmail.clone()
+        };
+        let copy_no_subject =
+            OutOfOfficeResponder::synced(&no_subject, None, now).expect("initial sync");
+        assert_eq!(copy_no_subject.google.response_subject, "");
+        assert_eq!(
+            OutOfOfficeResponder::synced(&no_subject, Some(&copy_no_subject), now),
+            None,
+            "None subject matches stored empty string"
+        );
+
+        let no_body = VacationSettings {
+            response_body_html: None,
+            response_body_plain_text: None,
+            ..gmail
+        };
+        let copy_no_body = OutOfOfficeResponder::synced(&no_body, None, now).expect("initial sync");
+        assert_eq!(copy_no_body.google.response_body_html, "");
+        assert_eq!(
+            OutOfOfficeResponder::synced(&no_body, Some(&copy_no_body), now),
+            None,
+            "None HTML body matches stored empty string"
         );
     }
 

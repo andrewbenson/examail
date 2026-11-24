@@ -4,7 +4,10 @@
 use std::{cmp::Ordering, collections::HashMap, ops::Range};
 
 pub use exo_store::Attachments;
-use exo_store::{Label, ListId, Mutation, ReminderStatus, SendFailure};
+use exo_store::{
+    Label, ListId, Mutation, ReminderStatus, SendFailure,
+    labels::{EXO_PARENT, SH_MUTED, SPAM, TRASH},
+};
 use jiff::Timestamp;
 
 use crate::format::{names::Person, row::Participant};
@@ -12,14 +15,12 @@ use crate::format::{names::Person, row::Participant};
 /// The `[Superhuman]/…` state labels (`[Superhuman]/Muted`, …), which never show as chips.
 pub(crate) const FOREIGN_STATE_LABEL_PREFIX: &str = "[Superhuman]";
 /// Exo's own hidden labels (exo-store's `[Exo]/Muted`).
-pub(crate) const EXO_LABEL_PREFIX: &str = "[Exo]";
+pub(crate) const EXO_LABEL_PREFIX: &str = EXO_PARENT;
 /// The muted chip's label (`SH_MUTED`, named `Muted`).
 const MUTED_CHIP: &str = "Muted";
-/// Gmail's spam label, and its chip's name.
-const SPAM: &str = "SPAM";
+/// Gmail's spam chip's name.
 const SPAM_CHIP: &str = "Spam";
-/// Gmail's trash label, and its chip's name (shown in search results and the header).
-const TRASH: &str = "TRASH";
+/// Gmail's trash chip's name (shown in search results and the header).
 const TRASH_CHIP: &str = "Trash";
 
 /// One row of a thread list.
@@ -169,14 +170,9 @@ impl ThreadSummary {
             ..SearchMarks::default()
         };
         if let Some(subject) = result.subject {
-            let trimmed = subject.text.replace('\u{feff}', "");
-            let trimmed = trimmed.trim_end();
-            marks.subject = subject
-                .bold
-                .into_iter()
-                .filter(|range| range.end <= trimmed.len())
-                .collect();
-            row.subject = trimmed.to_owned();
+            let (trimmed, bold) = strip_bom_with_marks(&subject.text, subject.bold);
+            marks.subject = bold;
+            row.subject = trimmed;
         }
         if let Some(snippet) = result.snippet {
             marks.snippet = snippet.bold;
@@ -190,6 +186,37 @@ impl ThreadSummary {
     pub fn has_label(&self, id: &str) -> bool {
         self.label_ids.iter().any(|label| label == id)
     }
+}
+
+/// Strips `\u{feff}` (UTF-8 BOM, 3 bytes) and trailing whitespace from `text`, remapping each bold
+/// byte range to keep highlights aligned on valid char boundaries within the trimmed string.
+fn strip_bom_with_marks(text: &str, bold: Vec<Range<usize>>) -> (String, Vec<Range<usize>>) {
+    const BOM_LEN: usize = '\u{feff}'.len_utf8();
+    let boms: Vec<usize> = text.match_indices('\u{feff}').map(|(at, _)| at).collect();
+    let stripped = if boms.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace('\u{feff}', "")
+    };
+    let trimmed = stripped.trim_end();
+    let map_offset = |offset: usize| -> usize {
+        let removed: usize = boms
+            .iter()
+            .take_while(|&&at| at < offset)
+            .map(|&at| (offset - at).min(BOM_LEN))
+            .sum();
+        let mapped = offset.saturating_sub(removed).min(trimmed.len());
+        trimmed.floor_char_boundary(mapped)
+    };
+    let marks = bold
+        .into_iter()
+        .filter_map(|range| {
+            let start = map_offset(range.start);
+            let end = map_offset(range.end);
+            (start < end).then_some(start..end)
+        })
+        .collect();
+    (trimmed.to_owned(), marks)
 }
 
 /// Which labels show as chips on rows: the user's own labels and Auto Labels, by id, each with
@@ -228,7 +255,7 @@ impl Chips {
             chips.push((TRASH_CHIP, TRASH_CHIP));
             chips.sort_by(|a, b| compare_label_names(a.0, b.0));
         }
-        lead_with_muted(chips, muted && !queried.iter().any(|id| id == "SH_MUTED"))
+        lead_with_muted(chips, muted && !queried.iter().any(|id| id == SH_MUTED))
     }
 
     /// The open thread's header chips, which are like a row's but keep the label being viewed.
@@ -398,18 +425,28 @@ pub fn compare_label_names(a: &str, b: &str) -> Ordering {
         }
         chunks
     }
-    let numeric = |chunk: &str| chunk.trim_start_matches('0').len();
-    for ((a_digit, a), (b_digit, b)) in chunks(a).iter().zip(&chunks(b)) {
+    let a_chunks = chunks(a);
+    let b_chunks = chunks(b);
+    for ((a_digit, a_chunk), (b_digit, b_chunk)) in a_chunks.iter().zip(&b_chunks) {
         let order = if *a_digit && *b_digit {
-            numeric(a).cmp(&numeric(b)).then_with(|| a.cmp(b))
+            let a_trimmed = a_chunk.trim_start_matches('0');
+            let b_trimmed = b_chunk.trim_start_matches('0');
+            a_trimmed
+                .len()
+                .cmp(&b_trimmed.len())
+                .then_with(|| a_trimmed.cmp(b_trimmed))
+                .then_with(|| a_chunk.len().cmp(&b_chunk.len()))
         } else {
-            a.cmp(b)
+            a_chunk.cmp(b_chunk)
         };
         if order != Ordering::Equal {
             return order;
         }
     }
-    a.len().cmp(&b.len())
+    a_chunks
+        .len()
+        .cmp(&b_chunks.len())
+        .then_with(|| a.len().cmp(&b.len()))
 }
 
 #[cfg(test)]
@@ -423,6 +460,60 @@ mod tests {
             Ordering::Less
         );
         assert_eq!(compare_label_names("Item 9", "Item 10"), Ordering::Less);
+        assert_eq!(compare_label_names("Item 02", "Item 1"), Ordering::Greater);
+        assert_eq!(compare_label_names("Item 1", "Item 02"), Ordering::Less);
+        assert_eq!(compare_label_names("Item 009", "Item 2"), Ordering::Greater);
+        assert_eq!(compare_label_names("Item 01", "Item 1"), Ordering::Greater);
+        assert_eq!(compare_label_names("Item 1", "Item 01"), Ordering::Less);
+        assert_eq!(compare_label_names("Item 00", "Item 0"), Ordering::Greater);
+        assert_eq!(compare_label_names("Item 1", "Item 1a"), Ordering::Less);
+    }
+
+    #[test]
+    fn search_result_preserves_subject_bold_offsets_when_stripping_bom() {
+        let raw = "\u{feff}Re: \u{feff}café budget  ";
+        let match_start = raw.find("budget").expect("budget present");
+        let match_end = match_start + "budget".len();
+        let result = exo_store::SearchResult {
+            thread: exo_store::ThreadSummary {
+                id: "t1".into(),
+                subject: raw.to_owned(),
+                snippet: String::new(),
+                participants: Vec::new(),
+                date: Timestamp::UNIX_EPOCH,
+                unread: false,
+                starred: false,
+                muted: false,
+                done: false,
+                labels: Vec::new(),
+                attachments: Attachments::None,
+                files: Vec::new(),
+                contact: None,
+                messages: 1,
+                drafts: 0,
+                failure: None,
+                sending: false,
+                scheduled: None,
+                removed_by: Vec::new(),
+                reminder: None,
+            },
+            subject: Some(exo_store::Highlighted {
+                text: raw.to_owned(),
+                bold: std::iter::once(match_start..match_end).collect(),
+            }),
+            snippet: None,
+        };
+        let row = ThreadSummary::search_result(result, &[], &[], &Chips::default());
+        assert_eq!(row.subject, "Re: café budget");
+        let marks = row.search.expect("search marks");
+        assert_eq!(marks.subject.len(), 1);
+        assert_eq!(&row.subject[marks.subject[0].clone()], "budget");
+
+        // Bold range covering only a BOM collapses and is dropped; trailing whitespace clamps.
+        let (stripped, bom_only) = strip_bom_with_marks("a\u{feff}b  ", vec![1..4, 4..7]);
+        assert_eq!(stripped, "ab");
+        assert_eq!(bom_only, vec![1..2]);
+        assert_eq!(&stripped[bom_only[0].clone()], "b");
     }
 
     #[test]

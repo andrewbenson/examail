@@ -1,5 +1,5 @@
 //! The folder drawer, hovering rows, the contact pane's conversations and ⌘C, end to end on
-//! gmail-mock.
+//! mock-servers.
 
 mod support;
 

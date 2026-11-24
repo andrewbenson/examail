@@ -174,8 +174,8 @@ pub fn paint_marker(ui: &egui::Ui, rect: egui::Rect, marker: Marker) {
     }
 }
 
-/// `(busy)` when one of `email`'s events overlaps `start`–`end` on the start's day, else `(OOO)`
-/// when an out-of-office one does. Nothing for free time, an unanswered invite, or while offline.
+/// `(busy)` when one of `email`'s events overlaps `start`–`end`, else `(OOO)` when an
+/// out-of-office one does. Nothing for free time, an unanswered invite, or while offline.
 pub fn busy_status(
     email: &str,
     data: &Data,
@@ -186,12 +186,10 @@ pub fn busy_status(
         return None;
     }
     let events = events_of(data, email)?;
-    let day = start.date();
     let mut statuses = events.iter().filter_map(|event| {
         status(
             event,
             email,
-            day,
             start.timestamp(),
             end.timestamp(),
             start.time_zone(),
@@ -209,27 +207,16 @@ pub fn busy_status(
     }
 }
 
-/// The busy status one of a guest's events on `day` gives them.
+/// The busy status one of a guest's events gives them across `start`–`end`.
 fn status(
     event: &ApiEvent,
     email: &str,
-    day: Date,
     start: Timestamp,
     end: Timestamp,
     tz: &TimeZone,
 ) -> Option<&'static str> {
     let (from, to, _) = span(event, tz)?;
-    let on_day = day
-        .to_zoned(tz.clone())
-        .ok()
-        .zip(
-            day.tomorrow()
-                .ok()
-                .and_then(|next| next.to_zoned(tz.clone()).ok()),
-        )
-        .is_some_and(|(midnight, next)| from < next.timestamp() && to > midnight.timestamp());
-    if !on_day
-        || event.transparency.as_deref() == Some("transparent")
+    if event.transparency.as_deref() == Some("transparent")
         || super::event::my_attendance(event, email) == Some(Rsvp::NeedsAction)
     {
         return None;
@@ -319,11 +306,12 @@ pub fn guest_events(
                 if event.summary.as_deref().is_none_or(str::is_empty) {
                     block.title = "Busy".to_owned();
                 }
-                if !block.all_day {
+                if !block.in_all_day_row() {
                     blocks.push(block);
                     continue;
                 }
-                // An all-day event that keeps them busy fills each of its days, to 23:59:59.
+                // An all-day or day-spanning event that keeps them busy fills each of its days to
+                // the next civil midnight.
                 if event.event_type.as_deref() != Some("outOfOffice")
                     && event.transparency.as_deref() == Some("transparent")
                 {
@@ -339,19 +327,22 @@ pub fn guest_events(
                     } else {
                         midnight.clone()
                     };
-                    let Ok(end) = midnight.checked_add(86_399.seconds()) else {
+                    let Ok(next_midnight) =
+                        day.tomorrow().and_then(|next| next.to_zoned(tz.clone()))
+                    else {
                         continue;
                     };
-                    let end = if block.end.date() == *day && block.end < end {
+                    let end = if block.end < next_midnight {
                         block.end.clone()
                     } else {
-                        end
+                        next_midnight
                     };
                     blocks.push(Event {
                         key: format!("{}_{day}", block.key),
                         start,
                         end,
                         all_day: false,
+                        span_row: false,
                         ..block.clone()
                     });
                 }
@@ -364,7 +355,11 @@ pub fn guest_events(
 /// The bars for one calendar's timed `events` on the day from `midnight`: each run of
 /// overlapping answered events as one bar, then each run of unanswered ones in what's left.
 pub fn merged(events: &[&Event], midnight: &Zoned) -> Vec<Event> {
-    let Ok(end_of_day) = midnight.checked_add(86_399.seconds()) else {
+    let Ok(end_of_day) = midnight
+        .date()
+        .tomorrow()
+        .and_then(|next| next.to_zoned(midnight.time_zone().clone()))
+    else {
         return Vec::new();
     };
     let mut gaps = vec![(midnight.clone(), end_of_day)];
@@ -464,7 +459,7 @@ pub fn columns(
     for (email, events) in guests {
         let on: Vec<&Event> = events
             .iter()
-            .filter(|event| !event.all_day && event.on(day))
+            .filter(|event| !event.in_all_day_row() && event.on(day))
             .collect();
         let collapsed = collapse && expanded != Some(email.as_str());
         let events = if collapsed {
@@ -529,7 +524,7 @@ pub fn all_day_columns<'a>(
                 collapse && expanded.is_some(),
                 mine.iter()
                     .copied()
-                    .filter(|event| event.all_day && event.on(*day))
+                    .filter(|event| event.in_all_day_row() && event.on(*day))
                     .collect(),
             )];
             columns.extend(guests.iter().map(|(email, events)| {
@@ -538,7 +533,7 @@ pub fn all_day_columns<'a>(
                     collapse && expanded != Some(email.as_str()),
                     events
                         .iter()
-                        .filter(|event| event.all_day && event.on(*day))
+                        .filter(|event| event.in_all_day_row() && event.on(*day))
                         .collect(),
                 )
             }));
@@ -649,7 +644,7 @@ impl crate::Mail {
                         .and_then(|day| day.parse::<Date>().ok())
                 };
                 let matches = block.key == key
-                    || (block.all_day
+                    || (block.in_all_day_row()
                         && key
                             .strip_prefix(block.key.as_str())
                             .and_then(day_of)
@@ -1025,5 +1020,93 @@ mod tests {
             ],
             "two guests: theirs collapse while mine is open"
         );
+    }
+
+    #[test]
+    fn cross_midnight_busy_conflicts_and_dst_all_day_spans_work() {
+        let tz = TimeZone::get("America/New_York").expect("zone");
+        let z = |text: &str| {
+            text.parse::<jiff::civil::DateTime>()
+                .expect("civil")
+                .to_zoned(tz.clone())
+                .expect("zoned")
+        };
+        let mut data = loaded(&["lena@brightmoor.co"]);
+        if let Some(cal) = data.guests.get_mut("lena@brightmoor.co") {
+            cal.events = GuestEvents::Shown(vec![ApiEvent {
+                id: Some("after-midnight".into()),
+                summary: Some("Deploy".into()),
+                start: Some(gmail::calendar::EventDateTime {
+                    date_time: Some("2026-11-18T00:00:00-05:00".into()),
+                    ..Default::default()
+                }),
+                end: Some(gmail::calendar::EventDateTime {
+                    date_time: Some("2026-11-18T01:00:00-05:00".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]);
+        }
+        assert_eq!(
+            busy_status(
+                "lena@brightmoor.co",
+                &data,
+                (&z("2026-11-17T23:30:00"), &z("2026-11-18T00:30:00")),
+                true,
+            ),
+            Some("(busy)"),
+            "cross-midnight meeting detects guest conflict after midnight"
+        );
+
+        // 23h spring-forward day (2026-03-08) and 25h fall-back day (2026-11-01): busy all-day
+        // blocks cover the exact civil day without bleeding onto the next day or stopping an hour
+        // short.
+        let pink = CalendarColor::from_name("pink").expect("pink");
+        for (start_day, end_day, hours) in [
+            (
+                jiff::civil::date(2026, 3, 8),
+                jiff::civil::date(2026, 3, 9),
+                23_i64,
+            ),
+            (
+                jiff::civil::date(2026, 11, 1),
+                jiff::civil::date(2026, 11, 2),
+                25_i64,
+            ),
+        ] {
+            if let Some(cal) = data.guests.get_mut("lena@brightmoor.co") {
+                cal.events = GuestEvents::Shown(vec![ApiEvent {
+                    id: Some("offsite".into()),
+                    summary: Some("Offsite".into()),
+                    start: Some(gmail::calendar::EventDateTime {
+                        date: Some(start_day.to_string()),
+                        ..Default::default()
+                    }),
+                    end: Some(gmail::calendar::EventDateTime {
+                        date: Some(end_day.to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]);
+            }
+            let guests = guest_events(
+                &data,
+                &[("lena@brightmoor.co".to_owned(), pink)],
+                &[start_day, end_day],
+                &tz,
+            );
+            let blocks = &guests[0].1;
+            assert_eq!(blocks.len(), 1);
+            assert!(!blocks[0].in_all_day_row());
+            assert_eq!(
+                blocks[0]
+                    .end
+                    .timestamp()
+                    .duration_since(blocks[0].start.timestamp())
+                    .as_hours(),
+                hours
+            );
+            assert!(blocks[0].on(start_day) && !blocks[0].on(end_day));
+        }
     }
 }

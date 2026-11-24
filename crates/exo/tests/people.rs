@@ -1,4 +1,4 @@
-//! Google's people, end to end on gmail-mock: Workspace colleagues in compose's suggestions, and
+//! Google's people, end to end on mock-servers: Workspace colleagues in compose's suggestions, and
 //! the photos, companies and titles of saved contacts and colleagues in the contact pane.
 
 mod support;

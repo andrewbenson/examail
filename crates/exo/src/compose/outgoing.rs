@@ -205,24 +205,18 @@ mod tests {
     #[test]
     fn a_reply_without_signatures_on_replies_sends_an_empty_block() {
         let aliases = alias("<div dir=\"ltr\">Maya</div>");
-        let reply = Open {
-            signature_on_replies: false,
-            ..open(DraftAction::Reply)
-        };
+        let mut reply = open(DraftAction::Reply);
+        reply.body.signature_on_replies = false;
         let sent = html(&reply, &aliases);
         assert!(
             sent.contains("<div class=\"gmail_signature\"><br/></div>") && !sent.contains(">Maya<"),
             "{sent}"
         );
-        let forward = Open {
-            signature_on_replies: false,
-            ..open(DraftAction::Forward)
-        };
+        let mut forward = open(DraftAction::Forward);
+        forward.body.signature_on_replies = false;
         assert!(!html(&forward, &aliases).contains(">Maya<"));
-        let new = Open {
-            signature_on_replies: false,
-            ..open(DraftAction::Compose)
-        };
+        let mut new = open(DraftAction::Compose);
+        new.body.signature_on_replies = false;
         assert!(
             html(&new, &aliases).contains(">Maya<"),
             "new mail always carries it"

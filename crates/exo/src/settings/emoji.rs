@@ -5,8 +5,11 @@
 //! Metrics are at a 1280×800 window.
 
 use egui::{Color32, Context, CursorIcon, Rect, Sense, Ui, pos2, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::EmojiSkinTone;
-use exo_ui::{Dialog, DialogResponse, Family, Font, TextStyle, motion};
+use exo_ui::{
+    Dialog, DialogResponse, Family, Font, TextStyle, motion, paint_dialog_literal_footer,
+};
 
 /// The subheader and footer: 12px/20px, 3px down.
 const TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
@@ -31,14 +34,9 @@ const BAR: f32 = 2.0;
 const ACCENT: Color32 = Color32::from_rgb(0xae, 0xb1, 0xdd);
 const SLIDE: f64 = 0.2;
 const SLIDE_CURVE: motion::CubicBezier = motion::CubicBezier::new(0.19, 1.0, 0.22, 1.0);
-/// The subheader's `rgba(0, 0, 0, .85)`, and the footer's `.6`.
+/// The subheader's `rgba(0, 0, 0, .85)`.
 const INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 217);
-const FOOTER_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 153);
-/// The footer's key, an 18px `#abb7c5` cap with 3px corners, 4px either side and 1px down, with a
-/// white `:`.
-const KEY: f32 = 18.0;
 const KEY_MARGIN: f32 = 4.0;
-const KEY_FILL: Color32 = Color32::from_rgb(0xab, 0xb7, 0xc5);
 const OPTIONS: [&str; 6] = ["🙌", "🙌🏻", "🙌🏼", "🙌🏽", "🙌🏾", "🙌🏿"];
 
 /// Something done in the dialog.
@@ -57,6 +55,27 @@ pub struct State {
 }
 
 impl State {
+    /// Registers the dialog's keyboard bindings in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let step = |id: &'static str, delta: isize, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::Emoji(Event::Step(delta))))
+                .keys(keys.iter().copied())
+                .repeat(wrap(super::Action::Emoji(Event::Step(delta))))
+                .regions(DIALOG)
+        };
+        commands.add(step("EMOJI_SKIN_TONE_NEXT", 1, &["tab", "right"]));
+        commands.add(step("EMOJI_SKIN_TONE_PREVIOUS", -1, &["shift+tab", "left"]));
+        commands.add(
+            Command::shortcut("EMOJI_SKIN_TONE_ENTER", wrap(super::Action::CloseDialog))
+                .key("enter")
+                .regions(DIALOG),
+        );
+    }
+
     /// Carries out `event` from `current`, returning the tone to save.
     pub fn handle(&mut self, event: Event, current: EmojiSkinTone) -> EmojiSkinTone {
         let at = position(current);
@@ -161,30 +180,14 @@ fn show(ui: &Ui, body: Rect, state: &mut State, current: EmojiSkinTone) -> Optio
 
     // `To use an emoji, just type [:] then the emoji's name!` is a flex row, so the spaces either
     // side of the cap go.
-    let line = body.top() + FOOTER_TOP + NUDGE;
-    let lead = TEXT.paint_line(
-        &painter,
-        pos2(left, line),
+    paint_dialog_literal_footer(
+        ui,
+        left,
+        body.top() + FOOTER_TOP + NUDGE,
         "To use an emoji, just type",
-        FOOTER_INK,
-        None,
-    );
-    let cap = Rect::from_min_size(pos2(left + lead + KEY_MARGIN, line + 1.0), vec2(KEY, KEY));
-    painter.rect_filled(exo_ui::pixel_snap(cap), 3.0, KEY_FILL);
-    let colon = TEXT.width(&ctx, ":");
-    TEXT.paint_line(
-        &painter,
-        pos2(cap.center().x - colon / 2.0, line),
         ":",
-        Color32::WHITE,
-        None,
-    );
-    TEXT.paint_line(
-        &painter,
-        pos2(cap.right() + KEY_MARGIN, line),
+        KEY_MARGIN,
         "then the emoji's name!",
-        FOOTER_INK,
-        None,
     );
     event
 }

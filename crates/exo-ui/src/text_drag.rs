@@ -165,18 +165,18 @@ pub fn field(
     let visible = line.intersect(ui.clip_rect());
     accept(ctx, visible);
     if let Some(over) = over(ctx).filter(|over| visible.contains(over.at)) {
-        let index = crate::field_index(ctx, text, line, style, over.at.x);
-        let x = crate::field_x(ctx, text, line, style, index);
+        let index = crate::field_index_scrolled(ctx, id, text, line, style, over.at.x);
+        let x = crate::field_x_scrolled(ctx, id, text, line, style, index);
         let pixels_per_point = ctx.pixels_per_point();
         let x = (x * pixels_per_point).round() / pixels_per_point;
-        ui.painter().rect_filled(
+        ui.painter().with_clip_rect(visible).rect_filled(
             Rect::from_x_y_ranges(x..=x + 1.0, line.y_range()),
             0.0,
             color,
         );
     }
     let dropped = take_drop(ctx, visible, id)?;
-    let index = crate::field_index(ctx, text, line, style, dropped.at.x);
+    let index = crate::field_index_scrolled(ctx, id, text, line, style, dropped.at.x);
     let inserted = dropped.text.replace("\r\n", " ").replace(['\r', '\n'], " ");
     let at = text
         .char_indices()
@@ -234,5 +234,89 @@ mod tests {
         assert_eq!(ended(&ctx, Id::new("b")), None);
         assert_eq!(ended(&ctx, Id::new("a")), Some(true));
         assert_eq!(ended(&ctx, Id::new("a")), None);
+    }
+
+    #[test]
+    fn scrolled_field_drop_uses_scrolled_index_and_clips_caret() {
+        let ctx = Context::default();
+        crate::install(&ctx).expect("system fonts");
+        let style = TextStyle::new(crate::Font::new(crate::Family::Sans, 400), 14.0, 22.0);
+        let id = Id::new("scrolled_drop_field");
+        let line = Rect::from_min_size(pos2(40.0, 20.0), vec2(80.0, 22.0));
+        let mut text = "prefix words before overflowing tail".to_owned();
+        let len = text.chars().count();
+        let caret_color = Color32::from_rgb(200, 30, 30);
+
+        // Scroll field to its end.
+        crate::focus_field(&ctx, id, CCursorRange::one(egui::text::CCursor::new(len)));
+        for _ in 0..3 {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = crate::text_field(
+                    ui,
+                    id,
+                    &mut text,
+                    line,
+                    &style,
+                    Color32::BLACK,
+                    Color32::LIGHT_BLUE,
+                );
+            })
+            .drop_without_applying_deltas();
+        }
+        assert!(crate::field_scroll_offset(&ctx, id) > 40.0);
+
+        // Drag over the middle of the visible line: caret clip stays within `line`.
+        let hover_at = pos2(line.center().x, line.center().y);
+        begin(
+            &ctx,
+            true,
+            Some(Over {
+                at: hover_at,
+                source: None,
+            }),
+            None,
+            None,
+        );
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = field(ui, id, &mut text, line, &style, caret_color);
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let caret = shapes
+            .iter()
+            .find(|item| matches!(&item.shape, egui::Shape::Rect(r) if r.fill == caret_color))
+            .expect("drop caret painted");
+        assert!(
+            caret.clip_rect.left() >= line.left() - 0.01
+                && caret.clip_rect.right() <= line.right() + 0.01,
+            "caret clipped to visible line: {:?}",
+            caret.clip_rect
+        );
+
+        // Drop at the right edge of the visible scrolled line: inserts near the scrolled tail.
+        let drop_at = pos2(line.right() - 2.0, line.center().y);
+        begin(
+            &ctx,
+            true,
+            None,
+            Some(Dropped {
+                at: drop_at,
+                html: None,
+                text: "!".into(),
+                source: None,
+                copy: false,
+            }),
+            None,
+        );
+        let mut inserted = None;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            inserted = field(ui, id, &mut text, line, &style, caret_color);
+        })
+        .drop_without_applying_deltas();
+        let range = inserted.expect("drop accepted");
+        assert!(
+            range.start > len / 2,
+            "scrolled drop inserted near tail ({range:?} in len {len}), got {text:?}"
+        );
     }
 }

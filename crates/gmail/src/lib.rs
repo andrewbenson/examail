@@ -1,14 +1,8 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Typed models and an async client for the Google APIs Exo uses: Gmail v1, Calendar v3,
 //! People v1 and OAuth 2.0.
 //!
 //! The models are transcribed by hand from Google's discovery documents (kept in `discovery/`)
-//! and are shared with `gmail-mock`, which serves the same wire format. Service origins are
+//! and are shared with `mock-servers`, which serves the same wire format. Service origins are
 //! configuration ([`Endpoints`]), so pointing Exo at the mock is a matter of swapping them.
 //!
 //! ```no_run
@@ -28,6 +22,7 @@ pub mod calendar;
 mod client;
 mod endpoints;
 mod error;
+pub mod ics;
 pub mod mime;
 mod model;
 pub mod multipart;

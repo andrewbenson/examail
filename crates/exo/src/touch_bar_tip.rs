@@ -93,18 +93,21 @@ impl crate::Mail {
 
     fn tip_keys(&mut self, ctx: &egui::Context) {
         let pressed = |key, modifiers| ctx.input_mut(|input| input.consume_key(modifiers, key));
-        if pressed(Key::Enter, Modifiers::NONE) {
+        if pressed(Key::Enter, Modifiers::NONE)
+            || pressed(Key::Enter, Modifiers::COMMAND)
+            || pressed(Key::Space, Modifiers::NONE)
+        {
             let selected = self.touch_bar_tip.as_ref().map_or(0, |tip| tip.selected);
             self.answer_tip(selected);
         } else if pressed(Key::Escape, Modifiers::NONE) {
             self.answer_tip(NO_THANKS);
         } else if let Some(tip) = &mut self.touch_bar_tip {
             if pressed(Key::ArrowLeft, Modifiers::NONE) || pressed(Key::Tab, Modifiers::SHIFT) {
-                tip.selected = (tip.selected + 1).min(ACTIONS.len() - 1);
+                tip.selected = exo_ui::Alert::move_selection(tip.selected, ACTIONS.len(), 1, true);
             } else if pressed(Key::ArrowRight, Modifiers::NONE)
                 || pressed(Key::Tab, Modifiers::NONE)
             {
-                tip.selected = tip.selected.saturating_sub(1);
+                tip.selected = exo_ui::Alert::move_selection(tip.selected, ACTIONS.len(), -1, true);
             }
         }
     }
@@ -124,14 +127,6 @@ impl crate::Mail {
         let Some(tip) = &self.touch_bar_tip else {
             return;
         };
-        // The overlay: the page dimmed to half, nothing behind it clickable.
-        ui.painter()
-            .rect_filled(page, 0.0, egui::Color32::from_black_alpha(128));
-        let _ = ui.interact(
-            page,
-            ui.id().with("touch-bar-tip-overlay"),
-            egui::Sense::click(),
-        );
         let ctx = ui.ctx().clone();
         let colors = KeycapColors::shortcuts_pane(exo_ui::palette(&ctx));
         let height = KEY_CODE_TOP + 2.0 * ALERT_TEXT.line_height + ALERT_PARAGRAPH_GAP;
@@ -141,28 +136,34 @@ impl crate::Mail {
             actions: &ACTIONS,
             selected: tip.selected,
         };
-        let clicked = alert.show_body(ui, page, height, |ui, text| {
-            let painter = ui.painter();
-            let top = text.top() + KEY_CODE_TOP;
-            // A cap's label sits on the text's baseline.
-            let cap_top = top + ALERT_TEXT.baseline(&ctx) - KEYCAP_BASELINE;
-            let mut x = text.left();
-            for (words, key) in [("Top tip! Instead of", "esc"), (" tap backtick", "`")] {
-                x +=
-                    ALERT_TEXT.paint_line(painter, egui::pos2(x, top), words, ALERT_TEXT_INK, None);
-                let caps = Keycaps::new(&ctx, &[key], colors);
-                caps.paint(painter, x, cap_top);
-                x += caps.width();
-            }
-            let second = top + ALERT_TEXT.line_height + ALERT_PARAGRAPH_GAP;
-            ALERT_TEXT.paint_line(
-                painter,
-                egui::pos2(text.left(), second),
-                "You can always turn this off in the settings.",
-                ALERT_TEXT_INK,
-                None,
-            );
-        });
+        let (clicked, _) =
+            alert.show_body_modal(&ctx, "touch-bar-tip", page, height, |ui, text| {
+                let painter = ui.painter();
+                let top = text.top() + KEY_CODE_TOP;
+                // A cap's label sits on the text's baseline.
+                let cap_top = top + ALERT_TEXT.baseline(&ctx) - KEYCAP_BASELINE;
+                let mut x = text.left();
+                for (words, key) in [("Top tip! Instead of", "esc"), (" tap backtick", "`")] {
+                    x += ALERT_TEXT.paint_line(
+                        painter,
+                        egui::pos2(x, top),
+                        words,
+                        ALERT_TEXT_INK,
+                        None,
+                    );
+                    let caps = Keycaps::new(&ctx, &[key], colors);
+                    caps.paint(painter, x, cap_top);
+                    x += caps.width();
+                }
+                let second = top + ALERT_TEXT.line_height + ALERT_PARAGRAPH_GAP;
+                ALERT_TEXT.paint_line(
+                    painter,
+                    egui::pos2(text.left(), second),
+                    "You can always turn this off in the settings.",
+                    ALERT_TEXT_INK,
+                    None,
+                );
+            });
         if let Some(action) = clicked {
             self.answer_tip(action);
         }

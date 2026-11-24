@@ -5,7 +5,7 @@
 
 use egui::{Color32, Order, Pos2, Rect, Sense, Ui, pos2, vec2};
 use exo_store::Contact;
-use exo_ui::{Family, Font, HoverIntent, TextStyle, motion};
+use exo_ui::{CopyTooltip, Family, Font, HoverIntent, HoverTooltip, Placement, TextStyle};
 
 use crate::format::names::Person;
 
@@ -18,28 +18,15 @@ const PADDING_BOTTOM: f32 = 3.0;
 const GAP: f32 = 8.0;
 /// A participant's tooltip polls its hover intent every 200ms, and the subject's every 100ms.
 const CONTACT_INTERVAL: f64 = 0.2;
-/// How long a tooltip stays once the pointer has left its target, or longer while the pointer is
-/// on the tooltip.
-const HIDE_AFTER: f64 = 0.15;
 const COPY: &str = "legacy/DEPRECATED_clipboard";
 
 /// What a click in a tooltip asks for.
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Clicked {
     /// A new message to the participant, popped out with ⇧.
     ComposeTo(Person, bool),
     /// This went on the clipboard.
     Copied(String),
-}
-
-/// A tooltip up, and what it's for.
-#[derive(Clone, Debug)]
-pub(super) struct Open {
-    /// Its target's box.
-    target: Rect,
-    /// When it showed, and when the pointer left its target.
-    since: f64,
-    left: Option<f64>,
-    what: Showing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,7 +37,8 @@ enum Showing {
 
 /// The tooltip up, if any, between frames, and the pointer settling on a target.
 pub(super) struct Tooltips {
-    open: Option<Open>,
+    hover: HoverTooltip<Showing>,
+    target: Rect,
     contact_intent: HoverIntent<Contact>,
     subject_intent: HoverIntent<String>,
 }
@@ -58,7 +46,8 @@ pub(super) struct Tooltips {
 impl Default for Tooltips {
     fn default() -> Self {
         Self {
-            open: None,
+            hover: HoverTooltip::default(),
+            target: Rect::NOTHING,
             contact_intent: HoverIntent::new(CONTACT_INTERVAL),
             subject_intent: HoverIntent::default(),
         }
@@ -78,7 +67,6 @@ impl Tooltips {
         within: egui::Rangef,
     ) -> Option<Clicked> {
         let ctx = ui.ctx().clone();
-        let now = ctx.input(|input| input.time);
         let pointer = ctx.pointer_hover_pos();
         // Only what's on top under the pointer counts as hovered (not a target under the
         // palette), but the open tooltip is a layer of its own.
@@ -93,56 +81,42 @@ impl Tooltips {
                     .filter(|(rect, _)| over(rect))
                     .map(|(rect, text)| (rect, Showing::Subject(text.to_owned())))
             });
-        let on_tooltip = self.open.as_ref().is_some_and(|open| {
-            let rect = self.rect(ui, open, within);
-            // The 8px between the target and the box is the tooltip's padding.
-            pointer.is_some_and(|at| rect.expand2(vec2(0.0, GAP)).contains(at))
-        });
-        let (contact, subject) = match &hovered {
+        if let Some((target, ref what)) = hovered
+            && self.hover.active() == Some(what)
+        {
+            self.target = target;
+        }
+        if let Some(open) = self.hover.active().cloned() {
+            let box_rect = self.rect(&ctx, self.target, &open, within);
+            self.hover.set_box(box_rect, false);
+        }
+        let (contact, subject_text) = match &hovered {
             Some((_, Showing::Contact(contact))) => (Some(contact.clone()), None),
             Some((_, Showing::Subject(subject))) => (None, Some(subject.clone())),
             None => (None, None),
         };
         let settled = match (
             self.contact_intent.update(&ctx, contact),
-            self.subject_intent.update(&ctx, subject),
+            self.subject_intent.update(&ctx, subject_text),
         ) {
             (Some(contact), _) => Some(Showing::Contact(contact.clone())),
             (_, Some(subject)) => Some(Showing::Subject(subject.clone())),
             _ => None,
         };
-        if let (Some(what), Some((target, _))) = (settled, &hovered)
-            && self.open.as_ref().is_none_or(|open| open.what != what)
+        if let (Some(what), Some((target, _))) = (&settled, &hovered)
+            && self.hover.active() != Some(what)
         {
-            self.open = Some(Open {
-                target: *target,
-                since: now,
-                left: None,
-                what,
-            });
+            self.target = *target;
         }
-        let open = self.open.as_mut()?;
-        match &hovered {
-            Some((target, what)) if *what == open.what => {
-                (open.target, open.left) = (*target, None)
-            }
-            _ => {
-                let left = *open.left.get_or_insert(now);
-                if !on_tooltip && now - left >= HIDE_AFTER {
-                    self.open = None;
-                    return None;
-                }
-                if !on_tooltip {
-                    ctx.request_repaint_after_secs((HIDE_AFTER - (now - left)) as f32);
-                }
-            }
-        }
-        let open = open.clone();
-        let rect = self.rect(ui, &open, within);
-        let fade = ((now - open.since) / 0.2).min(1.0) as f32;
-        if fade < 1.0 {
-            ctx.request_repaint();
-        }
+        let active_target = hovered.map(|(_, what)| what);
+        let (showing, opacity) = {
+            let (what, opacity) = self
+                .hover
+                .step_settled(&ctx, active_target, settled, false)?;
+            (what.clone(), opacity)
+        };
+        let rect = self.rect(&ctx, self.target, &showing, within);
+        self.hover.set_box(rect, false);
         let mut clicked = None;
         egui::Area::new(exo_ui::id(&ctx, "thread-header-tooltip"))
             .order(Order::Tooltip)
@@ -150,7 +124,7 @@ impl Tooltips {
             .constrain(false)
             .show(&ctx, |area| {
                 let mut painter = area.painter().clone();
-                painter.multiply_opacity(motion::CubicBezier::EASE.at(fade));
+                painter.multiply_opacity(opacity);
                 exo_ui::paint_tooltip_box(&painter, rect);
                 let line = pos2(rect.left() + PADDING_X, rect.top() + PADDING_TOP);
                 let whole = area.interact(
@@ -158,43 +132,45 @@ impl Tooltips {
                     exo_ui::id(area.ctx(), "thread-header-tooltip-box"),
                     Sense::click(),
                 );
-                clicked = match &open.what {
+                clicked = match &showing {
                     Showing::Contact(contact) => contact_content(area, &painter, line, contact),
-                    Showing::Subject(subject) => subject_content(area, &painter, line, subject),
+                    Showing::Subject(subject) => CopyTooltip::paint_content(
+                        area,
+                        &painter,
+                        exo_ui::id(area.ctx(), "thread-subject-copy"),
+                        rect,
+                        subject,
+                    )
+                    .map(|_| Clicked::Copied(subject.to_owned())),
                 };
                 // A click anywhere else on it closes it.
                 if clicked.is_some() || whole.clicked() {
-                    self.open = None;
+                    self.hover.close();
                 }
             });
         clicked
     }
 
     /// Where the open tooltip's box goes, centred under its target and inside `within`.
-    fn rect(&self, ui: &Ui, open: &Open, within: egui::Rangef) -> Rect {
-        let width = match &open.what {
-            Showing::Contact(contact) => contact_width(ui, contact),
-            Showing::Subject(subject) => subject_width(ui, subject),
+    fn rect(
+        &self,
+        ctx: &egui::Context,
+        target: Rect,
+        what: &Showing,
+        within: egui::Rangef,
+    ) -> Rect {
+        let size = match what {
+            Showing::Contact(contact) => vec2(
+                contact_width(ctx, contact) + 2.0 * PADDING_X,
+                PADDING_TOP + TEXT.line_height + PADDING_BOTTOM,
+            ),
+            Showing::Subject(subject) => CopyTooltip::box_size(ctx, subject),
         };
-        let size = vec2(
-            width + 2.0 * PADDING_X,
-            PADDING_TOP
-                + TEXT.line_height
-                + PADDING_BOTTOM
-                + f32::from(u8::from(matches!(open.what, Showing::Subject(_)))),
-        );
-        let left = (open.target.center().x - size.x / 2.0)
-            .min(within.max - size.x)
-            .max(within.min);
-        Rect::from_min_size(pos2(left, open.target.bottom() + GAP), size)
-    }
-}
-
-/// The tooltip's text color: `#ebeef2` on Snow's dark card, `#18191b` on Carbon's light one.
-fn ink(ui: &Ui) -> Color32 {
-    match exo_ui::theme(ui.ctx()) {
-        exo_ui::Theme::Snow => Color32::from_rgb(0xeb, 0xee, 0xf2),
-        exo_ui::Theme::Carbon => Color32::from_rgb(0x18, 0x19, 0x1b),
+        Placement::Below {
+            gap: GAP,
+            shift: 0.0,
+        }
+        .place(target, size, within)
     }
 }
 
@@ -205,14 +181,14 @@ const CONTACT_COPY: f32 = 7.0 + 12.0 - 3.0 + 4.0;
 
 /// The line's width as [`contact_content`] paints it, piece by piece (Chromium shapes each text
 /// node on its own).
-fn contact_width(ui: &Ui, contact: &Contact) -> f32 {
+fn contact_width(ctx: &egui::Context, contact: &Contact) -> f32 {
     let pieces = match contact.name.as_deref().filter(|name| !name.is_empty()) {
         Some(name) => vec![name, " <", &contact.email, ">"],
         None => vec![contact.email.as_str()],
     };
     pieces
         .into_iter()
-        .map(|piece| TEXT.width(ui.ctx(), piece))
+        .map(|piece| TEXT.width(ctx, piece))
         .sum::<f32>()
         + CONTACT_COPY
 }
@@ -233,7 +209,7 @@ fn contact_content(
     line: Pos2,
     contact: &Contact,
 ) -> Option<Clicked> {
-    let ink = ink(ui);
+    let ink = exo_ui::tooltip_text_color(ui.ctx());
     let name = contact.name.as_deref().filter(|name| !name.is_empty());
     let mut x = line.x;
     if let Some(name) = name {
@@ -289,65 +265,96 @@ fn contact_content(
     None
 }
 
-/// The subject's copy tooltip has its text at most 460px wide, then the icon 8px after it.
-const SUBJECT_MAX: f32 = 460.0;
-const SUBJECT_ICON_GAP: f32 = 8.0;
-const SUBJECT_ICON: f32 = 11.0;
+#[cfg(test)]
+mod tests {
+    use egui::{Context, Event, PointerButton, Rangef, RawInput};
 
-fn subject_width(ui: &Ui, subject: &str) -> f32 {
-    TEXT.single_line(ui.painter(), subject, Color32::PLACEHOLDER, None)
-        .size()
-        .x
-        .min(SUBJECT_MAX)
-        + SUBJECT_ICON_GAP
-        + SUBJECT_ICON
-}
+    use super::*;
 
-/// The subject's copy tooltip from `line`. The subject is in 70% white (black in Carbon) at
-/// `top: -1px`, cut at 460px and underlined while hovered. The copy icon follows it at 66%, at
-/// `top: 1px`. A click on either copies the subject.
-fn subject_content(ui: &Ui, painter: &egui::Painter, line: Pos2, subject: &str) -> Option<Clicked> {
-    let carbon = exo_ui::theme(ui.ctx()) == exo_ui::Theme::Carbon;
-    let (text_ink, icon_ink) = if carbon {
-        (
-            Color32::from_black_alpha(179),
-            Color32::from_black_alpha(153),
-        )
-    } else {
-        (
-            Color32::from_white_alpha(179),
-            Color32::from_white_alpha(153),
-        )
-    };
-    let at = line - vec2(0.0, 1.0);
-    let width = TEXT
-        .single_line(painter, subject, Color32::PLACEHOLDER, None)
-        .size()
-        .x
-        .min(SUBJECT_MAX);
-    let text = Rect::from_min_size(at, vec2(width, TEXT.line_height));
-    let hovered = ui.rect_contains_pointer(text);
-    TEXT.paint_line(painter, at, subject, text_ink, Some(SUBJECT_MAX));
-    if hovered {
-        // Hovered, the text is underlined.
-        let underline = Rect::from_min_size(
-            pos2(at.x, at.y + TEXT.baseline(ui.ctx()) + 1.0),
-            vec2(width, 1.0),
+    #[test]
+    fn subject_tooltip_settles_bridges_gap_and_copies_on_click() {
+        let ctx = Context::default();
+        exo_ui::install(&ctx).expect("the system fonts load");
+        let mut tooltips = Tooltips::default();
+        let target = Rect::from_min_size(pos2(100.0, 40.0), vec2(120.0, 20.0));
+
+        let step = |tooltips: &mut Tooltips, time: f64, events: Vec<Event>| -> Option<Clicked> {
+            let mut out = None;
+            ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = ui.allocate_rect(
+                        Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0)),
+                        Sense::hover(),
+                    );
+                    out = tooltips.show(
+                        ui,
+                        &[],
+                        Some((target, "Quarterly Review")),
+                        Rangef::new(0.0, 600.0),
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+            out
+        };
+
+        step(
+            &mut tooltips,
+            0.0,
+            vec![Event::PointerMoved(pos2(10.0, 10.0))],
         );
-        painter.rect_filled(exo_ui::pixel_snap(underline), 0.0, text_ink);
+        step(
+            &mut tooltips,
+            1.0,
+            vec![Event::PointerMoved(target.center())],
+        );
+        assert!(!tooltips.hover.is_open(), "not yet settled");
+        step(
+            &mut tooltips,
+            1.12,
+            vec![Event::PointerMoved(target.center())],
+        );
+        assert!(tooltips.hover.is_open(), "settled after 100ms subject poll");
+
+        // Move into the 8px bridge below `target` (y = 64.0) for longer than 150ms: stays open!
+        step(
+            &mut tooltips,
+            1.5,
+            vec![Event::PointerMoved(pos2(target.center().x, 64.0))],
+        );
+        assert!(tooltips.hover.is_open(), "bridge keeps tooltip open");
+
+        // Click the subject text inside the tooltip box (y = 76.0).
+        let click_pos = pos2(target.center().x, 76.0);
+        step(
+            &mut tooltips,
+            1.6,
+            vec![
+                Event::PointerMoved(click_pos),
+                Event::PointerButton {
+                    pos: click_pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        let clicked = step(
+            &mut tooltips,
+            1.62,
+            vec![Event::PointerButton {
+                pos: click_pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert_eq!(clicked, Some(Clicked::Copied("Quarterly Review".into())));
+        assert!(!tooltips.hover.is_open(), "clicking copies and closes");
     }
-    let icon = Rect::from_min_size(
-        pos2(at.x + width + SUBJECT_ICON_GAP, line.y + 1.0),
-        vec2(SUBJECT_ICON, 14.0),
-    );
-    exo_ui::paint_icon_on(painter, COPY, icon, icon_ink.gamma_multiply(0.66));
-    let hit = Rect::from_min_max(text.min, pos2(icon.right(), text.bottom()));
-    let copy = ui
-        .interact(
-            hit,
-            exo_ui::id(ui.ctx(), "thread-subject-copy"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    copy.clicked().then(|| Clicked::Copied(subject.to_owned()))
 }

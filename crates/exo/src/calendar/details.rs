@@ -11,13 +11,15 @@ use egui::{
 };
 use exo_ui::{BoxShadow, Family, Font, Menu, Scrollbar, TextStyle, motion};
 use gmail::calendar::{Event as ApiEvent, EventAttendee};
-use jiff::{ToSpan, Zoned};
+use jiff::Zoned;
 
 use super::{
-    event::{Event, Rsvp},
+    description::{Line, Run, interact_link, linkify},
+    event::{Event, Rsvp, conference_of},
     form::Field,
     popup::{self, Placement},
 };
+use crate::rsvp::{RsvpButtonMetrics, show_rsvp_buttons};
 
 /// The popover: 464px wide.
 const WIDTH: f32 = 464.0;
@@ -93,8 +95,6 @@ const BUTTON_TEXT_TOP: f32 = 3.0;
 /// The RSVP bar's `border-top: 1px solid #ededed`, Carbon's `#5f6165`.
 const RSVP_BORDER: Color32 = Color32::from_rgb(0xed, 0xed, 0xed);
 const RSVP_BORDER_CARBON: Color32 = Color32::from_rgb(0x5f, 0x61, 0x65);
-/// My answer's button: `rgba(84, 172, 220, .1)` (Carbon's `.15`) behind `rgba(84, 172, 220, .8)`.
-const RSVP_SELECTED: Color32 = Color32::from_rgb(84, 172, 220);
 
 /// The menu's items, top to bottom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,10 +523,7 @@ impl Details {
         if let Some(clicked) = list.clicked {
             self.menu = None;
             actions.push(DetailsAction::Menu(shown.menu[clicked]));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
+        } else if list.outside_released(ui, response.hovered()) {
             self.menu = None;
         }
     }
@@ -573,80 +570,23 @@ fn rsvp_bar(ui: &Ui, bar: Rect, current: Option<Rsvp>) -> Option<Rsvp> {
         palette.ink(0.75, 0.85),
         None,
     );
-    let mut x = bar.left() + RSVP_LEFT + label_width + RSVP_LABEL_GAP;
-    let mut clicked = None;
-    // The buttons' labels are uppercase.
-    for (label, answer) in [
-        ("YES", Rsvp::Accepted),
-        ("MAYBE", Rsvp::Tentative),
-        ("NO", Rsvp::Declined),
-    ] {
-        let width = BUTTON.width(ui.ctx(), label) + 2.0 * BUTTON_PADDING;
-        let button = Rect::from_min_size(
-            pos2(x, middle - BUTTON_HEIGHT / 2.0 + 1.0),
-            vec2(width, BUTTON_HEIGHT),
-        );
-        let response = ui
-            .interact(
-                button,
-                exo_ui::id(ui.ctx(), ("calendar-details-rsvp", label)),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let selected = current == Some(answer);
-        // `transition: all 150ms ease`. Pressed or selected, a button takes the blue fill and
-        // text. Otherwise, hovered, it takes `box-shadow: 0 0 8px rgba(0, 0, 0, .2)` (Carbon's
-        // `.5`).
-        let ease = |on: bool, salt: &str| {
-            motion::transition(
-                ui.ctx(),
-                response.id.with(salt),
-                on,
-                0.15,
-                motion::CubicBezier::EASE,
-            )
-        };
-        let chosen = ease(selected || response.is_pointer_button_down_on(), "selected");
-        let lifted = ease(response.hovered(), "hovered") * (1.0 - chosen);
-        let rect = exo_ui::pixel_snap(button);
-        if lifted > 0.0 {
-            BoxShadow::new(
-                [0.0, 0.0],
-                8.0,
-                0.0,
-                Color32::from_black_alpha(if carbon { 128 } else { 51 }).gamma_multiply(lifted),
-            )
-            .paint(painter, rect, CornerRadius::same(2));
-        }
-        if chosen > 0.0 {
-            painter.rect_filled(
-                rect,
-                CornerRadius::same(2),
-                RSVP_SELECTED.gamma_multiply(if carbon { 0.15 } else { 0.1 } * chosen),
-            );
-        }
-        // `color: rgba(0, 0, 0, .35)`, Carbon's white at `.45`.
-        let ink = motion::mix(
-            palette.ink(0.35, 0.45),
-            RSVP_SELECTED.gamma_multiply(0.8),
-            chosen,
-        );
-        BUTTON.paint_line(
-            painter,
-            pos2(
-                button.left() + BUTTON_PADDING,
-                button.top() + BUTTON_TEXT_TOP,
-            ),
-            label,
-            ink,
-            None,
-        );
-        if response.clicked() && !selected {
-            clicked = Some(answer);
-        }
-        x = button.right() + BUTTON_GAP;
-    }
-    clicked
+    let x = bar.left() + RSVP_LEFT + label_width + RSVP_LABEL_GAP;
+    show_rsvp_buttons(
+        ui,
+        palette,
+        exo_ui::id(ui.ctx(), "calendar-details-rsvp"),
+        pos2(x, middle - BUTTON_HEIGHT / 2.0 + 1.0),
+        current,
+        None,
+        RsvpButtonMetrics {
+            font: BUTTON,
+            height: BUTTON_HEIGHT,
+            padding_x: BUTTON_PADDING,
+            gap: BUTTON_GAP,
+            text_top: BUTTON_TEXT_TOP,
+            animated: true,
+        },
+    )
 }
 
 /// A row of the body.
@@ -693,21 +633,6 @@ struct Guest {
     /// `(organizer)` or `(optional)`.
     note: Option<&'static str>,
     answer: Option<Rsvp>,
-}
-
-/// A line of the description: runs of text, indented for a list.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Line {
-    pub indent: f32,
-    pub runs: Vec<Run>,
-}
-
-/// Text, a link when `link` is set, bold when `bold`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Run {
-    pub text: String,
-    pub link: Option<String>,
-    pub bold: bool,
 }
 
 impl Row {
@@ -1176,14 +1101,7 @@ fn paint_runs(
         }
         let mut hovered = false;
         for (piece, rect) in pieces.iter().enumerate() {
-            exo_ui::link_box(ui.ctx(), rect.intersect(clip), link);
-            let response = ui
-                .interact(
-                    rect.intersect(clip),
-                    id.with((index, piece)),
-                    Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = interact_link(ui, rect.intersect(clip), id.with((index, piece)), link);
             hovered |= response.hovered();
             if response.clicked() {
                 clicked = crate::format::urls::web(link);
@@ -1358,12 +1276,8 @@ fn guests(source: &ApiEvent) -> Vec<Guest> {
             } else {
                 format!("{name} <{email}>")
             };
-            let answer = match attendee.response_status.as_deref() {
-                Some("accepted") => Some(Rsvp::Accepted),
-                Some("declined") => Some(Rsvp::Declined),
-                Some("tentative") => Some(Rsvp::Tentative),
-                _ => None,
-            };
+            let answer = Rsvp::parse_opt(attendee.response_status.as_deref())
+                .filter(|a| *a != Rsvp::NeedsAction);
             let organizer = attendee.organizer == Some(true);
             let rank = if organizer {
                 0
@@ -1402,139 +1316,19 @@ fn guests(source: &ApiEvent) -> Vec<Guest> {
 /// The When row: `Thu, Nov 19 · 2:00 PM – 3:00 PM`, with the end's date when it's another day,
 /// `(all day)` for a single all-day day, and ` (recurring)` for a series.
 fn when(event: &Event, recurring: bool, now: &Zoned) -> String {
-    let (start, end) = (&event.start, &event.end);
-    // An all-day event's last day is the day before its end.
-    let last = if event.all_day {
-        end.checked_sub(1.day()).unwrap_or_else(|_| end.clone())
-    } else {
-        end.clone()
-    };
-    let this_year = start.year() == now.year() && last.year() == now.year();
-    let date = |at: &Zoned| {
-        at.strftime(if this_year {
-            "%a, %b %-d"
-        } else {
-            "%a, %b %-d, %Y"
-        })
-        .to_string()
-    };
-    let time = |at: &Zoned| at.strftime("%-I:%M %p").to_string();
-    let single_all_day = event.all_day && start.date() == last.date();
-    let other_day = start.date() != end.date();
-    let mut text = format!("{} ", date(start));
-    if !event.all_day {
-        text.push_str(&format!("\u{2004}·\u{2004}{}", time(start)));
-    }
-    if single_all_day {
-        text.push_str("(all day)");
-    } else {
-        text.push_str("\u{2004}–\u{2004}");
-    }
-    if other_day && !single_all_day {
-        text.push_str(&format!("{} ", date(&last)));
-        if !event.all_day {
-            text.push_str("\u{2004}·\u{2004}");
-        }
-    }
-    if !event.all_day {
-        text.push_str(&time(end));
-    }
-    if recurring {
-        text.push_str(" (recurring)");
-    }
-    text
+    crate::format::dates::event_details_range(
+        &event.start,
+        &event.end,
+        event.all_day,
+        recurring,
+        now,
+    )
 }
 
-/// The Conference row's content.
-struct Conference {
-    /// The entry point's label (`meet.google.com/abc-defg-hij`).
-    label: String,
-    /// Its link (a Meet link opens as this account, with `authuser`), and the link as Calendar has
-    /// it.
-    uri: String,
-    raw: String,
-    /// The tooltip's text.
-    copy: String,
-    join: &'static str,
-}
-
-/// The event's call (a video entry point first), if it has `conferenceData`. Only links Exo would
-/// open count.
-fn conference(source: &ApiEvent, me: &str) -> Option<Conference> {
-    let data = source.conference_data.as_ref()?;
-    let entries = data.get("entryPoints")?.as_array()?;
-    let entry = entries
-        .iter()
-        .find(|entry| entry.get("entryPointType").and_then(|kind| kind.as_str()) == Some("video"))
-        .or_else(|| entries.first())?;
-    let kind = entry.get("entryPointType")?.as_str()?;
-    let raw = entry.get("uri")?.as_str()?.to_owned();
-    let label = entry
-        .get("label")
-        .and_then(|label| label.as_str())
-        .map_or_else(
-            || raw.trim_start_matches("https://").to_owned(),
-            str::to_owned,
-        );
-    let solution = data.get("conferenceSolution");
-    let name = solution
-        .and_then(|solution| solution.get("name"))
-        .and_then(|name| name.as_str())
-        .unwrap_or_default();
-    let meet = solution
-        .and_then(|solution| solution.get("key"))
-        .and_then(|key| key.get("type"))
-        .and_then(|kind| kind.as_str())
-        == Some("hangoutsMeet")
-        || matches!(name, "Google Meet" | "Hangouts Meet");
-    let join = match (kind, name) {
-        ("video", "Microsoft Teams") => "Join Teams Call",
-        ("video", "Zoom Meeting") => "Join Zoom Call",
-        ("video", _) if meet => "Join Google Meet",
-        _ => "Join Meeting",
-    };
-    let web = crate::format::urls::web(&raw)?;
-    let (uri, copy) = if meet {
-        let mut link = url::Url::parse(&web).ok()?;
-        link.query_pairs_mut().append_pair("authuser", me);
-        (link.to_string(), label.clone())
-    } else {
-        (web.clone(), web)
-    };
-    Some(Conference {
-        label,
-        uri,
-        raw,
-        copy,
-        join,
-    })
-}
-
-/// `text` with its links found.
-fn linkify(text: &str) -> Vec<Run> {
-    let mut runs = Vec::new();
-    let mut at = 0;
-    for (range, url) in exo_mail::links(text) {
-        if range.start > at {
-            runs.push(Run {
-                text: text[at..range.start].to_owned(),
-                ..Run::default()
-            });
-        }
-        runs.push(Run {
-            text: text[range.clone()].to_owned(),
-            link: Some(url),
-            bold: false,
-        });
-        at = range.end;
-    }
-    if at < text.len() {
-        runs.push(Run {
-            text: text[at..].to_owned(),
-            ..Run::default()
-        });
-    }
-    runs
+/// The event's call (a video entry point first), if it has `conferenceData` or a call URL in its
+/// description. Only links Exo would open count.
+fn conference(source: &ApiEvent, me: &str) -> Option<super::event::ResolvedConference> {
+    conference_of(source, me)
 }
 
 #[cfg(test)]
@@ -1550,12 +1344,16 @@ mod tests {
                 .to_zoned(tz.clone())
                 .expect("exists")
         };
+        let (start, end) = (at(start), at(end));
+        let span_row =
+            all_day || end.timestamp().duration_since(start.timestamp()).as_hours() >= 24;
         Event {
             key: String::new(),
             title: String::new(),
-            start: at(start),
-            end: at(end),
+            start,
+            end,
             all_day,
+            span_row,
             color: exo_ui::CalendarColor::BLUE,
             rsvp: None,
             busy: Rsvp::Accepted,
@@ -1604,6 +1402,12 @@ mod tests {
                 &now
             ),
             "Thu, Nov 26 \u{2004}–\u{2004}Fri, Nov 27 "
+        );
+        let twenty_six_hours = event("2026-12-09T09:00", "2026-12-10T11:00", false);
+        assert!(twenty_six_hours.in_all_day_row() && !twenty_six_hours.all_day);
+        assert_eq!(
+            when(&twenty_six_hours, false, &now),
+            "Wed, Dec 9 \u{2004}·\u{2004}9:00 AM\u{2004}–\u{2004}Thu, Dec 10 \u{2004}·\u{2004}11:00 AM"
         );
         assert_eq!(
             when(

@@ -2,9 +2,9 @@
 //! highlighted row filled, padded 11px, on the base background with 2px corners and two soft
 //! shadows. Measured on the event details' menu.
 
-use egui::{Color32, CornerRadius, Id, Order, Pos2, Rect, Sense, Ui, Vec2, pos2, vec2};
+use egui::{Color32, Id, Order, Pos2, Rect, Sense, Ui, Vec2, pos2, vec2};
 
-use crate::{BoxShadow, Family, Font, TextStyle, app_theme, pixel_snap};
+use crate::{AnchoredCard, Family, Font, TextStyle, app_theme, pixel_snap};
 
 /// A row's name: 13px in 28px lines, padded `4px 16px 0`, or 12px in a dialog's.
 const ITEM: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 13.0, 28.0);
@@ -25,22 +25,6 @@ const ADDRESS_PADDING: f32 = 18.0;
 const CELL_PADDING: f32 = 16.0;
 /// The list: `padding: 11px 0`, 2px corners.
 const LIST_PADDING: f32 = 11.0;
-const RADIUS: u8 = 2;
-/// `0 2px 12px 0 rgba(0,0,0,.05), 0 2px 4px 0 rgba(0,0,0,.1)`.
-const SHADOWS: [BoxShadow; 2] = [
-    BoxShadow::new(
-        [0.0, 2.0],
-        12.0,
-        0.0,
-        Color32::from_rgba_premultiplied(0, 0, 0, 13),
-    ),
-    BoxShadow::new(
-        [0.0, 2.0],
-        4.0,
-        0.0,
-        Color32::from_rgba_premultiplied(0, 0, 0, 26),
-    ),
-];
 
 /// How a list's rows are drawn: their height, their text's style and ink, and where it sits.
 #[derive(Clone, Copy)]
@@ -64,12 +48,24 @@ pub struct Menu<'a> {
 /// What the pointer did over a [`Menu`] this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MenuResponse {
-    /// The row under the pointer.
+    /// The row under a moving pointer.
     pub hovered: Option<usize>,
     /// The row clicked.
     pub clicked: Option<usize>,
+    /// Whether the pointer is over the menu's own popup layer (including its vertical padding).
+    pub contains_pointer: bool,
     /// Where the list is.
     pub rect: Rect,
+}
+
+impl MenuResponse {
+    /// Whether a pointer button was released outside both this menu and its trigger.
+    pub fn outside_released(&self, ui: &Ui, trigger_hovered: bool) -> bool {
+        self.clicked.is_none()
+            && !trigger_hovered
+            && !self.contains_pointer
+            && ui.input(|input| input.pointer.any_released())
+    }
 }
 
 impl Menu<'_> {
@@ -237,6 +233,7 @@ impl Menu<'_> {
         let mut response = MenuResponse {
             hovered: None,
             clicked: None,
+            contains_pointer: false,
             rect: list,
         };
         egui::Area::new(id)
@@ -245,16 +242,13 @@ impl Menu<'_> {
             .constrain(false)
             .show(&ctx, |area| {
                 let painter = area.painter().clone();
-                let snapped = pixel_snap(list);
-                for shadow in SHADOWS {
-                    shadow.paint(&painter, snapped, CornerRadius::same(RADIUS));
-                }
-                painter.rect_filled(
-                    snapped,
-                    CornerRadius::same(RADIUS),
-                    palette.background_base_default,
-                );
+                let _ = AnchoredCard::menu(palette.background_base_default, Color32::TRANSPARENT)
+                    .paint(&painter, list);
                 let _ = area.allocate_rect(list, Sense::click());
+                response.contains_pointer = area.rect_contains_pointer(list);
+                let moving = area.input(|input| {
+                    input.pointer.is_moving() || input.pointer.delta() != Vec2::ZERO
+                });
                 for (index, item) in self.items.iter().enumerate() {
                     let row = Rect::from_min_size(
                         pos2(
@@ -266,7 +260,7 @@ impl Menu<'_> {
                     let hit = area
                         .interact(row, id.with(index), Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if hit.hovered() {
+                    if hit.hovered() && moving {
                         response.hovered = Some(index);
                     }
                     if hit.clicked() {
@@ -288,24 +282,6 @@ impl Menu<'_> {
     }
 }
 
-/// A dialog's dropdown button. It draws `value` at 12px/16px with its line box's top left at
-/// `value_top_left`, black at `.7`, and the down caret 10px after it, 10px wide and black at `.5`,
-/// with the icon's 12×6.7 viewBox fitted to that width and 5.4px down the line. Returns the
-/// button, for the pointer.
-pub fn paint_dialog_dropdown(ui: &Ui, value_top_left: Pos2, value: &str) -> Rect {
-    let palette = crate::palette(ui.ctx());
-    paint_dialog_dropdown_with(
-        ui,
-        value_top_left,
-        value,
-        DialogDropdown {
-            value: palette.ink(0.7, 0.7),
-            caret: palette.ink(0.5, 0.5),
-            gap: 10.0,
-        },
-    )
-}
-
 /// A dialog's dropdown button's inks, and the gap before its caret, where a dialog's rules change
 /// them (the Reminders dialog's `rgba(0,0,0,.9)` value and `.3` caret, `margin-left: 4px`).
 #[derive(Clone, Copy, Debug)]
@@ -315,7 +291,9 @@ pub struct DialogDropdown {
     pub gap: f32,
 }
 
-/// [`paint_dialog_dropdown`] in `style`.
+/// A dialog's dropdown button in `style`. Draws `value` at 12px/16px with its line box's top left
+/// at `value_top_left`, and the down caret `style.gap` px after it, 10px wide (12×6.7 viewBox
+/// fitted to that width and 5.4px down the line). Returns the button rect for hit-testing.
 pub fn paint_dialog_dropdown_with(
     ui: &Ui,
     value_top_left: Pos2,
@@ -332,4 +310,110 @@ pub fn paint_dialog_dropdown_with(
         value_top_left - vec2(0.0, 2.0),
         vec2(width + style.gap + CARET.x, 20.0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Context, Event, RawInput};
+
+    use super::*;
+
+    #[test]
+    fn stationary_pointer_does_not_hover_and_padding_contains_pointer_across_layers() {
+        let ctx = Context::default();
+        crate::install(&ctx).expect("system fonts");
+        let items = ["First", "Second"];
+        let menu = Menu {
+            items: &items,
+            highlighted: 1,
+        };
+        let list_id = Id::new("test-menu");
+        let top_left = pos2(40.0, 40.0);
+
+        let run = |events: Vec<Event>| -> (MenuResponse, bool) {
+            let mut out = None;
+            let mut outside = false;
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    // Draw from a Foreground area (as dialogs do) so the caller's layer differs
+                    // from Menu's Order::Tooltip layer.
+                    egui::Area::new(Id::new("dialog-host"))
+                        .order(Order::Foreground)
+                        .fixed_pos(pos2(0.0, 0.0))
+                        .show(ui.ctx(), |dialog_ui| {
+                            let resp = menu.show_in_dialog(dialog_ui, list_id, top_left);
+                            outside = resp.outside_released(dialog_ui, false);
+                            out = Some(resp);
+                        });
+                },
+            )
+            .drop_without_applying_deltas();
+            (out.expect("menu ran"), outside)
+        };
+
+        // Prime Area geometry past its sizing pass and establish an initial pointer position.
+        let (initial, _) = run(vec![Event::PointerMoved(pos2(0.0, 0.0))]);
+        let _ = run(vec![Event::PointerMoved(pos2(0.0, 0.0))]);
+        let row0 = pos2(
+            initial.rect.center().x,
+            initial.rect.top() + LIST_PADDING + 10.0,
+        );
+        let padding = pos2(initial.rect.center().x, initial.rect.top() + 4.0);
+        let outside_pt = pos2(initial.rect.right() + 30.0, initial.rect.bottom() + 30.0);
+
+        // Moving onto row 0 reports hover.
+        let (moved, _) = run(vec![Event::PointerMoved(row0)]);
+        assert_eq!(moved.hovered, Some(0));
+        assert!(moved.contains_pointer);
+
+        // Stationary pointer on row 0 after velocity settles does NOT report hover.
+        let mut still = moved;
+        for _ in 0..8 {
+            still = run(vec![]).0;
+        }
+        assert_eq!(still.hovered, None);
+        assert!(still.contains_pointer);
+
+        // Pressing and releasing inside the 11px top padding stays inside Menu's own layer.
+        let _ = run(vec![
+            Event::PointerMoved(padding),
+            Event::PointerButton {
+                pos: padding,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (in_padding, pad_outside) = run(vec![Event::PointerButton {
+            pos: padding,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(in_padding.contains_pointer);
+        assert!(!pad_outside, "release in padding is not an outside release");
+
+        // Releasing outside Menu reports outside_released.
+        let _ = run(vec![
+            Event::PointerMoved(outside_pt),
+            Event::PointerButton {
+                pos: outside_pt,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (away, away_outside) = run(vec![Event::PointerButton {
+            pos: outside_pt,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(!away.contains_pointer);
+        assert!(away_outside, "release outside menu closes it");
+    }
 }

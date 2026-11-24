@@ -1,7 +1,7 @@
 //! Renders one message of a Gmail thread to a PNG, the way Exo would show its body.
 //!
 //! ```sh
-//! cargo run -p gmail-mock -- --port 8791 &
+//! cargo run -p mock-servers -- --port 8791 &
 //! cargo run --release -p exo-mail --example render_message -- \
 //!     --mock http://127.0.0.1:8791 --thread 1a1e9b426200015e --out body.png
 //! ```
@@ -22,14 +22,13 @@ use std::{
 
 use clap::Parser;
 use exo_mail::{
-    BodyView, Done, Fetch, Fonts, Message, Region, Render, Theme, ViewOptions, html_from_payload,
-    render,
+    BodyView, Done, Fetch, Fonts, Message, Region, Render, Theme, ViewOptions, render, text_to_html,
 };
 use gmail::{Client, Endpoints, Format, MessagePart, StaticToken};
 
 #[derive(Parser)]
 struct Args {
-    /// gmail-mock (or any Gmail API) origin.
+    /// mock-servers (or any Gmail API) origin.
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     mock: url::Url,
     /// Access token.
@@ -279,4 +278,128 @@ fn attachments(part: &MessagePart) -> Vec<(String, Option<String>, Option<String
         found.extend(attachments(child));
     }
     found
+}
+
+/// The HTML shown for a Gmail message payload: an alternative's richest part, or each inline
+/// part of a mixed message.
+fn html_from_payload(part: &MessagePart) -> String {
+    html_from_part(part).unwrap_or_default()
+}
+
+fn html_from_part(part: &MessagePart) -> Option<String> {
+    let mime = part
+        .mime_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let data = || {
+        part.body
+            .as_ref()
+            .and_then(|body| body.data.as_ref())
+            .map(|data| String::from_utf8_lossy(data).into_owned())
+    };
+    let is_text = |p: &MessagePart| matches!(p.mime_type.as_deref(), Some("text/plain" | "text"));
+    match mime.as_str() {
+        "text/plain" | "text" => data().map(|text| text_to_html(&text)),
+        "text/html" => data(),
+        "multipart/alternative" => {
+            if is_attachment(part) {
+                return None;
+            }
+            let parts = &part.parts;
+            parts
+                .iter()
+                .rev()
+                .filter(|p| !is_text(p))
+                .find_map(|p| html_from_part(p).filter(|html| !html.is_empty()))
+                .or_else(|| {
+                    parts.iter().filter(|p| is_text(p)).find_map(|p| {
+                        let data = p.body.as_ref()?.data.as_ref()?;
+                        let text = String::from_utf8_lossy(data);
+                        text.trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with("<!doctype html")
+                            .then(|| text.into_owned())
+                    })
+                })
+                .or_else(|| {
+                    parts
+                        .iter()
+                        .rev()
+                        .filter(|p| is_text(p))
+                        .find_map(|p| html_from_part(p).filter(|h| !h.is_empty()))
+                })
+        }
+        "multipart/mixed" => Some(
+            part.parts
+                .iter()
+                .map(|p| {
+                    if is_attachment(p) {
+                        String::new()
+                    } else {
+                        html_from_part(p).unwrap_or_default()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => {
+            let nested = mime.starts_with("multipart/") || mime.starts_with("message/rfc822");
+            if !nested {
+                return None;
+            }
+            part.parts
+                .iter()
+                .filter(|p| !is_attachment(p))
+                .filter(|p| {
+                    let mime = p.mime_type.as_deref().unwrap_or_default();
+                    mime.starts_with("multipart/") || mime == "text/html" || is_text(p)
+                })
+                .find_map(|p| html_from_part(p).filter(|h| !h.is_empty()))
+        }
+    }
+}
+
+/// `Content-Disposition: attachment`, except Outlook's TNEF wrappers.
+fn is_attachment(part: &MessagePart) -> bool {
+    let header = |name: &str| {
+        part.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.to_ascii_lowercase())
+    };
+    header("content-disposition").is_some_and(|value| value.contains("attachment"))
+        && !header("content-type").is_some_and(|value| value.contains("application/ms-tnef"))
+}
+
+#[cfg(test)]
+mod tests {
+    use gmail::MessagePartBody;
+
+    use super::*;
+
+    #[test]
+    fn picks_the_html_alternative() {
+        let part = |mime: &str, data: &str| MessagePart {
+            mime_type: Some(mime.into()),
+            body: Some(MessagePartBody {
+                data: Some(data.as_bytes().to_vec()),
+                ..MessagePartBody::default()
+            }),
+            ..MessagePart::default()
+        };
+        let payload = MessagePart {
+            mime_type: Some("multipart/alternative".into()),
+            parts: vec![
+                part("text/plain", "plain"),
+                part("text/html", "<b>rich</b>"),
+            ],
+            ..MessagePart::default()
+        };
+        assert_eq!(html_from_payload(&payload), "<b>rich</b>");
+        assert_eq!(
+            html_from_payload(&part("text/plain", "a <b>")),
+            "<p>a &lt;b&gt;</p>"
+        );
+    }
 }

@@ -24,12 +24,16 @@
 
 mod copy;
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
+use std::cell::RefCell;
+use std::io::{self, Read};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use fastframe_update::{
-    MacConfig, MacTarget, Prepared, Release, ReqwestTransport, UpdateConfig, Updater,
+    MacConfig, MacTarget, Prepared, Release, Request as HttpRequest, Response as HttpResponse,
+    Transport, UpdateConfig, Updater,
 };
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub use copy::{ALERT_TITLE, Alert, Connection, Dialog, INSTALL_AND_RESTART, NOT_NOW};
 
@@ -169,10 +173,200 @@ pub trait Shell: Send + Sync + 'static {
     fn changed(&self);
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+std::thread_local! {
+    static STEP_CANCEL: RefCell<Option<watch::Receiver<bool>>> = const { RefCell::new(None) };
+}
+
+struct StepCancelGuard;
+
+impl Drop for StepCancelGuard {
+    fn drop(&mut self) {
+        STEP_CANCEL.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+fn enter_step_cancel(cancel: watch::Receiver<bool>) -> StepCancelGuard {
+    STEP_CANCEL.with(|cell| {
+        *cell.borrow_mut() = Some(cancel);
+    });
+    StepCancelGuard
+}
+
+async fn wait_cancelled(cancel: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = cancel.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Async `reqwest` transport for [`Updater`] running on Exo's shared Tokio runtime without
+/// `reqwest::blocking`, cancelling in-flight HTTP requests when a step's deadline expires.
+struct AsyncTransport {
+    client: reqwest::Client,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AsyncTransport {
+    fn new(runtime: tokio::runtime::Handle) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?;
+        Ok(Self { client, runtime })
+    }
+}
+
+struct AsyncBody {
+    chunks: mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for AsyncBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.offset >= self.current.len() {
+            match self.chunks.blocking_recv() {
+                Some(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok(0),
+            }
+        }
+        let available = &self.current[self.offset..];
+        let count = available.len().min(buf.len());
+        buf[..count].copy_from_slice(&available[..count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+struct StartedResponse {
+    status: u16,
+    location: Option<String>,
+    chunks: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+impl Transport for AsyncTransport {
+    fn get(&self, request: &HttpRequest<'_>) -> anyhow::Result<HttpResponse> {
+        let mut cancel = STEP_CANCEL.with(|cell| cell.borrow().clone());
+        if cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "update step timed out").into());
+        }
+        let builder = self
+            .client
+            .get(request.url)
+            .header(reqwest::header::ACCEPT, request.accept)
+            .header(reqwest::header::USER_AGENT, request.user_agent);
+        let (head_tx, head_rx) = oneshot::channel::<anyhow::Result<StartedResponse>>();
+        self.runtime.spawn(async move {
+            let response = tokio::select! {
+                biased;
+                () = wait_cancelled(&mut cancel) => {
+                    let _ = head_tx.send(Err(
+                        io::Error::new(io::ErrorKind::TimedOut, "update step timed out").into(),
+                    ));
+                    return;
+                }
+                result = builder.send() => match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = head_tx.send(Err(error.into()));
+                        return;
+                    }
+                },
+            };
+            let status = response.status().as_u16();
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let (chunk_tx, chunk_rx) = mpsc::channel(8);
+            if head_tx
+                .send(Ok(StartedResponse {
+                    status,
+                    location,
+                    chunks: chunk_rx,
+                }))
+                .is_err()
+            {
+                return;
+            }
+            let mut response = response;
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = wait_cancelled(&mut cancel) => {
+                        let _ = chunk_tx
+                            .send(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "update step timed out",
+                            )))
+                            .await;
+                        return;
+                    }
+                    chunk = response.chunk() => chunk,
+                };
+                match next {
+                    Ok(Some(bytes)) => {
+                        if chunk_tx.send(Ok(bytes.to_vec())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = chunk_tx.send(Err(io::Error::other(error))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        let StartedResponse {
+            status,
+            location,
+            chunks,
+        } = head_rx
+            .blocking_recv()
+            .map_err(|_| anyhow::anyhow!("update HTTP task stopped"))??;
+        Ok(HttpResponse {
+            status,
+            location,
+            body: Box::new(AsyncBody {
+                chunks,
+                current: Vec::new(),
+                offset: 0,
+            }),
+        })
+    }
+}
+
 /// The updater for this copy of Exo, when it can replace itself. That's Exo.app signed by a team,
 /// not run from its disk image or from a copy macOS made of a download.
 pub fn updater() -> Option<Updater> {
-    let transport = ReqwestTransport::new(reqwest::blocking::Client::builder())
+    let runtime = crate::account::shared_runtime()
+        .inspect_err(|error| log::warn!("the updater's runtime: {error}"))
+        .ok()?;
+    let transport = AsyncTransport::new(runtime.handle().clone())
         .inspect_err(|error| log::warn!("the updater's HTTP client: {error}"))
         .ok()?;
     let updater = Updater::new(CONFIG, transport);
@@ -243,7 +437,7 @@ pub struct Updates(Arc<Shared>);
 struct Shared {
     state: Mutex<State>,
     /// Wakes the worker for what's asked of it.
-    wake: Condvar,
+    wake: Notify,
     releases: Arc<dyn Releases>,
     shell: Arc<dyn Shell>,
     timing: Timing,
@@ -365,17 +559,19 @@ impl Updates {
     fn spawn(releases: impl Releases, shell: impl Shell, timing: Timing) -> Self {
         let updates = Self(Arc::new(Shared {
             state: Mutex::new(State::default()),
-            wake: Condvar::new(),
+            wake: Notify::new(),
             releases: Arc::new(releases),
             shell: Arc::new(shell),
             timing,
         }));
-        let worker = updates.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("exo-updates".to_owned())
-            .spawn(move || worker.run())
-        {
-            log::error!("starting the updater: {error}");
+        match crate::account::shared_runtime() {
+            Ok(runtime) => {
+                let worker = updates.clone();
+                runtime.spawn(async move {
+                    worker.run().await;
+                });
+            }
+            Err(error) => log::error!("starting the updater: {error}"),
         }
         updates
     }
@@ -414,7 +610,7 @@ impl Updates {
                 (Mode::Background, _) => {}
             }
         }
-        self.0.wake.notify_all();
+        self.0.wake.notify_waiters();
         self.0.shell.changed();
     }
 
@@ -438,7 +634,7 @@ impl Updates {
     /// Installs the update that's ready, once a check under way is over.
     pub fn install(&self) {
         self.lock().install = true;
-        self.0.wake.notify_all();
+        self.0.wake.notify_waiters();
     }
 
     /// Closes the alert. A check it showed goes on as one nobody asked for.
@@ -459,13 +655,13 @@ impl Updates {
     /// `Failed to update` says so.
     pub fn restored(&self) {
         let shell = Arc::clone(&self.0.shell);
-        if let Err(error) = std::thread::Builder::new()
-            .name("exo-update-restored".to_owned())
-            .spawn(move || {
-                shell.ask(&Dialog::Failed(None));
-            })
-        {
-            log::warn!("saying the update didn't install: {error}");
+        match crate::account::shared_runtime() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || {
+                    shell.ask(&Dialog::Failed(None));
+                });
+            }
+            Err(error) => log::warn!("saying the update didn't install: {error}"),
         }
     }
 
@@ -473,54 +669,63 @@ impl Updates {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    async fn ask(&self, dialog: Dialog) -> Option<usize> {
+        let shell = Arc::clone(&self.0.shell);
+        tokio::task::spawn_blocking(move || shell.ask(&dialog))
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// The worker. It checks now, then on each check asked for and 15 minutes after the last
     /// ended, and installs when asked.
-    fn run(self) {
+    async fn run(self) {
         let mut due = Instant::now();
         loop {
-            match self.next(due) {
+            match self.next(due).await {
                 Job::Check(mode) => {
-                    self.cycle(mode);
+                    self.cycle(mode).await;
                     due = Instant::now() + self.0.timing.between;
                 }
-                Job::Install => self.install_now(),
+                Job::Install => self.install_now().await,
             }
         }
     }
 
     /// Waits for what's asked, or for the check due.
-    fn next(&self, due: Instant) -> Job {
-        let mut state = self.lock();
+    async fn next(&self, due: Instant) -> Job {
         loop {
-            if std::mem::take(&mut state.install) {
-                return Job::Install;
-            }
-            if let Some(mode) = state.asked.take() {
-                return Job::Check(mode);
-            }
-            let now = Instant::now();
-            if now >= due {
-                return Job::Check(Mode::Background);
-            }
-            state = self
-                .0
-                .wake
-                .wait_timeout(state, due - now)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            let notified = self.0.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let wait = {
+                let mut state = self.lock();
+                if std::mem::take(&mut state.install) {
+                    return Job::Install;
+                }
+                if let Some(mode) = state.asked.take() {
+                    return Job::Check(mode);
+                }
+                let now = Instant::now();
+                if now >= due {
+                    return Job::Check(Mode::Background);
+                }
+                due - now
+            };
+            let _ = tokio::time::timeout(wait, notified).await;
         }
     }
 
     /// A check, shown as `mode` says to start with, and what follows from it.
-    fn cycle(&self, mode: Mode) {
+    async fn cycle(&self, mode: Mode) {
         {
             let mut state = self.lock();
             state.busy = true;
             state.mode = mode;
             state.percent = 0;
         }
-        if let Err(failure) = self.check_and_download() {
-            self.failed(failure);
+        if let Err(failure) = self.check_and_download().await {
+            self.failed(failure).await;
         }
         {
             let mut state = self.lock();
@@ -530,13 +735,15 @@ impl Updates {
         self.0.shell.changed();
     }
 
-    fn check_and_download(&self) -> Result<(), Failure> {
+    async fn check_and_download(&self) -> Result<(), Failure> {
         let releases = Arc::clone(&self.0.releases);
-        let Some(release) = self.step(Stage::Checking, self.0.timing.step, move |_| {
-            releases.check()
-        })?
+        let Some(release) = self
+            .step(Stage::Checking, self.0.timing.step, move |_| {
+                releases.check()
+            })
+            .await?
         else {
-            self.up_to_date();
+            self.up_to_date().await;
             return Ok(());
         };
         let downloaded = self
@@ -546,16 +753,12 @@ impl Updates {
             .map(|prepared| prepared.version().to_owned());
         if downloaded.is_some_and(|version| !fastframe_update::is_newer(&release.version, &version))
         {
-            self.ready(false);
+            self.ready(false).await;
             return Ok(());
         }
         let mode = self.lock().mode;
         if mode == Mode::Dialogs
-            && self
-                .0
-                .shell
-                .ask(&Dialog::Available(release.version.clone()))
-                != Some(0)
+            && self.ask(Dialog::Available(release.version.clone())).await != Some(0)
         {
             let mut state = self.lock();
             state.stage = state.settled();
@@ -569,18 +772,20 @@ impl Updates {
         }
         self.0.shell.changed();
         let releases = Arc::clone(&self.0.releases);
-        let prepared = self.step(
-            Stage::Downloading,
-            self.0.timing.download,
-            move |progress| releases.download(&release, progress),
-        )?;
+        let prepared = self
+            .step(
+                Stage::Downloading,
+                self.0.timing.download,
+                move |progress| releases.download(&release, progress),
+            )
+            .await?;
         self.lock().downloaded = Some(prepared);
-        self.ready(true);
+        self.ready(true).await;
         Ok(())
     }
 
     /// Nothing is newer, and the alert or the dialog says so.
-    fn up_to_date(&self) {
+    async fn up_to_date(&self) {
         let mode = {
             let mut state = self.lock();
             state.stage = state.settled();
@@ -591,13 +796,13 @@ impl Updates {
         };
         self.0.shell.changed();
         if mode == Mode::Dialogs {
-            self.0.shell.ask(&Dialog::UpToDate);
+            self.ask(Dialog::UpToDate).await;
         }
     }
 
     /// The update is downloaded (`fresh`ly, or by an earlier check). A notification says so,
     /// Exo restarts into it, or a dialog asks.
-    fn ready(&self, fresh: bool) {
+    async fn ready(&self, fresh: bool) {
         let (mode, version) = {
             let mut state = self.lock();
             state.stage = Stage::Downloaded;
@@ -611,17 +816,17 @@ impl Updates {
         match mode {
             Mode::Background if fresh => self.0.shell.ready(&version),
             Mode::Background => {}
-            Mode::Alerts => self.install_now(),
+            Mode::Alerts => self.install_now().await,
             Mode::Dialogs => {
-                if self.0.shell.ask(&Dialog::Ready(version)) == Some(0) {
-                    self.install_now();
+                if self.ask(Dialog::Ready(version)).await == Some(0) {
+                    self.install_now().await;
                 }
             }
         }
     }
 
     /// Hands the update that's ready to the helper and quits.
-    fn install_now(&self) {
+    async fn install_now(&self) {
         let prepared = {
             let mut state = self.lock();
             if state.stage != Stage::Downloaded {
@@ -633,22 +838,24 @@ impl Updates {
             prepared
         };
         let releases = Arc::clone(&self.0.releases);
-        let installed = self.step(Stage::Restarting, self.0.timing.step, move |_| {
-            releases.install(prepared, vec![UPDATED.to_owned()])
-        });
+        let installed = self
+            .step(Stage::Restarting, self.0.timing.step, move |_| {
+                releases.install(prepared, vec![UPDATED.to_owned()])
+            })
+            .await;
         match installed {
             Ok(()) => {
                 self.0.shell.quit();
                 // Exo quits now. If it's still running past the deadline, it didn't.
-                std::thread::sleep(self.0.timing.step);
-                self.failed(Failure::TimedOut(Stage::Restarting));
+                tokio::time::sleep(self.0.timing.step).await;
+                self.failed(Failure::TimedOut(Stage::Restarting)).await;
             }
-            Err(failure) => self.failed(failure),
+            Err(failure) => self.failed(failure).await,
         }
     }
 
     /// A step failed, and the alert or the dialog says so.
-    fn failed(&self, failure: Failure) {
+    async fn failed(&self, failure: Failure) {
         log::warn!("updating Exo: {failure}");
         let connection = failure.connection();
         let mode = {
@@ -665,13 +872,13 @@ impl Updates {
         };
         self.0.shell.changed();
         if mode == Mode::Dialogs {
-            self.0.shell.ask(&Dialog::Failed(connection));
+            self.ask(Dialog::Failed(connection)).await;
         }
     }
 
-    /// Runs `work` in `stage` on a thread of its own, within `limit` of the start or of the last
-    /// progress it told.
-    fn step<T: Send + 'static>(
+    /// Runs `work` in `stage` on the blocking pool, within `limit` of the start or of the last
+    /// progress it told, cancelling any in-flight HTTP step on timeout.
+    async fn step<T: Send + 'static>(
         &self,
         stage: Stage,
         limit: Duration,
@@ -679,29 +886,30 @@ impl Updates {
     ) -> Result<T, Failure> {
         self.lock().stage = stage;
         self.0.shell.changed();
-        let (sender, receiver) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let progress = sender.clone();
-        std::thread::Builder::new()
-            .name("exo-update-step".to_owned())
-            .spawn(move || {
-                let result = work(&mut |received, total| {
-                    let _ = progress.send(Step::Progress(received, total));
-                });
-                let _ = sender.send(Step::Done(result));
-            })
-            .map_err(|error| Failure::Error(error.into()))?;
+        tokio::task::spawn_blocking(move || {
+            let _guard = enter_step_cancel(cancel_rx);
+            let result = work(&mut |received, total| {
+                let _ = progress.send(Step::Progress(received, total));
+            });
+            let _ = sender.send(Step::Done(result));
+        });
         let mut deadline = Instant::now() + limit;
         loop {
-            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Step::Progress(received, total)) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Some(Step::Progress(received, total))) => {
                     deadline = Instant::now() + limit;
                     self.progress(received, total);
                 }
-                Ok(Step::Done(result)) => return result.map_err(Failure::Error),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                Ok(Some(Step::Done(result))) => return result.map_err(Failure::Error),
+                Ok(None) => return Err(Failure::Stopped),
+                Err(_) => {
+                    let _ = cancel_tx.send(true);
                     return Err(Failure::TimedOut(self.stage()));
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Failure::Stopped),
             }
         }
     }

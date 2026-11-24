@@ -6,7 +6,7 @@ use std::sync::Arc;
 use jiff::Zoned;
 
 /// Where Exo reads the time. The app reads the system's clock. Tests and screenshots set the time,
-/// since gmail-mock's mail is dated relative to the mock's clock (`Config::now`).
+/// since mock-servers' mail is dated relative to the mock's clock (`Config::now`).
 #[derive(Clone)]
 pub struct Clock(Arc<dyn Fn() -> Zoned + Send + Sync>);
 

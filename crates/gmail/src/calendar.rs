@@ -168,6 +168,10 @@ pub struct Event {
     /// Attendees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attendees: Vec<EventAttendee>,
+    /// Sends `"attendees": []` on [`Calendar::patch_event`] when [`Self::attendees`] is empty,
+    /// clearing the event's guests without emitting an unknown property on the wire.
+    #[serde(default, skip)]
+    pub clear_attendees: bool,
     /// Whether attendees were left out of this representation.
     pub attendees_omitted: Option<bool>,
     /// Private and shared extended properties.
@@ -530,6 +534,7 @@ impl<'a> Calendar<'a> {
         event: &Event,
         send_updates: Option<&str>,
     ) -> Call<'a, Event> {
+        let body = patch_event_body(event);
         self.call(
             Method::PATCH,
             &["calendars", calendar_id, "events", event_id],
@@ -539,7 +544,7 @@ impl<'a> Calendar<'a> {
             "conferenceDataVersion",
             event.conference_data.is_some().then_some(1),
         )
-        .json(event)
+        .json(&body)
     }
 
     /// `events.delete`.
@@ -575,5 +580,41 @@ impl<'a> Calendar<'a> {
     /// `freebusy.query`.
     pub fn free_busy(&self, request: &FreeBusyRequest) -> Call<'a, FreeBusyResponse> {
         self.call(Method::POST, &["freeBusy"]).json(request)
+    }
+}
+
+/// Serializes `event` for `events.patch`, including `"attendees": []` when `clear_attendees` asks
+/// to remove all guests.
+fn patch_event_body(event: &Event) -> serde_json::Value {
+    let mut body = serde_json::to_value(event).expect("API request types always serialize");
+    if event.clear_attendees
+        && event.attendees.is_empty()
+        && let serde_json::Value::Object(fields) = &mut body
+    {
+        fields.insert("attendees".to_owned(), serde_json::Value::Array(Vec::new()));
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_attendees_is_never_on_the_wire_and_sends_an_empty_array_on_patch() {
+        let cleared = Event {
+            clear_attendees: true,
+            ..Event::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&cleared).expect("serializes"),
+            serde_json::json!({}),
+            "insert/import bodies never emit clearAttendees"
+        );
+        assert_eq!(
+            patch_event_body(&cleared),
+            serde_json::json!({ "attendees": [] })
+        );
+        assert_eq!(patch_event_body(&Event::default()), serde_json::json!({}));
     }
 }

@@ -1,4 +1,4 @@
-//! The calendar cache against gmail-mock. It covers the calendar list, a window of events, a
+//! The calendar cache against mock-servers. It covers the calendar list, a window of events, a
 //! window fetched again after the calendar changed, and the changes queued for Calendar, which
 //! are shown at once, held, taken back, sent, postponed offline and across a restart, and given
 //! up when refused.
@@ -394,6 +394,7 @@ async fn events_are_created_changed_and_deleted_through_the_queue() {
         calendar: ACCOUNT.into(),
         id: "e0lunch0001".into(),
         patch,
+        clear_attendees: false,
         notify: false,
         shift: None,
         shown: vec![long],
@@ -577,6 +578,7 @@ async fn undoing_a_new_event_takes_back_its_edits_too() {
             summary: renamed.summary.clone(),
             ..Event::default()
         },
+        clear_attendees: false,
         notify: false,
         shift: None,
         shown: vec![renamed],
@@ -990,12 +992,12 @@ async fn an_answer_only_the_organizer_may_give_is_refused_as_such() {
     );
 }
 
-/// Another Google account of the user's, signed in for its calendars (gmail-mock gives it a
+/// Another Google account of the user's, signed in for its calendars (mock-servers gives it a
 /// primary calendar of its own and the holidays calendar).
 const PERSONAL: &str = "maya.lin@example.com";
 
 fn personal_tokens() -> gmail::StaticToken {
-    gmail::StaticToken(format!("{}:{PERSONAL}", gmail_mock::DEV_ACCESS_TOKEN))
+    gmail::StaticToken(format!("{}:{PERSONAL}", mock_servers::DEV_ACCESS_TOKEN))
 }
 
 #[tokio::test]
@@ -1218,4 +1220,391 @@ async fn a_calendar_account_lists_beside_the_mail_account_and_its_calendars_go_t
         .await
         .expect("reads");
     assert!(friday.is_empty(), "and its calendar's events");
+}
+
+#[tokio::test]
+async fn clearing_all_guests_sends_an_empty_attendee_list_and_drops_them_on_split() {
+    let harness = Harness::start().await;
+    let guest = gmail::calendar::EventAttendee {
+        email: Some("priya@brightmoor.co".into()),
+        response_status: Some("accepted".into()),
+        ..gmail::calendar::EventAttendee::default()
+    };
+    let review = Event {
+        id: Some("e0guestclear1".into()),
+        summary: Some("Review".into()),
+        start: Some(friday_at(9)),
+        end: Some(friday_at(10)),
+        attendees: vec![guest.clone()],
+        ..Event::default()
+    };
+    harness
+        .store
+        .queue_calendar_change(
+            1,
+            CalendarChange::Create {
+                calendar: ACCOUNT.into(),
+                event: review.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("queues");
+    assert_eq!(flush(&harness).await, [CalendarOutcome::Sent]);
+    assert_eq!(
+        harness
+            .gmail
+            .calendar()
+            .event(ACCOUNT, "e0guestclear1")
+            .await
+            .expect("events.get")
+            .attendees
+            .len(),
+        1
+    );
+
+    let cleared = Event {
+        attendees: Vec::new(),
+        ..review
+    };
+    harness
+        .store
+        .queue_calendar_change(
+            2,
+            CalendarChange::Edit {
+                calendar: ACCOUNT.into(),
+                id: "e0guestclear1".into(),
+                patch: Event::default(),
+                clear_attendees: true,
+                notify: false,
+                shift: None,
+                shown: vec![cleared],
+            },
+            None,
+        )
+        .await
+        .expect("queues");
+    assert_eq!(flush(&harness).await, [CalendarOutcome::Sent]);
+    assert!(
+        harness
+            .gmail
+            .calendar()
+            .event(ACCOUNT, "e0guestclear1")
+            .await
+            .expect("events.get")
+            .attendees
+            .is_empty(),
+        "empty attendees array clears guests on Google Calendar"
+    );
+
+    // Removing all guests on a series split leaves the remainder without attendees.
+    let series = Event {
+        id: Some("e0guestseries1".into()),
+        summary: Some("Weekly sync".into()),
+        start: Some(EventDateTime {
+            date_time: Some("2026-11-10T10:00:00-05:00".into()),
+            time_zone: Some("America/New_York".into()),
+            ..EventDateTime::default()
+        }),
+        end: Some(EventDateTime {
+            date_time: Some("2026-11-10T10:30:00-05:00".into()),
+            time_zone: Some("America/New_York".into()),
+            ..EventDateTime::default()
+        }),
+        recurrence: vec!["RRULE:FREQ=WEEKLY;COUNT=4;BYDAY=TU".into()],
+        attendees: vec![guest],
+        ..Event::default()
+    };
+    harness
+        .gmail
+        .calendar()
+        .insert_event(ACCOUNT, &series, None)
+        .await
+        .expect("inserts series");
+    let cut_start = EventDateTime {
+        date_time: Some("2026-11-17T10:00:00-05:00".into()),
+        time_zone: Some("America/New_York".into()),
+        ..EventDateTime::default()
+    };
+    let cut_end = EventDateTime {
+        date_time: Some("2026-11-17T10:30:00-05:00".into()),
+        time_zone: Some("America/New_York".into()),
+        ..EventDateTime::default()
+    };
+    harness
+        .store
+        .queue_calendar_change(
+            3,
+            CalendarChange::Split {
+                calendar: ACCOUNT.into(),
+                series: "e0guestseries1".into(),
+                from: exo_store::Cut::At("2026-11-17T15:00:00Z".parse().expect("time")),
+                patch: Event {
+                    id: Some("e0guestseries2".into()),
+                    ..Event::default()
+                },
+                clear_attendees: true,
+                start: cut_start,
+                end: cut_end,
+                notify: false,
+                shown: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("queues split");
+    assert_eq!(flush(&harness).await, [CalendarOutcome::Sent]);
+    assert!(
+        harness
+            .gmail
+            .calendar()
+            .event(ACCOUNT, "e0guestseries2")
+            .await
+            .expect("events.get")
+            .attendees
+            .is_empty(),
+        "split remainder drops cleared attendees"
+    );
+}
+
+#[tokio::test]
+async fn retrying_a_split_after_partial_failure_keeps_the_original_recurrence() {
+    let harness = Harness::start().await;
+    let series = Event {
+        id: Some("e0splitmaster1".into()),
+        summary: Some("Standup".into()),
+        start: Some(EventDateTime {
+            date_time: Some("2026-11-10T10:00:00-05:00".into()),
+            time_zone: Some("America/New_York".into()),
+            ..EventDateTime::default()
+        }),
+        end: Some(EventDateTime {
+            date_time: Some("2026-11-10T10:30:00-05:00".into()),
+            time_zone: Some("America/New_York".into()),
+            ..EventDateTime::default()
+        }),
+        recurrence: vec!["RRULE:FREQ=WEEKLY;COUNT=6;BYDAY=TU".into()],
+        ..Event::default()
+    };
+    harness
+        .gmail
+        .calendar()
+        .insert_event(ACCOUNT, &series, None)
+        .await
+        .expect("inserts series");
+
+    // Simulate a partial failure where `PATCH` on the master commits on the server (`after: true`)
+    // and then fails all 3 HTTP attempts so the outbox postpones and retries later.
+    for _ in 0..3 {
+        harness
+            .fault(serde_json::json!({
+                "method": "PATCH",
+                "path": "/calendar/v3/calendars/",
+                "status": 503,
+                "after": true
+            }))
+            .await;
+    }
+
+    harness
+        .store
+        .queue_calendar_change(
+            1,
+            CalendarChange::Split {
+                calendar: ACCOUNT.into(),
+                series: "e0splitmaster1".into(),
+                from: exo_store::Cut::At("2026-11-17T15:00:00Z".parse().expect("time")),
+                patch: Event {
+                    id: Some("e0splitrem001".into()),
+                    summary: Some("Standup (moved)".into()),
+                    ..Event::default()
+                },
+                clear_attendees: false,
+                start: EventDateTime {
+                    date_time: Some("2026-11-17T11:00:00-05:00".into()),
+                    time_zone: Some("America/New_York".into()),
+                    ..EventDateTime::default()
+                },
+                end: EventDateTime {
+                    date_time: Some("2026-11-17T11:30:00-05:00".into()),
+                    time_zone: Some("America/New_York".into()),
+                    ..EventDateTime::default()
+                },
+                notify: false,
+                shown: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("queues split");
+
+    let (due, _) = harness
+        .store
+        .due_calendar_changes(true)
+        .await
+        .expect("reads");
+    assert_eq!(
+        harness
+            .store
+            .send_calendar_change(&due[0])
+            .await
+            .expect("first attempt"),
+        CalendarOutcome::Postponed
+    );
+
+    // Now retry: master already has `UNTIL=20261117T145959Z` on the server, and remainder must NOT
+    // inherit that truncated `UNTIL`.
+    let (due, _) = harness
+        .store
+        .due_calendar_changes(true)
+        .await
+        .expect("reads");
+    assert_eq!(
+        harness
+            .store
+            .send_calendar_change(&due[0])
+            .await
+            .expect("retry"),
+        CalendarOutcome::Sent
+    );
+
+    let master_after = harness
+        .gmail
+        .calendar()
+        .event(ACCOUNT, "e0splitmaster1")
+        .await
+        .expect("master");
+    let rem_after = harness
+        .gmail
+        .calendar()
+        .event(ACCOUNT, "e0splitrem001")
+        .await
+        .expect("remainder");
+    assert_eq!(
+        master_after.recurrence,
+        ["RRULE:FREQ=WEEKLY;BYDAY=TU;UNTIL=20261117T145959Z"]
+    );
+    assert_eq!(
+        rem_after.recurrence,
+        ["RRULE:FREQ=WEEKLY;BYDAY=TU;WKST=SU;COUNT=5"],
+        "remainder keeps the 5 remaining instances rather than the truncated UNTIL"
+    );
+}
+
+#[tokio::test]
+async fn deleting_or_undoing_an_in_flight_create_waits_and_compensates() {
+    let config = mock_servers::Config {
+        latency: std::time::Duration::from_millis(80),
+        ..mock_servers::Config::default()
+    };
+    let harness = Harness::start_with(config, support::options()).await;
+
+    // 1. Undoing a `Create` while `send_calendar_change` is in flight queues a compensating Delete.
+    let first = Event {
+        id: Some("e0inflight001".into()),
+        summary: Some("Phantom A".into()),
+        start: Some(friday_at(9)),
+        end: Some(friday_at(10)),
+        ..Event::default()
+    };
+    harness
+        .store
+        .queue_calendar_change(
+            10,
+            CalendarChange::Create {
+                calendar: ACCOUNT.into(),
+                event: first,
+            },
+            None,
+        )
+        .await
+        .expect("queues");
+    let (due, _) = harness
+        .store
+        .due_calendar_changes(true)
+        .await
+        .expect("reads");
+    let sending = {
+        let store = harness.store.clone();
+        let item = due[0].clone();
+        tokio::spawn(async move { store.send_calendar_change(&item).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        harness
+            .store
+            .unqueue_calendar_change(10)
+            .await
+            .expect("undoes in-flight create")
+    );
+    assert_eq!(
+        sending.await.expect("joins").expect("sends"),
+        CalendarOutcome::Sent
+    );
+    assert!(
+        friday(&harness).await.is_empty(),
+        "compensating Delete hides the created event immediately"
+    );
+    assert_eq!(flush(&harness).await, [CalendarOutcome::Sent]);
+    assert_eq!(
+        friday_titled(&harness, "Phantom A").await,
+        0,
+        "deleted from Google Calendar too"
+    );
+
+    // 2. Queueing `CalendarChange::Delete` while `Create` is in flight also waits and deletes it.
+    let second = Event {
+        id: Some("e0inflight002".into()),
+        summary: Some("Phantom B".into()),
+        start: Some(friday_at(11)),
+        end: Some(friday_at(12)),
+        ..Event::default()
+    };
+    harness
+        .store
+        .queue_calendar_change(
+            11,
+            CalendarChange::Create {
+                calendar: ACCOUNT.into(),
+                event: second,
+            },
+            None,
+        )
+        .await
+        .expect("queues");
+    let (due, _) = harness
+        .store
+        .due_calendar_changes(true)
+        .await
+        .expect("reads");
+    let sending = {
+        let store = harness.store.clone();
+        let item = due[0].clone();
+        tokio::spawn(async move { store.send_calendar_change(&item).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    harness
+        .store
+        .queue_calendar_change(
+            12,
+            CalendarChange::Delete {
+                calendar: ACCOUNT.into(),
+                id: "e0inflight002".into(),
+                notify: false,
+            },
+            None,
+        )
+        .await
+        .expect("queues delete while create is in flight");
+    assert_eq!(
+        sending.await.expect("joins").expect("sends"),
+        CalendarOutcome::Sent
+    );
+    assert!(friday(&harness).await.is_empty());
+    assert_eq!(flush(&harness).await, [CalendarOutcome::Sent]);
+    assert_eq!(
+        friday_titled(&harness, "Phantom B").await,
+        0,
+        "no phantom live event remains on Google Calendar"
+    );
 }

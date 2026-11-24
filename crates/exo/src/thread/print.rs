@@ -66,7 +66,7 @@ impl ThreadView {
                         return Some(Message::Marker {
                             text: markers::REMINDER.to_owned(),
                             link: None,
-                            when: Some(dates::row(at, &self.now)),
+                            when: Some(dates::row(at, &self.action.now)),
                         });
                     }
                 };
@@ -81,8 +81,8 @@ impl ThreadView {
                     header_expanded: item.header_expanded,
                     collapsible: false,
                     composing: false,
-                    offline: !self.online,
-                    full_names: self.full_names,
+                    offline: !self.action.online,
+                    full_names: self.action.full_names,
                     reply_labels: false,
                 };
                 let draft = drafts
@@ -113,8 +113,8 @@ impl ThreadView {
         let conversation = Conversation {
             title: title.clone(),
             subject: detail.subject.clone(),
-            labels: self.chips.clone(),
-            scrolled: self.scroll > 0.0,
+            labels: self.action.chips.clone(),
+            scrolled: self.scroll_state.scroll > 0.0,
             messages,
             inline,
             page: Page::default(),
@@ -154,10 +154,10 @@ impl ThreadView {
     ) -> (Message, Snippet) {
         let painter = ctx.layer_painter(LayerId::background());
         let width = |style: &exo_ui::TextStyle, text: &str| width(&painter, style, text);
-        let from = message::participants(message, detail, false, self.full_names);
+        let from = message::participants(message, detail, false, self.action.full_names);
         let (when, date_width) = match Status::of(message, state) {
             Some(status) => {
-                let text = status.collapsed_title(&self.now);
+                let text = status.collapsed_title(&self.action.now);
                 let measured = width(&STATUS, &text);
                 (
                     When::Status {
@@ -168,7 +168,7 @@ impl ThreadView {
                 )
             }
             None => {
-                let date = dates::row(message.date, &self.now);
+                let date = dates::row(message.date, &self.action.now);
                 let measured = width(&DATE, &date) + DATE.letter_spacing;
                 (When::Date(date), measured)
             }
@@ -224,10 +224,10 @@ impl ThreadView {
             .collect();
             let when = match status {
                 Some(status) => When::Status {
-                    text: status.full_title(&self.now),
+                    text: status.full_title(&self.action.now),
                     color: status.ink(),
                 },
-                None => When::Date(dates::expanded(message.date, &self.now)),
+                None => When::Date(dates::expanded(message.date, &self.action.now)),
             };
             Header::Full {
                 rows,
@@ -238,13 +238,13 @@ impl ThreadView {
         } else {
             let when = match status {
                 Some(status) => When::Status {
-                    text: status.title(&self.now),
+                    text: status.title(&self.action.now),
                     color: status.ink(),
                 },
-                None => When::Date(dates::row(message.date, &self.now)),
+                None => When::Date(dates::row(message.date, &self.action.now)),
             };
             Header::Compact {
-                participants: message::participants(message, detail, true, self.full_names),
+                participants: message::participants(message, detail, true, self.action.full_names),
                 when,
             }
         };
@@ -253,6 +253,7 @@ impl ThreadView {
             .collect();
         let calendar = bodies.facts(&item.id).map(|facts| &facts.calendar);
         let invite = self
+            .invite_state
             .invites
             .get(&item.id)
             .zip(self.invite_context(&item.id, calendar))

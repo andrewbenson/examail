@@ -373,18 +373,19 @@ pub fn show(
             } else {
                 0.0
             };
-            let target = if toggle.is_some() {
-                Rect::from_min_size(pos2(left, y), vec2(width, LINE + gap))
+            let row_id = exo_ui::id(list_ui.ctx(), ("settings-row", title));
+            let response = if let Some(on) = toggle {
+                let target = Rect::from_min_size(pos2(left, y), vec2(width, LINE + gap));
+                exo_ui::SwitchRow::new(row_id, target, title, LABEL, subdued, on)
+                    .slider_id(exo_ui::id(&ctx, ("settings-toggle", title)))
+                    .offsets(NUDGE, 0.0)
+                    .show(&list_ui)
             } else {
-                label
+                LABEL.paint_line(&painter, label.min, title, subdued, None);
+                list_ui
+                    .interact(label, row_id, Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
             };
-            let response = list_ui
-                .interact(
-                    target,
-                    exo_ui::id(list_ui.ctx(), ("settings-row", title)),
-                    Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if let Some(text) = tooltip(&action) {
                 exo_ui::TextTooltip {
                     text,
@@ -403,22 +404,6 @@ pub fn show(
             }
             if response.clicked() {
                 clicked = Some(action);
-            }
-            LABEL.paint_line(&painter, label.min, title, subdued, None);
-            if let Some(on) = toggle {
-                // The slider: 16px high, right-aligned at the row's top.
-                let slider = Rect::from_min_size(
-                    pos2(left + width - exo_ui::SLIDER_SIZE.x, y),
-                    exo_ui::SLIDER_SIZE,
-                );
-                exo_ui::paint_slider(
-                    &painter,
-                    slider,
-                    on,
-                    false,
-                    exo_ui::id(&ctx, ("settings-toggle", title)),
-                    exo_ui::SliderColors::CLASSIC,
-                );
             }
             y += LINE + ROW_GAP;
         }

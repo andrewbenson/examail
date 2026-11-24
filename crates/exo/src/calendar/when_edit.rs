@@ -6,8 +6,11 @@
 //! A time is typed or picked from a list of quarter hours; a date is typed or picked from the
 //! month under it.
 
-use egui::{Color32, CornerRadius, Id, Rect, Sense, Ui, pos2, vec2};
-use exo_ui::{DateInput, DatePick, DatePicker, Family, Font, Scrollbar, TextStyle, Theme};
+use egui::{Color32, Id, Rect, Sense, Ui, pos2, vec2};
+use exo_ui::{
+    AnchoredCard, AnchoredList, DateField, DateFieldStyle, DateInput, DatePick, Family, Font,
+    Scrollbar, TextStyle, Theme, keep_row_in_view,
+};
 use jiff::{
     ToSpan, Zoned,
     civil::{Date, Weekday},
@@ -385,10 +388,12 @@ impl WhenEdit {
             limit: ZONES,
             ink,
             placeholder: palette.text_base_accent,
+            show_rule: true,
             always_ruled: false,
             blur_on_pick: false,
             list_width: ZONE_LIST_WIDTH,
-            rows: super::share::ZoneRows::EDIT_EVENT,
+            list_offset: super::timezones::DEFAULT_LIST_OFFSET,
+            rows: super::timezones::ZoneRows::EDIT_EVENT,
         };
         let zone = self.zone.show(ui, &field);
         if zone.focused {
@@ -456,8 +461,6 @@ impl WhenEdit {
         } else {
             &mut self.end_date
         };
-        let width = INPUT.width(&ctx, &input.text).clamp(MIN_INPUT, MAX_DATE);
-        let line = Rect::from_min_size(pos2(x, top), vec2(width, INPUT.line_height));
         let keys = ui.input(|input| {
             (
                 input.key_pressed(egui::Key::Enter),
@@ -466,23 +469,42 @@ impl WhenEdit {
             )
         });
         let had_focus = ui.memory(|memory| memory.has_focus(id));
-        let before = input.text.clone();
-        let response = exo_ui::text_field(
-            ui,
+        let style = DateFieldStyle {
+            text: INPUT,
+            placeholder: INPUT,
+            min_width: MIN_INPUT,
+            max_width: MAX_DATE,
+            ink: palette.ink(0.9, 0.85),
+            placeholder_ink: palette.ink(0.9, 0.85),
+            selection: palette.text_selection_default,
+            unfocused_rule: None,
+            focused_rule: (2.0, UNDERLINE, FOCUSED),
+            error_color: WRONG,
+            popup_anchor_below: 2.0 + UNDERLINE,
+        };
+        let out = DateField {
             id,
-            &mut input.text,
-            line,
-            &INPUT,
-            palette.ink(0.9, 0.85),
-            palette.text_selection_default,
-        );
+            input,
+            style,
+            placeholder: "",
+            rule_focused: false,
+            show_popup: false,
+            disabled: false,
+            extend_hit_to_rule: false,
+            today: shown.today,
+            min,
+            week_start: shown.week_start,
+        }
+        .show(ui, pos2(x, top));
+        let width = out.width;
+        let line = Rect::from_min_size(pos2(x, top), vec2(width, INPUT.line_height));
         let mut taken = Taken {
             width,
-            has_focus: response.has_focus(),
+            has_focus: out.has_focus,
             picked: None,
             advance: false,
         };
-        if response.gained_focus() || focus {
+        if out.gained_focus || focus {
             // Its text is selected, and the month opens.
             exo_ui::focus_field(
                 &ctx,
@@ -492,17 +514,17 @@ impl WhenEdit {
                     egui::text::CCursor::new(input.text.chars().count()),
                 ),
             );
-            input.month = Some(input.parsed.unwrap_or(current).first_of_month());
+            input.open_month(current);
         }
-        if response.clicked() && input.month.is_none() {
-            input.month = Some(input.parsed.unwrap_or(current).first_of_month());
+        if out.clicked && input.month.is_none() {
+            input.open_month(current);
         }
-        if input.text != before {
+        if out.text_changed {
             input.typed(current, shown.today, min, false);
         }
         if had_focus {
             if keys.2 && input.month.is_none() {
-                input.month = Some(input.parsed.unwrap_or(current).first_of_month());
+                input.open_month(current);
             } else if (keys.0 || keys.1) && !input.error {
                 // Enter or Tab takes what's typed.
                 taken.picked = input.parsed.filter(|date| *date != current);
@@ -513,7 +535,7 @@ impl WhenEdit {
                 }
             }
         }
-        if input.error || response.has_focus() {
+        if input.error || out.has_focus {
             let color = if input.error { WRONG } else { FOCUSED };
             ui.painter().rect_filled(
                 Rect::from_min_size(
@@ -524,19 +546,14 @@ impl WhenEdit {
                 color,
             );
         }
-        if let Some(mut month) = input.month.filter(|_| response.has_focus() || had_focus) {
-            // Tethered to the input's box: its line, padding and border.
-            let picker = DatePicker {
-                id: id.with("month"),
-                month: &mut month,
-                selected: input.parsed,
-                today: shown.today,
-                min,
-                week_start: shown.week_start,
-            };
-            match picker.show(
+        if out.has_focus || had_focus {
+            match input.show_popup(
                 &ctx,
-                pos2(line.left(), line.bottom() + 2.0 + UNDERLINE) + exo_ui::DATE_PICKER_OFFSET,
+                id.with("month"),
+                pos2(line.left(), line.bottom() + 2.0 + UNDERLINE),
+                shown.today,
+                min,
+                shown.week_start,
             ) {
                 Some(DatePick::Picked(day)) => {
                     // The month closes, and the next part takes the keyboard.
@@ -552,7 +569,6 @@ impl WhenEdit {
                     *input = DateInput::showing(Some(day), shown.today);
                 }
                 Some(DatePick::MonthChanged) => {
-                    input.month = Some(month);
                     ui.memory_mut(|memory| memory.request_focus(id));
                 }
                 None => {}
@@ -563,7 +579,7 @@ impl WhenEdit {
         } else {
             &mut self.end_date
         };
-        if response.lost_focus() && !ui.memory(|memory| memory.has_focus(id)) {
+        if out.lost_focus && !ui.memory(|memory| memory.has_focus(id)) {
             // Leaving it closes the month, and what's typed and not taken goes back.
             input.month = None;
             if taken.picked.is_none() && !input.error {
@@ -660,10 +676,9 @@ impl WhenEdit {
                 time.highlighted = (time.highlighted + 1).min(listed.len() - 1);
             }
             if keys.0 || keys.1 {
-                // Keep it in view.
                 let item = ITEM_TOP + time.highlighted as f32 * ITEM;
-                let view = list_height(listed.len());
-                time.scroll = time.scroll.clamp(item + ITEM - view, item);
+                time.scroll =
+                    keep_row_in_view(time.scroll, item, item + ITEM, list_height(listed.len()));
             }
         }
         let valid = valid_time(&time.text);
@@ -672,7 +687,7 @@ impl WhenEdit {
             let picked = if time.open && !listed.is_empty() {
                 listed.get(time.highlighted).map(|(_, _, at)| at.clone())
             } else {
-                parse_time(&time.text, shown.start, part == Part::EndTime)
+                parse_part_time(&time.text, part, shown)
             };
             if let Some(at) = picked {
                 taken.picked = Some(at);
@@ -719,7 +734,7 @@ impl WhenEdit {
             time.open = false;
             // On leaving, what's typed and differs is taken when it reads as a time.
             if taken.picked.is_none() && time.text != time_text(current) {
-                taken.picked = parse_time(&time.text, shown.start, part == Part::EndTime);
+                taken.picked = parse_part_time(&time.text, part, shown);
             }
         }
         if let Some(at) = &taken.picked {
@@ -881,87 +896,49 @@ fn paint_list(
         Color32::from_rgb(0xf2, 0xf4, 0xfa)
     };
     let (text, duration) = (palette.ink(0.9, 0.9), palette.ink(0.4, 0.4));
-    let content = ITEM_TOP + listed.len() as f32 * ITEM + LIST_BOTTOM;
-    let mut clicked = None;
-    egui::Area::new(id)
-        .order(egui::Order::Tooltip)
-        .fixed_pos(rect.min)
-        .constrain(false)
-        .show(&ctx, |area| {
-            let rect = exo_ui::pixel_snap(rect);
-            let response = area.allocate_rect(rect, Sense::hover());
-            if response.hovered() {
-                time.scroll -= area.input(|input| input.smooth_scroll_delta.y);
-            }
-            time.scroll = time.scroll.clamp(0.0, (content - rect.height()).max(0.0));
-            let painter = area.painter().with_clip_rect(rect);
-            exo_ui::BoxShadow::new([0.0, 2.0], 8.0, 0.0, Color32::from_black_alpha(26)).paint(
-                area.painter(),
-                rect,
-                CornerRadius::same(4),
+    let out = AnchoredList::new(
+        id,
+        exo_ui::pixel_snap(rect),
+        AnchoredCard::elevated(fill, selected),
+    )
+    .padding(ITEM_TOP, LIST_BOTTOM)
+    .highlighted(Some(time.highlighted))
+    .scroll(&mut time.scroll)
+    .scrollbar(id.with("scrollbar"), &mut time.scrollbar)
+    .show_uniform(&ctx, listed.len(), ITEM, |painter, item, index| {
+        let (label, length, _) = listed[index];
+        let line = item.top() + ITEM_TEXT;
+        if part == Part::StartTime {
+            let width = SMALL_LINE.width(&ctx, label);
+            SMALL_LINE.paint_line(
+                painter,
+                pos2(item.center().x - width / 2.0, line),
+                label,
+                text,
+                None,
             );
-            area.painter()
-                .rect_filled(rect, CornerRadius::same(4), fill);
-            let (pointer, moving, pressed) = ctx.input(|input| {
-                (
-                    input.pointer.hover_pos(),
-                    input.pointer.is_moving(),
-                    input.pointer.primary_pressed(),
-                )
-            });
-            for (index, (label, length, _)) in listed.iter().enumerate() {
-                let item = Rect::from_min_size(
-                    pos2(
-                        rect.left(),
-                        rect.top() + ITEM_TOP + index as f32 * ITEM - time.scroll,
-                    ),
-                    vec2(rect.width(), ITEM),
-                );
-                if item.bottom() < rect.top() || item.top() > rect.bottom() {
-                    continue;
-                }
-                let hovered = pointer.is_some_and(|at| item.contains(at) && rect.contains(at));
-                if hovered && moving {
-                    time.highlighted = index;
-                }
-                if index == time.highlighted {
-                    painter.rect_filled(item, 0.0, selected);
-                }
-                let line = item.top() + ITEM_TEXT;
-                if part == Part::StartTime {
-                    let width = SMALL_LINE.width(&ctx, label);
-                    SMALL_LINE.paint_line(
-                        &painter,
-                        pos2(item.center().x - width / 2.0, line),
-                        label,
-                        text,
-                        None,
-                    );
-                } else {
-                    SMALL_LINE.paint_line(
-                        &painter,
-                        pos2(item.left() + END_PADDING, line),
-                        label,
-                        text,
-                        None,
-                    );
-                    let width = SMALL_LINE.width(&ctx, length);
-                    SMALL_LINE.paint_line(
-                        &painter,
-                        pos2(item.right() - END_PADDING - width, line),
-                        length,
-                        duration,
-                        None,
-                    );
-                }
-                if hovered && pressed {
-                    clicked = Some(index);
-                }
-            }
-            time.scrollbar
-                .show(area, id.with("scrollbar"), rect, time.scroll, content);
-        });
-    clicked
+        } else {
+            SMALL_LINE.paint_line(
+                painter,
+                pos2(item.left() + END_PADDING, line),
+                label,
+                text,
+                None,
+            );
+            let width = SMALL_LINE.width(&ctx, length);
+            SMALL_LINE.paint_line(
+                painter,
+                pos2(item.right() - END_PADDING - width, line),
+                length,
+                duration,
+                None,
+            );
+        }
+    });
+    if let Some(hovered) = out.hovered {
+        time.highlighted = hovered;
+    }
+    out.pressed
 }
 
 /// A typed time as one of [`FORMATS`] reads it.
@@ -1052,10 +1029,21 @@ fn valid_time(text: &str) -> bool {
     FORMATS.iter().any(|format| read(&text, format).is_some())
 }
 
+/// Parses a typed time for `part`, using `shown.end` as the day/half-day reference when editing
+/// `Part::EndTime` (so multi-day events stay on their end date) while rolling over only when the
+/// end falls before `shown.start`.
+fn parse_part_time(text: &str, part: Part, shown: &Shown<'_>) -> Option<Zoned> {
+    if part == Part::EndTime {
+        parse_time(text, shown.end, Some(shown.start))
+    } else {
+        parse_time(text, shown.start, None)
+    }
+}
+
 /// `text` as a time on `reference`'s day, in the first format it reads in. A 12-hour time without
-/// am or pm takes the reference's half of the day. An end before the reference is the next
-/// day's.
-fn parse_time(text: &str, reference: &Zoned, end: bool) -> Option<Zoned> {
+/// am or pm takes the reference's half of the day. When `after` is set (an end time) and the
+/// parsed time falls before it, it rolls over to the next day.
+fn parse_time(text: &str, reference: &Zoned, after: Option<&Zoned>) -> Option<Zoned> {
     let text = trimmed(text);
     let read = FORMATS.iter().find_map(|format| read(&text, format))?;
     let hour = if read.twelve {
@@ -1075,7 +1063,7 @@ fn parse_time(text: &str, reference: &Zoned, end: bool) -> Option<Zoned> {
         .at(hour as i8, minute as i8, 0, 0)
         .to_zoned(reference.time_zone().clone())
         .ok()?;
-    if end && at < *reference {
+    if after.is_some_and(|start| at < *start) {
         return at.checked_add(1.day()).ok();
     }
     Some(at)
@@ -1090,7 +1078,7 @@ mod tests {
     }
 
     fn typed(text: &str, reference: &str) -> Option<String> {
-        parse_time(text, &at(reference), false).map(|at| at.strftime("%-I:%M %p").to_string())
+        parse_time(text, &at(reference), None).map(|at| at.strftime("%-I:%M %p").to_string())
     }
 
     #[test]
@@ -1139,8 +1127,59 @@ mod tests {
 
     #[test]
     fn an_end_before_the_start_is_the_next_day() {
-        let end = parse_time("1a", &at("2026-11-18T22:00"), true).expect("end");
+        let start = at("2026-11-18T22:00");
+        let end = parse_time("1a", &start, Some(&start)).expect("end");
         assert_eq!(end, at("2026-11-19T01:00"));
+    }
+
+    #[test]
+    fn typing_end_time_on_multiday_event_keeps_end_date_and_same_day_shortening_stays() {
+        // Multi-day timed event: Nov 18 09:00 -> Nov 20 17:00. Typing an earlier or later end time
+        // must stay on Nov 20 rather than collapsing to Nov 18 or rolling over to Nov 21.
+        let (start, end) = (at("2026-11-18T09:00"), at("2026-11-20T17:00"));
+        let shown = Shown {
+            start: &start,
+            end: &end,
+            all_day: false,
+            today: start.date(),
+            week_start: Weekday::Sunday,
+        };
+        assert_eq!(
+            parse_part_time("3p", Part::EndTime, &shown),
+            Some(at("2026-11-20T15:00"))
+        );
+        assert_eq!(
+            parse_part_time("8a", Part::EndTime, &shown),
+            Some(at("2026-11-20T08:00"))
+        );
+        assert_eq!(
+            parse_part_time("715", Part::EndTime, &shown),
+            Some(at("2026-11-20T19:15")),
+            "half of day comes from shown.end"
+        );
+        assert_eq!(
+            parse_part_time("10a", Part::StartTime, &shown),
+            Some(at("2026-11-18T10:00"))
+        );
+
+        // Same-day event: shortening 9:00-11:00 to 10:00 AM must stay on Nov 18 (not roll over).
+        let same_day_end = at("2026-11-18T11:00");
+        let same_day = Shown {
+            start: &start,
+            end: &same_day_end,
+            all_day: false,
+            today: start.date(),
+            week_start: Weekday::Sunday,
+        };
+        assert_eq!(
+            parse_part_time("10a", Part::EndTime, &same_day),
+            Some(at("2026-11-18T10:00"))
+        );
+        // Wrapping past midnight (before start) still rolls over to the next day.
+        assert_eq!(
+            parse_part_time("8a", Part::EndTime, &same_day),
+            Some(at("2026-11-19T08:00"))
+        );
     }
 
     #[test]

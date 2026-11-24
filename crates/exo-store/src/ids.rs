@@ -75,7 +75,7 @@ pub enum ListId {
     Split(String),
 }
 
-pub(crate) mod labels {
+pub mod labels {
     //! Gmail system label ids and Exo's virtual list ids.
 
     pub const INBOX: &str = "INBOX";
@@ -100,6 +100,9 @@ pub(crate) mod labels {
     pub const SH_SNOOZED: &str = "SH_SNOOZED";
     pub const SH_ALL: &str = "SH_ALL";
     pub const SH_NO_REPLY: &str = "SH_NO_REPLY";
+    pub const SH_SNIPPETS: &str = "SH_SNIPPETS";
+    pub const SH_KNOWLEDGE_BASE: &str = "SH_KNOWLEDGE_BASE";
+    pub const SH_SIGNATURES: &str = "SH_SIGNATURES";
 
     /// Exo's hidden labels in Gmail: their parent, and those under it.
     pub const EXO_PARENT: &str = "[Exo]";

@@ -7,7 +7,9 @@
 use egui::{Color32, Context, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Ui, pos2, vec2};
 use exo_editor::{ActiveDate, BodyText, Editor, EditorStyle};
 use exo_store::{OutOfOfficeDays, OutOfOfficeResponder};
-use exo_ui::{ActionKind, DateInput, DialogAction, Family, Font, SliderColors, TextStyle};
+use exo_ui::{
+    ActionKind, DateInput, DialogAction, Family, Font, Scrollbar, SliderColors, TextStyle,
+};
 use gmail::VacationSettings;
 use jiff::{SignedDuration, Timestamp, Zoned, civil::Date};
 
@@ -217,15 +219,6 @@ pub struct Dialog {
     /// The days the nudge opened it with.
     days: Option<OutOfOfficeDays>,
     editor: Editor,
-    /// The subject's spelling, as a field's, autocorrect or not.
-    pub subject_spelling: exo_editor::FieldSpelling,
-    /// The dates' spelling, which is checked too.
-    pub start_spelling: exo_editor::FieldSpelling,
-    pub end_spelling: exo_editor::FieldSpelling,
-    /// A right-click in the message, for the app's menu.
-    pub message_menu: Option<exo_editor::ContextMenu>,
-    /// A word the message's autocorrect pill learned, for the app's hint.
-    pub message_learned: Option<String>,
     /// The detected date the message's caret is on.
     date: Option<ActiveDate>,
     /// A date the caret came onto, or whose text changed under it, for the app to show its day.
@@ -236,6 +229,7 @@ pub struct Dialog {
     /// `People at {domain}`, unless the account is on `gmail.com`.
     domain: Option<String>,
     scroll: f32,
+    scrollbar: Scrollbar,
 }
 
 impl Dialog {
@@ -261,16 +255,12 @@ impl Dialog {
             form,
             days,
             editor,
-            subject_spelling: exo_editor::FieldSpelling::default(),
-            start_spelling: exo_editor::FieldSpelling::default(),
-            end_spelling: exo_editor::FieldSpelling::default(),
-            message_menu: None,
-            message_learned: None,
             date: None,
             day: None,
             focus: None,
             domain,
             scroll: 0.0,
+            scrollbar: Scrollbar::default(),
         }
     }
 
@@ -294,16 +284,17 @@ impl Dialog {
         !self.loading && self.form != self.initial
     }
 
-    /// Save can't be pressed when it's waiting, the reply is off and was when it opened, the
-    /// subject or message is empty, or a typed date is wrong.
+    /// Save can't be pressed when it's waiting, when turning off an already-off reply, or (while
+    /// enabled) when the subject or message is empty or a typed date is wrong. Turning off an
+    /// active reply stays allowed even if disabled fields hold an empty subject or date error.
     pub fn save_disabled(&self) -> bool {
-        self.loading
-            || self.submitting
-            || (!self.form.enabled && !self.initial.enabled)
-            || self.form.subject.is_empty()
-            || self.editor.is_empty()
-            || self.start.error
-            || self.end.error
+        if self.loading || self.submitting {
+            return true;
+        }
+        if !self.form.enabled {
+            return !self.initial.enabled;
+        }
+        self.form.subject.is_empty() || self.editor.is_empty() || self.start.error || self.end.error
     }
 
     /// What Save sends.
@@ -319,23 +310,6 @@ impl Dialog {
     /// Whether the message's editor has the keyboard and something of its own for Escape.
     pub fn editor_wants_escape(&self) -> bool {
         self.focus == Some(Control::Message) && self.editor.wants_escape()
-    }
-
-    /// Does `choice` from the menu of a right-click `menu` in the first date (`start`) or the
-    /// last.
-    pub(crate) fn date_choice(
-        &mut self,
-        ctx: &egui::Context,
-        start: bool,
-        menu: &exo_editor::ContextMenu,
-        choice: crate::page_menu::Choice,
-    ) -> crate::spelling::Done {
-        let (spelling, input) = if start {
-            (&mut self.start_spelling, &mut self.start)
-        } else {
-            (&mut self.end_spelling, &mut self.end)
-        };
-        crate::spelling::field_choice(ctx, spelling, &mut input.text, menu, choice)
     }
 
     /// Whether the message's caret is on a detected date, which ⌘⇧– and ⌘⇧= move.
@@ -421,7 +395,11 @@ impl Dialog {
         if focus == self.focus {
             return;
         }
+        let previous = self.focus;
         self.focus = focus;
+        if let Some(control) = previous {
+            self.commit_control(control, now);
+        }
         // A date input's month opens when it gets the keyboard and closes when it loses it.
         let today = now.date();
         for (control, input) in [
@@ -433,13 +411,45 @@ impl Dialog {
         }
     }
 
+    /// Commits any valid typed date in `control` without changing focus.
+    fn commit_control(&mut self, control: Control, now: &Zoned) {
+        let tz = now.time_zone().clone();
+        match control {
+            Control::Start => {
+                if let Some(date) = self.start.parsed.filter(|_| !self.start.error)
+                    && date != self.form.start.to_zoned(tz).date()
+                {
+                    self.apply_start(date, now);
+                }
+            }
+            Control::End => {
+                let current = self.form.end.map(|end| end.to_zoned(tz).date());
+                if let Some(date) = self.end.parsed.filter(|_| !self.end.error)
+                    && Some(date) != current
+                {
+                    self.apply_end(Some(date), now);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commits any valid typed dates in both Start and End inputs (called right before saving).
+    pub fn commit_dates(&mut self, now: &Zoned) {
+        self.commit_control(Control::Start, now);
+        self.commit_control(Control::End, now);
+    }
+
     /// Enter on the focused control.
     pub fn enter(&mut self, now: &Zoned) -> Option<Event> {
         match self.focus? {
             Control::Switch => self.toggle(),
             Control::Contacts => self.form.contacts = !self.form.contacts,
             Control::Domain => self.form.domain = !self.form.domain,
-            Control::Save => return Some(Event::Save),
+            Control::Save => {
+                self.commit_dates(now);
+                return Some(Event::Save);
+            }
             Control::Cancel => return Some(Event::Close),
             Control::Start | Control::End => {
                 self.commit(now);
@@ -491,31 +501,45 @@ impl Dialog {
         true
     }
 
-    /// Picks the first day, which moves to `date`. A last day now before it moves along to keep
-    /// the time away as long, and the last day's input gets the keyboard.
-    fn pick_start(&mut self, date: Date, now: &Zoned) {
+    /// Moves the first day to `date`, shifting a last day now before it by the same number of
+    /// civil days (ending at `23:59:59` in `now`'s zone so DST changes don't drift the wall time).
+    fn apply_start(&mut self, date: Date, now: &Zoned) {
+        let tz = now.time_zone().clone();
         let start = midnight(date, now);
         if let Some(end) = self.form.end.filter(|end| start > *end) {
-            self.form.end = Some(start + end.duration_since(self.form.start));
+            let old_start = self.form.start.to_zoned(tz.clone()).date();
+            let old_end = end.to_zoned(tz).date();
+            let shifted = old_start
+                .until(old_end)
+                .ok()
+                .filter(|span| !span.is_negative())
+                .and_then(|span| date.checked_add(span).ok())
+                .unwrap_or(date);
+            self.form.end = end_of_day(shifted, now);
         }
         self.form.start = start;
         self.start.error = false;
         self.show_dates(now);
+    }
+
+    /// Picks the first day, which moves to `date`. A last day now before it moves along to keep
+    /// the time away as long, and the last day's input gets the keyboard.
+    fn pick_start(&mut self, date: Date, now: &Zoned) {
+        self.apply_start(date, now);
         self.set_focus(Some(Control::End), now);
+    }
+
+    /// Moves the last day to `date`'s last second, or none.
+    fn apply_end(&mut self, date: Option<Date>, now: &Zoned) {
+        self.form.end = date.and_then(|date| end_of_day(date, now));
+        self.end.error = false;
+        self.show_dates(now);
     }
 
     /// Picks the last day, `date`'s last second, or none. The input keeps the keyboard, with its
     /// month closed.
     fn pick_end(&mut self, date: Option<Date>, now: &Zoned) {
-        self.form.end = date
-            .and_then(|date| {
-                date.at(23, 59, 59, 0)
-                    .to_zoned(now.time_zone().clone())
-                    .ok()
-            })
-            .map(|end| end.timestamp());
-        self.end.error = false;
-        self.show_dates(now);
+        self.apply_end(date, now);
     }
 
     /// The date inputs show the form's days again.
@@ -648,7 +672,6 @@ impl Dialog {
                 placeholder: "",
                 min: today,
                 today,
-                spelling: &mut self.start_spelling,
             };
             let start_left = left + first_width + DATE_PADDING;
             let start_width = start_field.width(&ctx);
@@ -670,7 +693,6 @@ impl Dialog {
                 placeholder: "Select date",
                 min: start_date,
                 today,
-                spelling: &mut self.end_spelling,
             };
             let end_event = end_field.show(
                 ui,
@@ -724,7 +746,7 @@ impl Dialog {
                     TEXT.paint_line(&painter, line.min, "Enter subject", TEXT_SUBDUED, None);
                 }
                 let field_id = id.with("subject");
-                let field = self.subject_spelling.show(
+                let field = crate::spelling::text_field(
                     ui,
                     field_id,
                     &mut self.form.subject,
@@ -876,6 +898,7 @@ impl Dialog {
             claimed = true;
         }
         if save.show(ui, id.with("save"), save_rect).clicked() {
+            self.commit_dates(now);
             event = Some(Event::Save);
             claimed = true;
         }
@@ -937,8 +960,11 @@ impl Dialog {
                     min_height: area.height(),
                 };
                 let edited = self.editor.ui(ui, &style);
-                self.message_menu = edited.context_menu.or(self.message_menu.take());
-                self.message_learned = edited.learned.or(self.message_learned.take());
+                crate::spelling::note_editor(
+                    ui.ctx(),
+                    crate::spelling::EditorTarget::OutOfOfficeMessage,
+                    &edited,
+                );
                 if edited.date != self.date {
                     self.day = edited
                         .date
@@ -972,20 +998,14 @@ impl Dialog {
             }
             hold_focus(ui, self.focus == Some(Control::Message), editor_id);
         }
-        // The thumb: 7px of `rgba(0, 0, 0, .5)` in its 11px track, while the message overflows.
         let content = output.content_size.y;
-        if content > area.height() {
-            let track =
-                Rect::from_min_max(pos2(area.right() - gutter, area.top()), area.max).shrink(2.0);
-            let length = track.height() * area.height() / content;
-            let offset = (track.height() - length) * self.scroll / (content - area.height());
-            let thumb = Rect::from_min_size(
-                pos2(track.left(), track.top() + offset),
-                vec2(track.width(), length),
-            );
-            ui.painter()
-                .rect_filled(thumb, CornerRadius::same(4), Color32::from_black_alpha(128));
-        }
+        self.scrollbar.show(
+            ui,
+            exo_ui::id(ui.ctx(), "out-of-office-scrollbar"),
+            area,
+            self.scroll,
+            content,
+        );
         (pasted_file.then_some(Event::PastedFile), focused)
     }
 
@@ -1053,6 +1073,14 @@ fn midnight(date: Date, now: &Zoned) -> Timestamp {
         .map_or_else(|_| now.timestamp(), |zoned| zoned.timestamp())
 }
 
+/// `date`'s last local second (`23:59:59`) in `now`'s zone.
+fn end_of_day(date: Date, now: &Zoned) -> Option<Timestamp> {
+    date.at(23, 59, 59, 0)
+        .to_zoned(now.time_zone().clone())
+        .ok()
+        .map(|end| end.timestamp())
+}
+
 /// A loading skeleton in `rect`, with its shine where the 2s animation has it.
 fn skeleton(ui: &Ui, rect: Rect) {
     let painter = ui.painter();
@@ -1083,4 +1111,140 @@ fn skeleton(ui: &Ui, rect: Rect) {
     }
     painter.with_clip_rect(rect).add(egui::Shape::mesh(mesh));
     ui.ctx().request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::civil::date;
+
+    use super::*;
+
+    fn ny(text: &str) -> Zoned {
+        text.parse().expect("valid zoned")
+    }
+
+    fn loaded_active_dialog(now: &Zoned) -> Dialog {
+        let mut dialog = Dialog::new("maya@brightmoor.co", None, now);
+        let vacation = VacationSettings {
+            enable_auto_reply: Some(true),
+            response_subject: Some("Out of office".into()),
+            response_body_html: Some("<div>Back soon</div>".into()),
+            start_time: Some(midnight(now.date(), now).as_millisecond()),
+            end_time: end_of_day(now.date(), now)
+                .map(|end| (end + SignedDuration::from_secs(1)).as_millisecond()),
+            ..VacationSettings::default()
+        };
+        let copy = OutOfOfficeResponder::of(&vacation, now.timestamp());
+        dialog.loaded(Some(&copy), now);
+        dialog
+    }
+
+    #[test]
+    fn turning_off_active_ooo_allows_save_despite_empty_fields_or_date_errors() {
+        let now = ny("2026-11-17T09:00[America/New_York]");
+        let mut dialog = loaded_active_dialog(&now);
+        assert!(!dialog.save_disabled());
+
+        // While enabled, empty subject or date error disables Save.
+        dialog.form.subject.clear();
+        dialog.start.error = true;
+        assert!(dialog.save_disabled());
+
+        // Turning off an active OOO lets the user save despite disabled-field errors.
+        dialog.toggle();
+        assert!(!dialog.form.enabled && dialog.initial.enabled);
+        assert!(!dialog.save_disabled());
+
+        // Loading / submitting still disable Save.
+        dialog.submitting = true;
+        assert!(dialog.save_disabled());
+        dialog.submitting = false;
+        dialog.loading = true;
+        assert!(dialog.save_disabled());
+
+        // Turning off when already initially off keeps Save disabled.
+        let mut off = Dialog::new("maya@brightmoor.co", None, &now);
+        off.loaded(None, &now);
+        assert!(!off.form.enabled && !off.initial.enabled);
+        assert!(off.save_disabled());
+    }
+
+    #[test]
+    fn pick_start_shifts_end_by_civil_days_across_dst_boundaries() {
+        // Spring forward in America/New_York is 2026-03-08 (a 23-hour day).
+        let spring = ny("2026-03-06T09:00[America/New_York]");
+        let mut dialog = loaded_active_dialog(&spring);
+        // Set range: Mar 6 .. Mar 7 (1-day span, 2 calendar days).
+        dialog.pick_end(Some(date(2026, 3, 7)), &spring);
+        // Pick start = Mar 8 -> end should shift to Mar 9 at 23:59:59 EDT.
+        dialog.pick_start(date(2026, 3, 8), &spring);
+        let shifted_end = dialog
+            .form
+            .end
+            .expect("end stays set")
+            .to_zoned(spring.time_zone().clone());
+        assert_eq!(shifted_end.date(), date(2026, 3, 9));
+        assert_eq!(
+            (
+                shifted_end.hour(),
+                shifted_end.minute(),
+                shifted_end.second()
+            ),
+            (23, 59, 59),
+            "spring-forward DST must keep end at 23:59:59: {shifted_end}"
+        );
+
+        // Fall back in America/New_York is 2026-11-01 (a 25-hour day).
+        let fall = ny("2026-10-31T09:00[America/New_York]");
+        let mut dialog = loaded_active_dialog(&fall);
+        dialog.pick_end(Some(date(2026, 10, 31)), &fall);
+        dialog.pick_start(date(2026, 11, 1), &fall);
+        let shifted_end = dialog
+            .form
+            .end
+            .expect("end stays set")
+            .to_zoned(fall.time_zone().clone());
+        assert_eq!(shifted_end.date(), date(2026, 11, 1));
+        assert_eq!(
+            (
+                shifted_end.hour(),
+                shifted_end.minute(),
+                shifted_end.second()
+            ),
+            (23, 59, 59),
+            "fall-back DST must keep end at 23:59:59: {shifted_end}"
+        );
+    }
+
+    #[test]
+    fn valid_typed_dates_commit_on_focus_blur_and_before_save() {
+        let now = ny("2026-11-17T09:00[America/New_York]");
+        let mut dialog = loaded_active_dialog(&now);
+
+        // Type a new start date and blur to Subject -> start date commits without stealing focus.
+        dialog.set_focus(Some(Control::Start), &now);
+        dialog.start.text = "Nov 20, 2026".into();
+        dialog.start.parsed = Some(date(2026, 11, 20));
+        dialog.start.error = false;
+        dialog.set_focus(Some(Control::Subject), &now);
+        assert_eq!(dialog.focus(), Some(Control::Subject));
+        assert_eq!(
+            dialog.form.start.to_zoned(now.time_zone().clone()).date(),
+            date(2026, 11, 20)
+        );
+
+        // Type a new end date and save directly without blurring -> end date commits before Save.
+        dialog.set_focus(Some(Control::End), &now);
+        dialog.end.text = "Nov 25, 2026".into();
+        dialog.end.parsed = Some(date(2026, 11, 25));
+        dialog.end.error = false;
+        dialog.commit_dates(&now);
+        let end = dialog
+            .form
+            .end
+            .expect("end committed")
+            .to_zoned(now.time_zone().clone());
+        assert_eq!(end.date(), date(2026, 11, 25));
+        assert_eq!((end.hour(), end.minute(), end.second()), (23, 59, 59));
+    }
 }

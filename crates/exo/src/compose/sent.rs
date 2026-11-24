@@ -127,10 +127,15 @@ impl ShownSends {
     }
 }
 
-/// The message `open` sends, as Gmail will have it in Sent: from you, to its recipients,
-/// dated `at`. Its files show once Gmail's copy arrives.
-fn message(open: &Open, html: &str, aliases: &[Alias], at: Timestamp) -> MessageDetail {
-    let record = &open.record;
+/// A synthetic [`MessageDetail`] for rendering an unsynced body (an outgoing reply in its thread,
+/// or a snippet in its read-only card) with its recipients, subject and `<body>` HTML.
+pub(crate) fn synthetic_message(
+    id: String,
+    [to, cc, bcc]: [&[Address]; 3],
+    aliases: &[Alias],
+    subject: &str,
+    html: &str,
+) -> MessageDetail {
     let contact = |address: &Address| Contact {
         name: address.name.clone(),
         email: address.email.clone(),
@@ -138,41 +143,65 @@ fn message(open: &Open, html: &str, aliases: &[Alias], at: Timestamp) -> Message
             .iter()
             .any(|alias| recipients::same_address(&alias.email, &address.email)),
     };
-    let text = plain::from_html(html);
     MessageDetail {
-        id: format!("sending-{}", open.id),
-        labels: vec!["SENT".into()],
-        date: at,
-        from: record.from.as_ref().map(|from| Contact {
-            is_me: true,
-            ..contact(from)
-        }),
-        to: record.to.iter().map(contact).collect(),
-        cc: record.cc.iter().map(contact).collect(),
-        bcc: record.bcc.iter().map(contact).collect(),
+        id,
+        labels: Vec::new(),
+        date: Timestamp::UNIX_EPOCH,
+        from: None,
+        to: to.iter().map(contact).collect(),
+        cc: cc.iter().map(contact).collect(),
+        bcc: bcc.iter().map(contact).collect(),
         reply_to: Vec::new(),
-        subject: record.subject.clone(),
-        snippet: text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(200)
-            .collect(),
-        rfc822_id: Some(record.rfc822_id.clone()),
-        in_reply_to: record.in_reply_to_rfc822.clone(),
-        references: record.references.clone(),
+        subject: subject.to_owned(),
+        snippet: String::new(),
+        rfc822_id: None,
+        in_reply_to: None,
+        references: Vec::new(),
         list_id: None,
         list_unsubscribe: None,
         list_unsubscribe_post: None,
         headers: Vec::new(),
         body: Body {
             html: Some(format!("<html><head></head><body>{html}</body></html>")),
-            text: Some(text),
+            text: None,
         },
         attachments: Vec::new(),
         failure: None,
         scheduled: None,
-        sending: true,
+        sending: false,
     }
+}
+
+/// The message `open` sends, as Gmail will have it in Sent: from you, to its recipients,
+/// dated `at`. Its files show once Gmail's copy arrives.
+fn message(open: &Open, html: &str, aliases: &[Alias], at: Timestamp) -> MessageDetail {
+    let record = &open.record;
+    let text = plain::from_html(html);
+    let mut detail = synthetic_message(
+        format!("sending-{}", open.id),
+        [&record.to, &record.cc, &record.bcc],
+        aliases,
+        &record.subject,
+        html,
+    );
+    detail.labels = vec![exo_store::labels::SENT.into()];
+    detail.date = at;
+    detail.from = record.from.as_ref().map(|from| Contact {
+        name: from.name.clone(),
+        email: from.email.clone(),
+        is_me: true,
+    });
+    detail.snippet = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect();
+    detail.rfc822_id = Some(record.rfc822_id.clone());
+    detail.in_reply_to.clone_from(&record.in_reply_to_rfc822);
+    detail.references.clone_from(&record.references);
+    detail.body.text = Some(text);
+    detail.sending = true;
+    detail
 }

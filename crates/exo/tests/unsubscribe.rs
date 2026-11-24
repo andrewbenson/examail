@@ -1,4 +1,4 @@
-//! Unsubscribe end to end on gmail-mock: `⌘U` and its picker, the
+//! Unsubscribe end to end on mock-servers: `⌘U` and its picker, the
 //! confirmation, each way of unsubscribing (a one-click POST to the mock's own endpoint, a
 //! `mailto:` sent from the account, a web link opened), the Mark Done and Trash all rows with
 //! Undo, the offer to block when there's nothing to unsubscribe from, and offline.
@@ -135,7 +135,7 @@ fn a_one_click_unsubscribe_posts_to_the_list_after_confirming() {
     );
     assert!(unsubscribes(&app).is_empty(), "nothing before Confirm");
     app.key(Key::Enter);
-    assert_eq!(app.mail().toast(), Some("Unsubscribed."));
+    assert_eq!(app.mail().toast_text(), Some("Unsubscribed."));
     let posted = unsubscribes(&app);
     assert_eq!(posted.len(), 1);
     assert_eq!(posted[0]["list"], "shop.example/u");
@@ -171,7 +171,7 @@ fn a_mailto_unsubscribe_sends_the_request_from_the_account() {
     app.press(Key::U, CMD);
     app.key(Key::Enter);
     app.key(Key::Enter);
-    assert_eq!(app.mail().toast(), Some("Unsubscribed."));
+    assert_eq!(app.mail().toast_text(), Some("Unsubscribed."));
     app.wait(1.0);
 
     let gmail = app.gmail();
@@ -273,7 +273,7 @@ fn a_web_link_opens_in_the_browser_without_a_toast() {
     app.settle();
     assert_eq!(opened.as_deref(), Some("https://shop.example/preferences"));
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         None,
         "the browser does the unsubscribing"
     );
@@ -325,7 +325,7 @@ fn unsubscribe_and_mark_done_all_moves_on_and_undo_brings_them_back() {
     assert_eq!(alert(&app), Some(("Unsubscribe & Mark Done".into(), "Would you like to unsubscribe and Mark Done all existing messages from deals@shop.example?".into())));
     app.key(Key::Enter);
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Unsubscribed, and Marking Done all from deals@shop.example.")
     );
     assert_ne!(app.cursor(), "Deal three", "from the inbox it moves on");
@@ -341,7 +341,7 @@ fn unsubscribe_and_mark_done_all_moves_on_and_undo_brings_them_back() {
     );
 
     app.key(Key::Z);
-    assert_eq!(app.mail().toast(), Some("Unsubscribed."));
+    assert_eq!(app.mail().toast_text(), Some("Unsubscribed."));
     app.sync();
     assert_eq!(
         count(&app, "in:inbox from:deals@shop.example"),
@@ -366,7 +366,7 @@ fn unsubscribe_and_trash_all_from_a_thread_opens_the_next_conversation() {
     assert_eq!(alert(&app), Some(("Unsubscribe & Trash".into(), "Would you like to unsubscribe and Trash all existing messages from deals@shop.example?".into())));
     app.key(Key::Enter);
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Unsubscribed, and Trashing all from deals@shop.example.")
     );
     let open = open_subject(&app);
@@ -393,7 +393,7 @@ fn with_auto_advance_off_trash_all_goes_back_to_the_list() {
     app.key(Key::Enter);
     app.key(Key::Enter);
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Unsubscribed, and Trashing all from deals@shop.example.")
     );
     assert_eq!(open_subject(&app), None, "back to the list");
@@ -436,7 +436,7 @@ fn offline_the_unsubscribe_waits_through_a_relaunch_and_goes_once_back() {
     app.key(Key::Enter);
     app.key(Key::Enter);
     assert_eq!(
-        app.mail().toast(),
+        app.mail().toast_text(),
         Some("Unsubscribe will happen when online.")
     );
 

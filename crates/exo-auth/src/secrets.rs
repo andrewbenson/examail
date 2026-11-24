@@ -44,7 +44,7 @@ impl<S: SecretStore + ?Sized> SecretStore for Arc<S> {
     }
 }
 
-/// Secrets in memory only, for tests and gmail-mock sessions.
+/// Secrets in memory only, for tests and mock-servers sessions.
 #[derive(Default)]
 pub struct MemorySecrets(Mutex<HashMap<String, String>>);
 

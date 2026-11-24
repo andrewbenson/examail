@@ -1,4 +1,4 @@
-//! Out of Office Reply end to end on gmail-mock: the dialog reads Gmail's vacation responder and
+//! Out of Office Reply end to end on mock-servers: the dialog reads Gmail's vacation responder and
 //! saves to it, the status bar while replies go out, the alerts, and the nudge for
 //! out-of-office days on the calendar.
 

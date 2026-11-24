@@ -9,15 +9,17 @@
 //! Over a photo ([`Behind::for_toasts`]) the card is see-through: white at .2 over the photo
 //! blurred 12.5px, with white text.
 
+use std::sync::Arc;
+
 use egui::{
-    Area, Color32, Context, CornerRadius, Id, LayerId, Order, Painter, Pos2, Rect, Response, Sense,
-    Ui, Vec2,
+    Area, Color32, Context, CornerRadius, Galley, Id, LayerId, Order, Painter, Pos2, Rect,
+    Response, Sense, Ui, Vec2,
     text::{LayoutJob, TextWrapping},
 };
 
 use crate::{
-    Behind, BoxShadow, Family, Font, KeyTooltip, TextStyle, motion, paint_icon, paint_job, palette,
-    pixel_snap, rem,
+    Behind, BoxShadow, Family, Font, KeyTooltip, TextStyle, layout, motion, paint_icon, paint_text,
+    palette, pixel_snap, rem,
 };
 
 const HEIGHT: f32 = 48.0;
@@ -76,19 +78,17 @@ pub struct ToastActionView<'a> {
     pub disabled: bool,
 }
 
-/// A line of text to paint, and its exact width.
+/// A line of text to paint, shaped once, and its exact width.
 struct Line {
-    job: LayoutJob,
+    galley: Arc<Galley>,
     width: f32,
 }
 
 impl Line {
     fn new(ctx: &Context, job: LayoutJob) -> Self {
-        let width = ctx
-            .fonts_mut(|fonts| fonts.layout_job(job.clone()))
-            .size()
-            .x;
-        Self { job, width }
+        let galley = layout(ctx, job);
+        let width = galley.size().x;
+        Self { galley, width }
     }
 }
 
@@ -395,7 +395,7 @@ impl ToastView<'_> {
             ..ToastResponse::default()
         };
         let mut x = card.left() + status;
-        let mut text_job = text.job;
+        let mut text_galley = text.galley;
         if self.clickable {
             // The text's box, its padding included, takes the click.
             let room = percentage.as_ref().map_or(0.0, |(_, room)| *room);
@@ -420,17 +420,22 @@ impl ToastView<'_> {
                 0.15,
                 motion::CubicBezier::EASE,
             );
-            for section in &mut text_job.sections {
-                section.format.color = motion::mix(section.format.color, CLICKABLE_HOVER, blue);
+            if blue > 0.0
+                && let Some(base) = text_galley.job.sections.first().map(|s| s.format.color)
+            {
+                text_galley = crate::text::recolor_galley(
+                    &text_galley,
+                    motion::mix(base, CLICKABLE_HOVER, blue),
+                );
             }
         }
-        paint_job(painter, Pos2::new(x, top + LINE_TOP), text_job, &TEXT);
+        paint_text(painter, Pos2::new(x, top + LINE_TOP), text_galley, &TEXT);
         x += text.width;
         if let Some((line, room)) = percentage {
-            paint_job(
+            paint_text(
                 painter,
                 Pos2::new(x + PERCENTAGE_GAP, top + LINE_TOP),
-                line.job,
+                line.galley,
                 &TEXT,
             );
             x += room;
@@ -463,7 +468,12 @@ impl ToastView<'_> {
                 if action_response.clicked() {
                     result.clicked = Some(i);
                 }
-                paint_job(&clipped, Pos2::new(at, top + LINE_TOP), line.job, &ACTION);
+                paint_text(
+                    &clipped,
+                    Pos2::new(at, top + LINE_TOP),
+                    line.galley,
+                    &ACTION,
+                );
                 show_action_tooltip(ui, &action_response, action);
                 x += width;
                 continue;
@@ -489,7 +499,7 @@ impl ToastView<'_> {
             if action_response.clicked() {
                 result.clicked = Some(i);
             }
-            paint_job(painter, Pos2::new(x, top + LINE_TOP), line.job, &ACTION);
+            paint_text(painter, Pos2::new(x, top + LINE_TOP), line.galley, &ACTION);
             show_action_tooltip(ui, &action_response, action);
             x += line.width;
         }

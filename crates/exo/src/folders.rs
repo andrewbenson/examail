@@ -12,7 +12,8 @@ use egui::{
 };
 use exo_store::{Label, ListCount, ListId};
 use exo_ui::{
-    Behind, BoxShadow, Family, Font, KeycapColors, Keycaps, Palette, TextStyle, Theme,
+    Behind, BoxShadow, Family, Font, HighlightState, HighlightTarget, KeycapColors, Keycaps,
+    ListHighlight, Palette, TextStyle, Theme,
     motion::{self, CubicBezier},
     paint_job,
 };
@@ -49,12 +50,8 @@ const AVATAR: f32 = 32.0;
 const AVATAR_GAP: f32 = 14.0;
 /// The avatar's initial: 18px, bold like the row it's in, centered with `dy: .35em`.
 const INITIAL: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 18.0, 18.0);
-/// The cursor's highlight: 6px in from either side, 2px corners, a 3px bar.
+/// The cursor's highlight: 6px in from either side; fade duration and curve match `ListHighlight`.
 const HIGHLIGHT_INSET: f32 = 6.0;
-const HIGHLIGHT_RADIUS: u8 = 2;
-const BAR_WIDTH: f32 = 3.0;
-/// `transition: transform 256ms cubic-bezier(0.19, 1, 0.22, 1), opacity 512ms …`.
-const HIGHLIGHT_SLIDE: f32 = 0.256;
 const HIGHLIGHT_FADE: f32 = 0.512;
 const HIGHLIGHT_CURVE: CubicBezier = CubicBezier::new(0.19, 1.0, 0.22, 1.0);
 /// Labels listed before `Load More`, unless there are fewer than ten more.
@@ -565,7 +562,7 @@ impl Folders {
             origin,
             highlight,
             self.jump,
-            inks.highlight,
+            view.behind.is_some(),
         );
         let mut index = 0;
         for (i, (line, &(row_top, height))) in lines.iter().zip(&layout).enumerate() {
@@ -714,7 +711,7 @@ impl Folders {
             0.0,
             (self.cursor == 0).then_some((account.top(), ROW)),
             self.jump,
-            inks.highlight,
+            view.behind.is_some(),
         );
         if self.open && moved && pointer.is_some_and(|at| account.contains(at)) {
             self.move_to(0, true);
@@ -758,9 +755,9 @@ fn wrapped_height(ctx: &egui::Context, name: &str, width: f32) -> f32 {
     rows as f32 * LABEL.line_height + 2.0 * NESTED_PADDING
 }
 
-/// The cursor's highlight (`color`) on the row at `target` (its top and height in content that
-/// starts at `origin` on screen, so scrolling doesn't slide it), sliding from where it was, or
-/// fading out with no target.
+/// The cursor's highlight on the row at `target` (its top and height in content that starts at
+/// `origin` on screen, so scrolling doesn't slide it), sliding via [`ListHighlight`] and fading
+/// out over [`HIGHLIGHT_FADE`] when the cursor leaves this section.
 fn paint_highlight(
     painter: &Painter,
     id: Id,
@@ -768,16 +765,9 @@ fn paint_highlight(
     origin: f32,
     target: Option<(f32, f32)>,
     jump: bool,
-    color: Color32,
+    photo: bool,
 ) {
     let ctx = painter.ctx();
-    let now = ctx.input(|input| input.time);
-    #[derive(Clone, Copy)]
-    struct Slide {
-        from: (f32, f32),
-        to: (f32, f32),
-        started: f64,
-    }
     let opacity = motion::transition(
         ctx,
         id.with("shown"),
@@ -785,64 +775,51 @@ fn paint_highlight(
         if jump { 0.0 } else { HIGHLIGHT_FADE },
         HIGHLIGHT_CURVE,
     );
-    let previous = ctx.data(|data| data.get_temp::<Slide>(id));
-    let at = |slide: &Slide| {
-        let t = ((now - slide.started) as f32 / HIGHLIGHT_SLIDE).clamp(0.0, 1.0);
-        let eased = HIGHLIGHT_CURVE.at(t);
-        (
-            (
-                slide.from.0 + (slide.to.0 - slide.from.0) * eased,
-                slide.from.1 + (slide.to.1 - slide.from.1) * eased,
-            ),
-            t < 1.0,
-        )
+    let last_id = id.with("last");
+    let shown_target = match target {
+        Some((top, height)) => {
+            let target = HighlightTarget { top, height };
+            ctx.data_mut(|data| data.insert_temp(last_id, target));
+            Some(target)
+        }
+        None if opacity > 0.0 => ctx.data(|data| data.get_temp::<HighlightTarget>(last_id)),
+        None => {
+            ctx.data_mut(|data| data.remove::<HighlightTarget>(last_id));
+            None
+        }
     };
-    let slide = match (previous, target) {
-        (Some(slide), Some(to)) if slide.to == to => slide,
-        (Some(slide), Some(to)) if !jump => Slide {
-            from: at(&slide).0,
-            to,
-            started: now,
-        },
-        (_, Some(to)) => Slide {
-            from: to,
-            to,
-            started: now,
-        },
-        (Some(slide), None) => slide,
-        (None, None) => return,
-    };
-    ctx.data_mut(|data| data.insert_temp(id, slide));
-    let ((top, height), moving) = at(&slide);
-    if opacity <= 0.0 {
+    let origin = pos2(drawer.left() + HIGHLIGHT_INSET, origin);
+    let width = drawer.width() - 2.0 * HIGHLIGHT_INSET;
+    if opacity <= 0.0 || shown_target.is_none() {
+        let _ =
+            ListHighlight::new(id).paint(painter, origin, width, None, HighlightState::default());
         return;
     }
-    let palette = exo_ui::palette(ctx);
-    let rect = exo_ui::pixel_snap(Rect::from_min_size(
-        pos2(drawer.left() + HIGHLIGHT_INSET, origin + top),
-        vec2(drawer.width() - 2.0 * HIGHLIGHT_INSET, height),
-    ));
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(HIGHLIGHT_RADIUS),
-        color.gamma_multiply(opacity),
-    );
-    // `::before`, shown while the drawer has the keyboard, which it always has while open.
-    let bar = Rect::from_min_size(rect.min, vec2(BAR_WIDTH, rect.height()));
-    let corners = CornerRadius {
-        nw: HIGHLIGHT_RADIUS,
-        sw: HIGHLIGHT_RADIUS,
-        ne: 0,
-        se: 0,
+    let mut bar_painter = painter.clone();
+    bar_painter.multiply_opacity(opacity);
+    let mut bg_painter = bar_painter.clone();
+    let paint = |bg: &Painter| {
+        ListHighlight::new(id).paint(
+            bg,
+            origin,
+            width,
+            shown_target,
+            HighlightState {
+                focused: true,
+                jump,
+                ..HighlightState::default()
+            },
+        )
     };
-    painter.rect_filled(
-        bar,
-        corners,
-        palette.border_base_active.gamma_multiply(opacity),
-    );
-    if moving || (opacity < 1.0 && target.is_some()) {
-        ctx.request_repaint();
-    }
+    // Over Inbox Zero's photo the drawer is translucent dark with white text, so keep the
+    // highlight dark and subtle rather than painting Snow's light tint behind white text.
+    let bar = if photo {
+        bg_painter.multiply_opacity(0.25);
+        exo_ui::with_theme(ctx, Theme::Carbon, || paint(&bg_painter))
+    } else {
+        paint(&bg_painter)
+    };
+    bar.paint(&bar_painter);
 }
 
 /// The Inbox row's `Important • Other` after its name: 12px after it, its dot with 1px either
@@ -947,8 +924,6 @@ struct Inks {
     count: Color32,
     /// The line between the folders and the labels.
     divider: Color32,
-    /// The cursor's highlight.
-    highlight: Color32,
     /// The account's caret.
     caret: Color32,
     /// A folder's `G then {key}` caps.
@@ -966,7 +941,6 @@ impl Inks {
                 dot: white(0.55),
                 count: white(0.4),
                 divider: white(0.09),
-                highlight: Color32::from_black_alpha(20),
                 caret: white(0.4),
                 keycaps: KeycapColors {
                     background: white(0.15),
@@ -989,7 +963,6 @@ impl Inks {
                 Theme::Snow => Color32::from_rgb(0xed, 0xed, 0xed),
                 Theme::Carbon => Color32::from_rgb(0x5f, 0x61, 0x65),
             },
-            highlight: palette.background_brand_subdued,
             caret: palette.icon_base_default,
             // The caps' `then` is in the subdued text color.
             keycaps: KeycapColors {

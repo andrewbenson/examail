@@ -1,4 +1,4 @@
-//! Autocorrect and autocomplete in compose, end to end on gmail-mock: the palette's toggles and
+//! Autocorrect and autocomplete in compose, end to end on mock-servers: the palette's toggles and
 //! their hints, a reply corrected as it's typed, `Learn` from the suggestion pill, Tab taking
 //! ghost text, and the Autocorrect dialog.
 

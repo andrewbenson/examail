@@ -96,7 +96,7 @@ unsafe extern "C-unwind" fn key_down(view: &AnyObject, sel: Sel, event: &NSEvent
     if let Some(keystroke) = paste_without_text(event) {
         LAUNCHER.with(|cell| {
             if let Some(launcher) = cell.get() {
-                launcher.keystroke(keystroke);
+                launcher.keystroke_without_text(keystroke);
             }
         });
     }
@@ -106,7 +106,9 @@ unsafe extern "C-unwind" fn key_down(view: &AnyObject, sel: Sel, event: &NSEvent
 /// types no Latin letter), while the clipboard holds no text. egui-winit hands such a keystroke on
 /// as nothing.
 fn paste_without_text(event: &NSEvent) -> Option<super::menu::Keystroke> {
-    use objc2_app_kit::NSEventModifierFlags;
+    use objc2_app_kit::{NSEventModifierFlags, NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSArray;
+
     /// `kVK_ANSI_V`.
     const V: u16 = 9;
     let flags = event.modifierFlags();
@@ -124,10 +126,15 @@ fn paste_without_text(event: &NSEvent) -> Option<super::menu::Keystroke> {
     {
         return None;
     }
-    let text = arboard::Clipboard::new()
-        .and_then(|mut clipboard| clipboard.get_text())
-        .unwrap_or_default();
-    if !text.is_empty() {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    // SAFETY: AppKit's pasteboard type constant, read only.
+    let string_type = unsafe { NSPasteboardTypeString };
+    let wanted = NSArray::from_slice(&[string_type]);
+    let has_text = pasteboard.availableTypeFromArray(&wanted).is_some()
+        && pasteboard
+            .stringForType(string_type)
+            .is_some_and(|text| !text.is_empty());
+    if has_text {
         return None;
     }
     Some(if flags.contains(NSEventModifierFlags::Shift) {

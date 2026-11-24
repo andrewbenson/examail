@@ -1,4 +1,4 @@
-//! Reading a conversation end to end on gmail-mock: Open Links & Attachments (`⌘O`), replies
+//! Reading a conversation end to end on mock-servers: Open Links & Attachments (`⌘O`), replies
 //! that quote a selection, the Bcc reply-all warning, the palette's Google apps rows and View
 //! Raw Email Data (`|`). Links never reach a browser. The tests read what the app asked egui to
 //! open.

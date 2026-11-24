@@ -291,39 +291,36 @@ impl Content {
                         pairs
                             .iter()
                             .find(|(x, y)| s == x || s == y)
-                            .map(|(x, _)| x.clone())
+                            .map(|(x, _)| x.as_str())
                     };
                     canonical(a).is_some() && canonical(a) == canonical(b)
                 }
         };
-        let mut index = 0;
-        while index < haystack.len() {
-            while index < haystack.len() && !haystack[index].ends_with(pattern[0]) {
-                index += 1;
-            }
-            if index == haystack.len() {
-                break;
-            }
-            let mut matched = 1;
-            while matched < pattern.len()
-                && haystack
-                    .get(index + matched)
-                    .is_some_and(|piece| equivalent(piece, pattern[matched]))
-            {
-                matched += 1;
-            }
-            if matched == pattern.len() {
-                let before: usize = haystack[..index].iter().map(|p| p.len()).sum();
-                let start = before + haystack[index].rfind(pattern[0]).unwrap_or(0);
-                let mut end = start + pattern[0].len();
-                for piece in &haystack[index + 1..index + matched] {
-                    end += piece.len();
-                }
-                return (end <= limit).then_some(Range { start, end });
-            }
-            index += 1;
+        if pattern.len() < 3 || haystack.len() < pattern.len() {
+            return None;
         }
-        None
+        let last_part = pattern.len() - 1;
+        let mut last = None;
+        let mut before = 0;
+        for index in 0..=haystack.len() - pattern.len() {
+            if haystack[index].ends_with(pattern[0])
+                && (1..last_part)
+                    .all(|offset| equivalent(haystack[index + offset], pattern[offset]))
+                && haystack[index + last_part].starts_with(pattern[last_part])
+            {
+                let start = before + haystack[index].len() - pattern[0].len();
+                let middle: usize = haystack[index + 1..index + last_part]
+                    .iter()
+                    .map(|piece| piece.len())
+                    .sum();
+                let end = start + pattern[0].len() + middle + pattern[last_part].len();
+                if end <= limit {
+                    last = Some(Range { start, end });
+                }
+            }
+            before += haystack[index].len();
+        }
+        last
     }
 
     /// `range` grown backwards by `text`'s clean length.
@@ -696,7 +693,9 @@ pub(crate) fn is_empty_image(node: &NodeRef) -> bool {
     });
     dom::attr(node, "src")
         .filter(|src| !src.is_empty())
-        .is_some_and(|src| SPACER.is_match(&src) || pixels::is_read_status_pixel(node))
+        .is_some_and(|src| {
+            src == pixels::BLANK_GIF || SPACER.is_match(&src) || pixels::is_read_status_pixel(node)
+        })
 }
 
 /// Links that look like buttons.
@@ -821,5 +820,44 @@ mod tests {
         let body = dom::body(&document).unwrap();
         trim(&body);
         assert_eq!(dom::inner_html(&body), "<p>text</p>");
+    }
+
+    #[test]
+    fn last_range_with_equivalences_finds_last_match_and_prefix_of_trailing_chunk() {
+        let equivalences = vec![("<pic.png>".to_owned(), REPLACED.to_string())];
+        // Both occurrences have trailing text after "attached." and the second is the real quote.
+        let text = content(
+            "<div>See &lt;pic.png&gt; attached. (yes)</div>\
+             <div>On Mon wrote:</div>\
+             <div>See &lt;pic.png&gt; attached. -- Footer</div>",
+        );
+        let needle = format!("See {REPLACED} attached.");
+        let last = text
+            .last_range_containing(&needle, None, &equivalences)
+            .expect("should match trailing chunk prefix");
+        assert_eq!(
+            &text.clean_string()[last.start..last.end],
+            "See<pic.png>attached."
+        );
+        assert!(
+            text.clean_string()[..last.start].ends_with("OnMonwrote:"),
+            "must return the last match, not the first: {}",
+            &text.clean_string()[..last.start]
+        );
+        assert_eq!(&text.clean_string()[last.end..], "--Footer");
+
+        // Respecting `before` returns the earlier match whose end <= limit.
+        let before = Range {
+            start: last.start,
+            end: text.len(),
+        };
+        let earlier = text
+            .last_range_containing(&needle, Some(before), &equivalences)
+            .expect("should match earlier occurrence before limit");
+        assert_eq!(earlier.start, 0);
+        assert_eq!(
+            &text.clean_string()[earlier.start..earlier.end],
+            "See<pic.png>attached."
+        );
     }
 }

@@ -12,7 +12,7 @@ use jiff::{
 use crate::{BoxShadow, Family, Font, IconButton, TextStyle, Theme};
 
 /// The popup: 316×256, `padding: 16px 12px`, with 4px corners.
-pub const DATE_PICKER_SIZE: Vec2 = vec2(316.0, 256.0);
+pub(crate) const DATE_PICKER_SIZE: Vec2 = vec2(316.0, 256.0);
 /// The popup hangs 6px below the input's box and 24px left of it.
 pub const DATE_PICKER_OFFSET: Vec2 = vec2(-24.0, 6.0);
 const PADDING: Vec2 = vec2(12.0, 16.0);
@@ -121,6 +121,38 @@ impl DateInput {
         }
     }
 
+    /// Opens the month popup on `self.parsed`, or `fallback` when nothing is parsed yet.
+    pub fn open_month(&mut self, fallback: Date) {
+        self.month = Some(self.parsed.unwrap_or(fallback).first_of_month());
+    }
+
+    /// Paints the tethered [`DatePicker`] popup while `self.month` is `Some`, updating the stored
+    /// month when a navigation chevron is clicked.
+    pub fn show_popup(
+        &mut self,
+        ctx: &egui::Context,
+        id: Id,
+        anchor_bottom_left: Pos2,
+        today: Date,
+        min: Option<Date>,
+        week_start: Weekday,
+    ) -> Option<DatePick> {
+        let mut month = self.month?;
+        let pick = DatePicker {
+            id,
+            month: &mut month,
+            selected: self.parsed,
+            today,
+            min,
+            week_start,
+        }
+        .show(ctx, anchor_bottom_left + DATE_PICKER_OFFSET);
+        if pick == Some(DatePick::MonthChanged) {
+            self.month = Some(month);
+        }
+        pick
+    }
+
     /// The input as typed changed to `text`. It parses against `reference` (the field's date, or
     /// today), and is wrong when it's not a date or is before `min`. Returns whether the field was
     /// emptied while `nullable`.
@@ -178,9 +210,12 @@ pub fn parse_date(text: &str, reference: Date, today: Date) -> Option<Date> {
     if let [day] = words[..]
         && let Some(weekday) = weekday(day)
     {
-        let date = reference - i64::from(reference.weekday().to_sunday_zero_offset()).days()
-            + i64::from(weekday.to_sunday_zero_offset()).days();
-        return Some(if past(date) { date + 7.days() } else { date });
+        let date = in_week(reference, weekday)?;
+        return Some(if past(date) {
+            date.checked_add(7.days()).ok()?
+        } else {
+            date
+        });
     }
     if let Some(date) = month_day(&words, reference.year()) {
         return Some(if past(date) {
@@ -245,6 +280,9 @@ fn in_week(date: Date, weekday: Weekday) -> Option<Date> {
 
 /// A number from 1 to `max`.
 fn number(text: &str, max: i8) -> Option<i8> {
+    if !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     text.parse::<i8>()
         .ok()
         .filter(|value| (1..=max).contains(value))
@@ -252,6 +290,9 @@ fn number(text: &str, max: i8) -> Option<i8> {
 
 /// `yy` (this century) or `yyyy`.
 fn full_year(text: &str) -> Option<i16> {
+    if !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let year: i16 = text.parse().ok()?;
     match text.len() {
         2 => Some(2000 + year),
@@ -393,10 +434,18 @@ impl DatePicker<'_> {
                         None,
                     );
                 }
-                let lead = (first.weekday().to_sunday_zero_offset() - first_column).rem_euclid(7);
-                let start = first - i64::from(lead).days();
-                for index in 0..42 {
-                    let day = start + i64::from(index).days();
+                let lead = i64::from(
+                    (first.weekday().to_sunday_zero_offset() - first_column).rem_euclid(7),
+                );
+                for index in 0..42i64 {
+                    let offset = index - lead;
+                    let Ok(day) = (if offset < 0 {
+                        first.checked_sub((-offset).days())
+                    } else {
+                        first.checked_add(offset.days())
+                    }) else {
+                        continue;
+                    };
                     let (row, column) = (index / 7, index % 7);
                     let cell = Rect::from_min_size(
                         origin
@@ -465,6 +514,204 @@ impl DatePicker<'_> {
                 event
             })
             .inner
+    }
+}
+
+/// Visual metrics and colors of a content-sized [`DateField`].
+#[derive(Clone, Copy, Debug)]
+pub struct DateFieldStyle {
+    /// Text style for the date string.
+    pub text: TextStyle,
+    /// Text style for an empty field's placeholder.
+    pub placeholder: TextStyle,
+    /// Minimum width of the field.
+    pub min_width: f32,
+    /// Maximum width of the field (`f32::INFINITY` when unconstrained).
+    pub max_width: f32,
+    /// Foreground color of the date text.
+    pub ink: Color32,
+    /// Foreground color of the placeholder text.
+    pub placeholder_ink: Color32,
+    /// Selection highlight fill.
+    pub selection: Color32,
+    /// Unfocused rule `(gap_below_line, thickness, color)`, or `None` when unfocused fields show no
+    /// rule.
+    pub unfocused_rule: Option<(f32, f32, Color32)>,
+    /// Focused rule `(gap_below_line, thickness, color)`.
+    pub focused_rule: (f32, f32, Color32),
+    /// Error rule color (`input.error`).
+    pub error_color: Color32,
+    /// Distance below `line.bottom()` to the bottom-left anchor of the [`DatePicker`] popup.
+    pub popup_anchor_below: f32,
+}
+
+/// Outcome of drawing a [`DateField`] for one frame.
+#[derive(Clone, Copy, Debug)]
+pub struct DateFieldOutput {
+    /// Measured width of the input this frame.
+    pub width: f32,
+    /// Whether the underlying `TextEdit` currently holds egui focus.
+    pub has_focus: bool,
+    /// Whether the `TextEdit` gained focus this frame.
+    pub gained_focus: bool,
+    /// Whether the `TextEdit` lost focus this frame.
+    pub lost_focus: bool,
+    /// Whether the input or its bottom padding/rule hit box was clicked.
+    pub clicked: bool,
+    /// Whether `input.text` was edited this frame.
+    pub text_changed: bool,
+    /// What happened in the open [`DatePicker`] popup, if any.
+    pub pick: Option<DatePick>,
+}
+
+/// Shared content-sized date text input, bottom rule, and tethered [`DatePicker`] popup (used by
+/// Out of Office and Calendar `when_edit`).
+#[must_use]
+pub struct DateField<'a> {
+    pub id: Id,
+    pub input: &'a mut DateInput,
+    pub style: DateFieldStyle,
+    pub placeholder: &'a str,
+    pub rule_focused: bool,
+    pub show_popup: bool,
+    pub disabled: bool,
+    pub extend_hit_to_rule: bool,
+    pub today: Date,
+    pub min: Option<Date>,
+    pub week_start: Weekday,
+}
+
+impl DateField<'_> {
+    /// Content-sized width of the field for its current text or placeholder.
+    pub fn width(&self, ctx: &egui::Context) -> f32 {
+        let raw = if self.input.text.is_empty() && !self.placeholder.is_empty() {
+            self.style.placeholder.width(ctx, self.placeholder)
+        } else {
+            self.style.text.width(ctx, &self.input.text)
+        };
+        raw.clamp(self.style.min_width, self.style.max_width)
+    }
+
+    /// Paints the date field at `at` using [`crate::text_field`].
+    pub fn show(self, ui: &mut egui::Ui, at: Pos2) -> DateFieldOutput {
+        self.show_with(ui, at, crate::text_field)
+    }
+
+    /// Paints the date field at `at` using `paint_field` (for example, a spellchecked text field).
+    pub fn show_with(
+        self,
+        ui: &mut egui::Ui,
+        at: Pos2,
+        paint_field: impl FnOnce(
+            &mut egui::Ui,
+            Id,
+            &mut String,
+            Rect,
+            &TextStyle,
+            Color32,
+            Color32,
+        ) -> egui::Response,
+    ) -> DateFieldOutput {
+        let width = self.width(ui.ctx());
+        let line = Rect::from_min_size(at, vec2(width, self.style.text.line_height));
+        if self.input.text.is_empty() && !self.placeholder.is_empty() {
+            self.style.placeholder.paint_line(
+                ui.painter(),
+                line.min,
+                self.placeholder,
+                self.style.placeholder_ink,
+                None,
+            );
+        }
+
+        let mut has_focus = false;
+        let mut gained_focus = false;
+        let mut lost_focus = false;
+        let mut clicked = false;
+        let mut text_changed = false;
+
+        if self.disabled {
+            self.style.text.paint_line(
+                ui.painter(),
+                line.min,
+                &self.input.text,
+                self.style.ink,
+                None,
+            );
+        } else {
+            let before = self.input.text.clone();
+            let response = paint_field(
+                ui,
+                self.id,
+                &mut self.input.text,
+                line,
+                &self.style.text,
+                self.style.ink,
+                self.style.selection,
+            );
+            has_focus = response.has_focus();
+            gained_focus = response.gained_focus();
+            lost_focus = response.lost_focus();
+            clicked = response.clicked();
+            text_changed = self.input.text != before;
+
+            if self.extend_hit_to_rule && self.style.popup_anchor_below > 0.0 {
+                let hit = Rect::from_min_max(
+                    pos2(line.left(), line.bottom()),
+                    pos2(line.right(), line.bottom() + self.style.popup_anchor_below),
+                );
+                let pointer = ui
+                    .interact(hit, self.id.with("hit"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::Text);
+                clicked |= pointer.clicked();
+            }
+        }
+
+        let rule_spec = if self.rule_focused {
+            Some(self.style.focused_rule)
+        } else if self.input.error {
+            Some(self.style.unfocused_rule.unwrap_or(self.style.focused_rule))
+        } else {
+            self.style.unfocused_rule
+        };
+        if let Some((gap, thickness, base_color)) = rule_spec {
+            let color = if self.input.error {
+                self.style.error_color
+            } else if self.rule_focused {
+                self.style.focused_rule.2
+            } else {
+                base_color
+            };
+            let rule = Rect::from_min_size(
+                pos2(line.left(), line.bottom() + gap),
+                vec2(width, thickness),
+            );
+            ui.painter()
+                .rect_filled(crate::pixel_snap(rule), 0.0, color);
+        }
+
+        let pick = if self.show_popup && !self.disabled {
+            self.input.show_popup(
+                ui.ctx(),
+                self.id.with("popup"),
+                pos2(line.left(), line.bottom() + self.style.popup_anchor_below),
+                self.today,
+                self.min,
+                self.week_start,
+            )
+        } else {
+            None
+        };
+
+        DateFieldOutput {
+            width,
+            has_focus,
+            gained_focus,
+            lost_focus,
+            clicked,
+            text_changed,
+            pick,
+        }
     }
 }
 
@@ -555,5 +802,187 @@ mod tests {
             input.typed(date(2026, 11, 26), TODAY, Some(TODAY), true),
             "a last day can be emptied"
         );
+    }
+
+    #[test]
+    fn signed_years_and_numbers_are_rejected() {
+        let reference = date(2026, 11, 26);
+        for text in [
+            "1/5/-100",
+            "1/5/-5",
+            "1/5/+5",
+            "1/5/+100",
+            "Nov 5 -100",
+            "Nov 5 -5",
+            "Nov 5 +5",
+            "-100-01-05",
+            "+2026-01-05",
+            "+1/+5/2026",
+        ] {
+            assert_eq!(parse_date(text, reference, TODAY), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn extreme_year_boundaries_do_not_overflow_picker_or_weekday_parse() {
+        let max_day = date(9999, 12, 15);
+        assert_eq!(
+            parse_date("9999-12-15", max_day, TODAY),
+            Some(max_day),
+            "9999-12-15 parses cleanly"
+        );
+        // 9999-12-31 is a Friday; Saturday in its week and a past weekday shifted +7d overflow.
+        let last_day = date(9999, 12, 31);
+        assert_eq!(parse_date("saturday", last_day, last_day), None);
+        assert_eq!(parse_date("sunday", last_day, last_day), None);
+        assert_eq!(parse_date("friday", last_day, last_day), Some(last_day));
+
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("system fonts");
+        for extreme in [max_day, date(-9999, 1, 15)] {
+            let mut month = extreme.first_of_month();
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let pick = DatePicker {
+                    id: Id::new(("extreme-picker", extreme.year())),
+                    month: &mut month,
+                    selected: Some(extreme),
+                    today: extreme,
+                    min: None,
+                    week_start: Weekday::Sunday,
+                }
+                .show(ui.ctx(), pos2(20.0, 20.0));
+                assert_eq!(pick, None);
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn extend_hit_to_rule_leaves_text_edit_interactive_and_clicks_below_line() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("system fonts");
+        let id = Id::new("date-field-hit-test");
+        let at = pos2(40.0, 40.0);
+        let style = DateFieldStyle {
+            text: TextStyle::new(Font::new(Family::Sans, 400), 13.0, 20.0),
+            placeholder: TextStyle::new(Font::new(Family::Sans, 400), 13.0, 20.0),
+            min_width: 100.0,
+            max_width: 200.0,
+            ink: Color32::BLACK,
+            placeholder_ink: Color32::GRAY,
+            selection: Color32::LIGHT_BLUE,
+            unfocused_rule: Some((8.0, 1.0, Color32::GRAY)),
+            focused_rule: (7.0, 2.0, Color32::BLUE),
+            error_color: Color32::RED,
+            popup_anchor_below: 9.0,
+        };
+        let mut input = DateInput::showing(Some(date(2026, 11, 26)), TODAY);
+        let run = |input: &mut DateInput, events: Vec<egui::Event>| -> DateFieldOutput {
+            let mut out = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    out = Some(
+                        DateField {
+                            id,
+                            input,
+                            style,
+                            placeholder: "",
+                            rule_focused: false,
+                            show_popup: false,
+                            disabled: false,
+                            extend_hit_to_rule: true,
+                            today: TODAY,
+                            min: None,
+                            week_start: Weekday::Sunday,
+                        }
+                        .show(ui, at),
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+            out.expect("field ran")
+        };
+
+        // Prime layout.
+        let _ = run(&mut input, vec![]);
+
+        // Click inside `line` (y = 50): must reach `TextEdit` (focus + click), not be swallowed.
+        let on_line = pos2(at.x + 25.0, at.y + 10.0);
+        let _ = run(
+            &mut input,
+            vec![
+                egui::Event::PointerMoved(on_line),
+                egui::Event::PointerButton {
+                    pos: on_line,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let out = run(
+            &mut input,
+            vec![egui::Event::PointerButton {
+                pos: on_line,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(out.has_focus, "clicking inside line focuses TextEdit");
+        assert!(out.clicked, "clicking inside line reports clicked");
+
+        // Right-click inside `line`: must reach `text_field` and open the editable field menu.
+        let _ = run(
+            &mut input,
+            vec![egui::Event::PointerButton {
+                pos: on_line,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let _ = run(
+            &mut input,
+            vec![egui::Event::PointerButton {
+                pos: on_line,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            crate::take_field_menu(&ctx, Some(id)).is_some(),
+            "right-click inside line reaches TextEdit"
+        );
+
+        // Click in the strip below `line` (y = 64, between line.bottom=60 and rule=69).
+        let below_line = pos2(at.x + 25.0, at.y + style.text.line_height + 4.0);
+        let _ = run(
+            &mut input,
+            vec![
+                egui::Event::PointerMoved(below_line),
+                egui::Event::PointerButton {
+                    pos: below_line,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let out = run(
+            &mut input,
+            vec![egui::Event::PointerButton {
+                pos: below_line,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(out.clicked, "clicking strip below line reports clicked");
     }
 }

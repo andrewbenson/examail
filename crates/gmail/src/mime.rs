@@ -9,11 +9,12 @@ use mail_builder::headers::content_type::ContentType;
 use mail_builder::headers::message_id::MessageId;
 use mail_builder::headers::raw::Raw;
 use mail_builder::mime::{BodyPart, MimePart};
+use serde::{Deserialize, Serialize};
 
 use crate::model::Message;
 
 /// A name and address, as in `From: Ada Lovelace <ada@example.com>`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mailbox {
     /// Display name.
     pub name: Option<String>,
@@ -38,18 +39,69 @@ impl Mailbox {
         }
     }
 
-    /// Parses `Ada Lovelace <ada@example.com>`, `"Lovelace, Ada" <ada@example.com>` or a bare
-    /// `ada@example.com`, as found in `From:`/`To:` header values.
+    /// Parses `Ada Lovelace <ada@example.com>`, `"Lovelace, Ada" <ada@example.com>`,
+    /// `"Ada" <ada@example.com> (via Docs)`, or a bare `ada@example.com`, as found in
+    /// `From:`/`To:` header values.
     #[must_use]
     pub fn parse(text: &str) -> Self {
-        match text.rsplit_once('<') {
-            Some((name, address)) => Self {
-                name: Some(name.trim().trim_matches('"').replace("\\\"", "\""))
-                    .filter(|name| !name.is_empty()),
-                email: address.trim_end_matches('>').trim().to_owned(),
-            },
-            None => Self::address(text.trim()),
+        if let Some((angle_start, angle_end)) = find_angle_addr(text) {
+            Self {
+                name: parse_display_name(&text[..angle_start]),
+                email: text[angle_start + 1..angle_end].trim().to_owned(),
+            }
+        } else {
+            Self::address(strip_comments(text).trim())
         }
+    }
+
+    /// Splits an RFC 5322 address-list header (`To:`, `Cc:`, ...) on commas outside quoted
+    /// strings `"..."`, nested comments `(...)` and angle brackets `<...>`, parses each entry
+    /// with [`Mailbox::parse`], and drops entries whose address contains no `@` (such as
+    /// `undisclosed-recipients:;`).
+    #[must_use]
+    pub fn parse_list(text: &str) -> Vec<Self> {
+        let mut mailboxes = Vec::new();
+        let mut start = 0;
+        let (mut quoted, mut escaped, mut angle) = (false, false, false);
+        let mut comment_depth = 0_usize;
+
+        for (idx, ch) in text.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' && (quoted || comment_depth > 0) {
+                escaped = true;
+                continue;
+            }
+            if comment_depth > 0 {
+                match ch {
+                    '(' => comment_depth += 1,
+                    ')' => comment_depth -= 1,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => quoted = !quoted,
+                '(' if !quoted && !angle => comment_depth = 1,
+                '<' if !quoted => angle = true,
+                '>' if !quoted => angle = false,
+                ',' if !quoted && !angle => {
+                    let mailbox = Self::parse(text[start..idx].trim());
+                    if mailbox.email.contains('@') {
+                        mailboxes.push(mailbox);
+                    }
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        let mailbox = Self::parse(text[start..].trim());
+        if mailbox.email.contains('@') {
+            mailboxes.push(mailbox);
+        }
+        mailboxes
     }
 
     /// mail-builder encodes the name but writes the address verbatim, and addresses come from
@@ -62,9 +114,18 @@ impl Mailbox {
 
 impl fmt::Display for Mailbox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SPECIALS: &[char] = &[
+            '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '.', '[', ']',
+        ];
         match &self.name {
-            Some(name) if name.contains([',', '"', '<', '>', '@', ';', ':']) => {
-                write!(f, "\"{}\" <{}>", name.replace('"', "\\\""), self.email)
+            Some(name) if name.is_empty() => f.write_str(&self.email),
+            Some(name)
+                if name.contains(SPECIALS)
+                    || name.starts_with(char::is_whitespace)
+                    || name.ends_with(char::is_whitespace) =>
+            {
+                let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+                write!(f, "\"{escaped}\" <{}>", self.email)
             }
             Some(name) => write!(f, "{name} <{}>", self.email),
             None => f.write_str(&self.email),
@@ -177,7 +238,9 @@ impl Email {
             builder = builder.header("Date", Raw::new(date));
         }
         for (name, value) in &self.headers {
-            builder = builder.header(name.as_str(), Raw::new(value.as_str()));
+            if is_valid_header_name(name) {
+                builder = builder.header(name.as_str(), Raw::new(one_line(value)));
+            }
         }
         builder
             .body(self.body())
@@ -188,17 +251,52 @@ impl Email {
     /// The MIME tree: alternatives, wrapped in `related` for inline images and in `mixed` for
     /// attachments. Boundaries are derived from the content, so output is deterministic.
     fn body(&self) -> MimePart<'_> {
-        let seed = fnv1a(
-            [
-                self.message_id.as_deref().unwrap_or_default(),
-                self.subject.as_str(),
-                self.text.as_deref().unwrap_or_default(),
-            ]
-            .concat()
-            .as_bytes(),
-        );
+        let mut seed_input = Vec::new();
+        for part in [
+            self.message_id.as_deref().unwrap_or_default(),
+            self.subject.as_str(),
+            self.text.as_deref().unwrap_or_default(),
+            self.html.as_deref().unwrap_or_default(),
+            self.calendar.as_deref().unwrap_or_default(),
+        ] {
+            seed_input.extend_from_slice(part.as_bytes());
+        }
+        for attachment in &self.attachments {
+            seed_input.extend_from_slice(attachment.filename.as_bytes());
+            seed_input.extend_from_slice(attachment.content_type.as_bytes());
+        }
+        let seed = fnv1a(&seed_input);
+        let collides = |boundary: &str| {
+            let needle = boundary.as_bytes();
+            let in_bytes = |haystack: &[u8]| {
+                haystack
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            };
+            self.text.as_deref().is_some_and(|s| in_bytes(s.as_bytes()))
+                || self.html.as_deref().is_some_and(|s| in_bytes(s.as_bytes()))
+                || self
+                    .calendar
+                    .as_deref()
+                    .is_some_and(|s| in_bytes(s.as_bytes()))
+                || self
+                    .attachments
+                    .iter()
+                    .any(|attachment| in_bytes(&attachment.data))
+        };
         let container = |kind: &str, depth: u64, parts: Vec<MimePart<'static>>| {
-            let boundary = format!("{:016x}{depth:04x}", seed.wrapping_add(depth));
+            let mut attempt = 0_u64;
+            let boundary = loop {
+                let candidate = if attempt == 0 {
+                    format!("{:016x}{depth:04x}", seed.wrapping_add(depth))
+                } else {
+                    format!("{:016x}{depth:04x}{attempt:04x}", seed.wrapping_add(depth))
+                };
+                if !collides(&candidate) {
+                    break candidate;
+                }
+                attempt += 1;
+            };
             MimePart::new(
                 ContentType::new(format!("multipart/{kind}")).attribute("boundary", boundary),
                 parts,
@@ -290,7 +388,9 @@ pub fn reply_subject(subject: &str) -> String {
     }
 }
 
-fn strip_angles(id: &str) -> String {
+/// Trims whitespace and enclosing `<` / `>` brackets from a Message-ID or Content-ID.
+#[must_use]
+pub fn strip_angles(id: &str) -> String {
     id.trim()
         .trim_start_matches('<')
         .trim_end_matches('>')
@@ -298,10 +398,177 @@ fn strip_angles(id: &str) -> String {
 }
 
 /// 64-bit FNV-1a, which is stable across Rust versions, unlike `DefaultHasher`.
-fn fnv1a(bytes: &[u8]) -> u64 {
+#[must_use]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// RFC 5322 `ftext`: printable US-ASCII except `:`.
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+}
+
+/// Finds the top-level `<addr-spec>` outside quotes and RFC 5322 comments.
+fn find_angle_addr(text: &str) -> Option<(usize, usize)> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut comment_depth = 0_usize;
+    let mut angle_start: Option<usize> = None;
+    let mut found: Option<(usize, usize)> = None;
+
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && (in_quotes || comment_depth > 0) {
+            escaped = true;
+            continue;
+        }
+        if comment_depth > 0 {
+            match ch {
+                '(' => comment_depth += 1,
+                ')' => comment_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        match ch {
+            '(' if angle_start.is_none() => comment_depth = 1,
+            '<' => angle_start = Some(idx),
+            '>' => {
+                if let Some(start) = angle_start.take() {
+                    found = Some((start, idx));
+                }
+            }
+            _ => {}
+        }
+    }
+    found.or_else(|| angle_start.map(|start| (start, text.len())))
+}
+
+/// Decodes an RFC 5322 display-name phrase, unquoting `\"` and `\\` and skipping comments.
+fn parse_display_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pending_ws = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut comment_depth = 0_usize;
+
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            if comment_depth == 0 {
+                if !in_quotes && !out.is_empty() && !pending_ws.is_empty() {
+                    out.push_str(&pending_ws);
+                }
+                pending_ws.clear();
+                out.push(ch);
+            }
+            continue;
+        }
+        if ch == '\\' && (in_quotes || comment_depth > 0) {
+            escaped = true;
+            continue;
+        }
+        if comment_depth > 0 {
+            match ch {
+                '(' => comment_depth += 1,
+                ')' => comment_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if in_quotes {
+            if ch == '"' {
+                in_quotes = false;
+            } else {
+                out.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                if !out.is_empty() && !pending_ws.is_empty() {
+                    out.push_str(&pending_ws);
+                }
+                pending_ws.clear();
+                in_quotes = true;
+            }
+            '(' => {
+                comment_depth = 1;
+                if !out.is_empty() && pending_ws.is_empty() {
+                    pending_ws.push(' ');
+                }
+            }
+            c if c.is_whitespace() => {
+                if !out.is_empty() {
+                    pending_ws.push(c);
+                }
+            }
+            c => {
+                if !out.is_empty() && !pending_ws.is_empty() {
+                    out.push_str(&pending_ws);
+                }
+                pending_ws.clear();
+                out.push(c);
+            }
+        }
+    }
+    if escaped && comment_depth == 0 {
+        out.push('\\');
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Strips top-level RFC 5322 `(...)` comments outside quoted strings.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut comment_depth = 0_usize;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            if comment_depth == 0 {
+                out.push(ch);
+            }
+            continue;
+        }
+        if ch == '\\' && (in_quotes || comment_depth > 0) {
+            escaped = true;
+            if comment_depth == 0 {
+                out.push(ch);
+            }
+            continue;
+        }
+        if comment_depth > 0 {
+            match ch {
+                '(' => comment_depth += 1,
+                ')' => comment_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                out.push(ch);
+            }
+            '(' if !in_quotes => comment_depth = 1,
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -367,10 +634,57 @@ mod tests {
         for mailbox in [
             Mailbox::new("Ada Lovelace", "ada@example.com"),
             Mailbox::new("Lovelace, Ada", "ada@example.com"),
+            Mailbox::new("Ada. L.", "ada@example.com"),
+            Mailbox::new("Ada (Countess) [Eng]", "ada@example.com"),
+            Mailbox::new(r#"Ada "Countess" \ Lovelace"#, "ada@example.com"),
+            Mailbox::new(r"Ada\", "ada@example.com"),
             Mailbox::address("ada@example.com"),
         ] {
-            assert_eq!(Mailbox::parse(&mailbox.to_string()), mailbox);
+            let formatted = mailbox.to_string();
+            assert_eq!(Mailbox::parse(&formatted), mailbox, "{formatted}");
         }
+        assert_eq!(
+            Mailbox::parse(r#""Ada. L." <ada@example.com>"#).to_string(),
+            r#""Ada. L." <ada@example.com>"#
+        );
+        assert_eq!(
+            Mailbox::parse(r#""Ada" <ada@x.com> (via Docs)"#),
+            Mailbox::new("Ada", "ada@x.com")
+        );
+        assert_eq!(
+            Mailbox::parse(r#"ada@x.com (via Docs)"#),
+            Mailbox::address("ada@x.com")
+        );
+        assert_eq!(
+            Mailbox::parse(r#""Ada \"The\" \\ Boss" <ada@x.com> (via <Docs>)"#),
+            Mailbox::new(r#"Ada "The" \ Boss"#, "ada@x.com")
+        );
+    }
+
+    #[test]
+    fn mailbox_parse_list_handles_quotes_comments_angles_and_groups() {
+        let header = concat!(
+            r#""Lovelace, Ada" <ada@example.com>, "#,
+            r#""Ada \"The, Boss\" \\" <boss@example.com> (Team, (Lead, Core\))), "#,
+            r#"bob@example.com (via Docs, (internal, note\))), "#,
+            r#"<"first,last"@example.com>, "#,
+            r#"undisclosed-recipients:;, "#,
+            r#""fake@name" <>, "#,
+            r#" , "#,
+            r#"Carol <carol@example.com>,"#
+        );
+        assert_eq!(
+            Mailbox::parse_list(header),
+            vec![
+                Mailbox::new("Lovelace, Ada", "ada@example.com"),
+                Mailbox::new(r#"Ada "The, Boss" \"#, "boss@example.com"),
+                Mailbox::address("bob@example.com"),
+                Mailbox::address(r#""first,last"@example.com"#),
+                Mailbox::new("Carol", "carol@example.com"),
+            ]
+        );
+        assert!(Mailbox::parse_list("").is_empty());
+        assert!(Mailbox::parse_list("undisclosed-recipients:;").is_empty());
     }
 
     #[test]
@@ -449,5 +763,95 @@ mod tests {
             "{raw}"
         );
         assert!(raw.contains("notesBcc: x@evil.com.txt"), "{raw}");
+    }
+
+    #[test]
+    fn custom_headers_reject_invalid_names_and_strip_control_chars() {
+        let email = Email {
+            subject: "Hi".into(),
+            text: Some("Body".into()),
+            headers: vec![
+                (
+                    "X-Valid".into(),
+                    "ok\r\nBcc: eve@evil.com\n\r\nFakeBody".into(),
+                ),
+                ("Bad Name".into(), "1".into()),
+                ("Bad:Name".into(), "1".into()),
+                ("Bad\r\nBcc".into(), "eve@evil.com".into()),
+                (String::new(), "1".into()),
+            ],
+            ..Email::default()
+        };
+        let raw = String::from_utf8(email.to_rfc822()).expect("7-bit");
+        let head = raw.split("\r\n\r\n").next().expect("a header block");
+        assert!(
+            head.lines()
+                .any(|line| line == "X-Valid: okBcc: eve@evil.comFakeBody"),
+            "{head}"
+        );
+        assert!(
+            !head.split(['\r', '\n']).any(|line| {
+                ["Bcc:", "Bad", "FakeBody"]
+                    .iter()
+                    .any(|bad| line.trim_start().starts_with(bad))
+            }),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn boundary_avoids_collisions_in_body_and_attachments() {
+        let first = Email {
+            subject: "Test".into(),
+            text: Some("plain".into()),
+            html: Some("<p>html</p>".into()),
+            ..Email::default()
+        };
+        let first_raw = String::from_utf8(first.to_rfc822()).expect("utf8");
+        let extract_boundary = |raw: &str| -> String {
+            let after = raw.split("boundary=").nth(1).expect("boundary");
+            let line = after.lines().next().expect("line").trim();
+            line.trim_matches('"').to_owned()
+        };
+        let b1 = extract_boundary(&first_raw);
+
+        // Changing HTML changes the boundary seed even when text is identical.
+        let different_html = Email {
+            html: Some("<p>different</p>".into()),
+            ..first.clone()
+        };
+        assert_ne!(
+            extract_boundary(&String::from_utf8(different_html.to_rfc822()).expect("utf8")),
+            b1
+        );
+
+        // Compute the exact seed for a body containing a specific string doesn't collide,
+        // and test direct collision with an attachment's bytes (which don't change the seed!).
+        let with_att = Email {
+            subject: "Att".into(),
+            text: Some("body".into()),
+            attachments: vec![Attachment {
+                filename: "a.bin".into(),
+                content_type: "application/octet-stream".into(),
+                data: b"initial".to_vec(),
+                content_id: None,
+            }],
+            ..Email::default()
+        };
+        let default_boundary =
+            extract_boundary(&String::from_utf8(with_att.to_rfc822()).expect("utf8"));
+        let colliding = Email {
+            attachments: vec![Attachment {
+                filename: "a.bin".into(),
+                content_type: "application/octet-stream".into(),
+                data: format!("--{default_boundary}--").into_bytes(),
+                content_id: None,
+            }],
+            ..with_att
+        };
+        let colliding_raw = String::from_utf8(colliding.to_rfc822()).expect("utf8");
+        let chosen = extract_boundary(&colliding_raw);
+        assert_ne!(chosen, default_boundary, "stepped past colliding boundary");
+        assert!(chosen.starts_with(&default_boundary));
     }
 }

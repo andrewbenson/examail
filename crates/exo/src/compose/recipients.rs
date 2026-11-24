@@ -6,29 +6,41 @@ use std::sync::LazyLock;
 use exo_store::Address;
 use regex::Regex;
 
-/// The shape of a valid address.
-static VALID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])$").expect("valid regex")
-});
+use crate::format::names;
+
 /// `"Name" <address>`.
 static NAMED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""?((?:[^\\"]|\\.)*)"?\s*<\s*([^<>]+@[^@<>]+)\s*>"#).expect("valid regex")
 });
-/// Name suffixes that keep a comma: `Smith, Jr` isn't `Jr Smith`.
-static SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i),\s?(Jr|Junior|Sr|Senior|CEO|CPA|CSPO|DACVS|DDS|DVM|Esq|Inc|Director|Founder|Co-?founder|J\.?D|LLC|MBA|M\.?D|M\.?Ed|MBA|PCC|Ph\.?D|Psy\.?D|R\.?N)[\s.]*").expect("valid regex")
-});
 static VIA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[ ](\||[Vv]ia|[Ff]rom) .*").expect("valid regex"));
-static TO_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^to:\s*").expect("valid regex"));
+/// A domain name: dot-separated labels of letters, digits and inner hyphens.
+static DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+        .expect("valid regex")
+});
+/// What reads as the start of an email address.
+static ADDRESS_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[a-z0-9!#$%&'*/=?^_`{|}~-]{1,20}(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]{1,20}){0,2}@?(?:[a-z0-9](?:[a-z0-9-]{0,20}[a-z0-9])?\.)?(?:[a-z0-9-]{0,20}[a-z0-9])?$")
+        .expect("valid regex")
+});
 
 /// Gmail's limit on recipients per message.
 pub(crate) const MAX_RECIPIENTS: usize = 100;
 
 /// A valid address: non-empty, at most 900 characters, and shaped like an address.
 pub(crate) fn is_valid(email: &str) -> bool {
-    !email.is_empty() && email.len() <= 900 && VALID.is_match(email)
+    !email.is_empty() && email.len() <= 900 && exo_mail::is_valid_email(email)
+}
+
+/// Whether `text` is a valid domain name (`example.com`, `sub.example-1.co`).
+pub(crate) fn is_valid_domain(text: &str) -> bool {
+    DOMAIN.is_match(text)
+}
+
+/// Whether `text` could be the start of an email address being typed.
+pub(crate) fn is_address_start(text: &str) -> bool {
+    ADDRESS_START.is_match(text)
 }
 
 /// The same address, ignoring case.
@@ -79,10 +91,7 @@ fn unescape(text: &str) -> String {
 /// is a suffix like `Jr`), and ` via …`, ` | …`, ` from …`, a trailing `(…)` or `,`, a leading
 /// `to:` and surrounding quotes go.
 pub(crate) fn sanitize_name(name: &str, strip_via: bool) -> String {
-    let mut name = match name.find(", ") {
-        Some(at) if !SUFFIX.is_match(name) => format!("{} {}", &name[at + 2..], &name[..at]),
-        _ => name.to_owned(),
-    };
+    let mut name = names::reverse_by_comma(name);
     if strip_via {
         name = VIA.replace(&name, "").into_owned();
     }
@@ -103,7 +112,7 @@ pub(crate) fn sanitize_name(name: &str, strip_via: bool) -> String {
     if let Some(cut) = cut {
         name.truncate(cut);
     }
-    let name = TO_PREFIX.replace(&name, "").into_owned();
+    let name = names::strip_to_prefix(&name);
     for (open, close) in [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
         if let Some(inner) = name.strip_prefix(open) {
             let inner = inner.strip_suffix(close).unwrap_or(inner);
@@ -112,7 +121,7 @@ pub(crate) fn sanitize_name(name: &str, strip_via: bool) -> String {
             }
         }
     }
-    name
+    name.to_owned()
 }
 
 /// A chip as text to edit, `Name <address>`. The name is quoted (with `"` and `\` escaped) unless
@@ -148,8 +157,18 @@ pub(crate) fn split_pasted(text: &str) -> Vec<String> {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut quoted = false;
+        let mut escaped = false;
         for ch in text.chars() {
+            if escaped {
+                escaped = false;
+                current.push(ch);
+                continue;
+            }
             match ch {
+                '\\' if quoted => {
+                    escaped = true;
+                    current.push(ch);
+                }
                 '"' => {
                     quoted = !quoted;
                     current.push(ch);
@@ -264,6 +283,19 @@ mod tests {
         assert_eq!(
             split_pasted("\"Lee, Ann\" <ann@x.com>, Bob <b@x.com>"),
             ["\"Lee, Ann\" <ann@x.com>", "Bob <b@x.com>"]
+        );
+        assert_eq!(
+            split_pasted(
+                "\"Ada \\\"Countess, Lovelace\\\"\" <ada@example.com>, Bob <b@example.com>"
+            ),
+            [
+                "\"Ada \\\"Countess, Lovelace\\\"\" <ada@example.com>",
+                "Bob <b@example.com>",
+            ]
+        );
+        assert_eq!(
+            parse("\"Ada \\\"Countess, Lovelace\\\"\" <ada@example.com>"),
+            named("Ada \"Countess, Lovelace\"", "ada@example.com")
         );
     }
 }

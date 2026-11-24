@@ -991,7 +991,7 @@ async fn a_cleared_store_gives_space_back_and_eviction_keeps_what_clearing_kept(
 
 #[tokio::test]
 async fn a_file_from_before_eviction_is_rebuilt_once_to_give_space_back() {
-    let server = gmail_mock::MockServer::start(gmail_mock::Config::default())
+    let server = mock_servers::MockServer::start(mock_servers::Config::default())
         .await
         .expect("the mock starts");
     let dir = support::TempDir::new();
@@ -1240,7 +1240,7 @@ impl Rng {
     }
 }
 
-/// A year of a busy inbox on gmail-mock with the fixture's bodies, then the default eviction.
+/// A year of a busy inbox on mock-servers with the fixture's bodies, then the default eviction.
 ///
 /// `cargo test --release -p exo-store --test evict -- --ignored --nocapture busy_year`
 #[tokio::test(flavor = "multi_thread")]
@@ -1257,7 +1257,7 @@ async fn a_busy_year_of_real_sized_mail() {
     year((13_000, 37_000)).await;
 }
 
-/// A year of a busy inbox on gmail-mock, delivered a day at a time with a sync after each, as
+/// A year of a busy inbox on mock-servers, delivered a day at a time with a sync after each, as
 /// Exo running every day would see it. Each day brings 25 new conversations and 25 replies in the
 /// inbox, 20 newsletters, 50 notifications that skip the inbox (20 of them follow-ups), and 15
 /// sent replies. Each day the inbox is cleared (Mark Done) and 3 conversations older than a month
@@ -1268,9 +1268,9 @@ async fn year(pad: (usize, usize)) {
     const DAYS: i64 = 365;
     let start = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * (DAYS + 1));
     let tz = jiff::tz::TimeZone::get("America/New_York").expect("a zone");
-    let config = gmail_mock::Config {
+    let config = mock_servers::Config {
         now: start.to_zoned(tz),
-        ..gmail_mock::Config::default()
+        ..mock_servers::Config::default()
     };
     let harness = Harness::start_with(config, options()).await;
     harness.sync_all().await;

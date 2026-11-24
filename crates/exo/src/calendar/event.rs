@@ -2,45 +2,226 @@
 //! Calendar's event and the account's calendar settings.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use exo_store::{Settings, StoredEvent};
 use exo_ui::CalendarColor;
 use gmail::calendar::{CalendarListEntry, Event as ApiEvent, EventDateTime};
 use jiff::{Timestamp, Zoned, civil::Date, tz::TimeZone};
+use regex::Regex;
 
-use crate::thread::invite::{Invite, Response};
+pub use crate::rsvp::Rsvp;
+use crate::thread::invite::Invite;
 
-/// An attendee's answer (`responseStatus`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rsvp {
-    NeedsAction,
-    Accepted,
-    Tentative,
-    Declined,
+/// A video call extracted from an event or `.ics` description (`Meet`, `Zoom`, or `Teams`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConferenceCall {
+    /// The row's short provider label (`"Meet"`, `"Zoom"`, or `"Teams"`).
+    pub label: &'static str,
+    pub url: String,
 }
 
-impl From<Rsvp> for Response {
-    fn from(answer: Rsvp) -> Self {
-        match answer {
-            Rsvp::NeedsAction => Response::NeedsAction,
-            Rsvp::Accepted => Response::Accepted,
-            Rsvp::Tentative => Response::Tentative,
-            Rsvp::Declined => Response::Declined,
+/// A resolved conference call ready for the event details popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedConference {
+    /// The entry point's label (`meet.google.com/abc-defg-hij`).
+    pub label: String,
+    /// Its link (a Meet link opens as `me`, with `authuser`), and the link as Calendar has it.
+    pub uri: String,
+    pub raw: String,
+    /// The copy tooltip's text.
+    pub copy: String,
+    pub join: &'static str,
+}
+
+static TEAMS_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([\n|]\s*)(.+?)<(https?://.+?)>").expect("valid regex"));
+static ANGLE_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<(https?://.+?)>").expect("valid regex"));
+static MEET_JOIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:^|\n)(?:Join|Join with Google Meet): (https?://(?:www\.)?meet\.google\.com/\S+)",
+    )
+    .expect("valid regex")
+});
+static MEET_BARE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}[^\s<>"')]*"#)
+        .expect("valid regex")
+});
+static ZOOM_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://(?:[a-zA-Z0-9-]+\.)?zoom\.us/(?:j|my|w)/[^\s<>"')]+"#)
+        .expect("valid regex")
+});
+static TEAMS_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://teams\.microsoft\.com/l/meetup-join/[^\s<>"')]+"#).expect("valid regex")
+});
+
+/// Rewrites `<url>` and Teams `text<url>` join lines into HTML `<a>` links and extracts the first
+/// `Meet`, `Teams`, or `Zoom` video call URL found in `description`.
+#[must_use]
+pub fn extract_conference_text(description: &str) -> (String, Option<ConferenceCall>) {
+    let mut text = description.to_owned();
+    let mut teams = None;
+    if description.contains("Microsoft Teams meeting") {
+        let trimmed = text.trim().trim_matches('_').to_owned();
+        if let Some(at) = trimmed.find("Microsoft Teams meeting") {
+            let tail = TEAMS_LINE.replace_all(&trimmed[at..], |found: &regex::Captures| {
+                if found[3].contains("teams.microsoft.com/l/meetup-join/") {
+                    teams = Some(found[3].to_owned());
+                }
+                format!("{}<a href=\"{}\">{}</a>", &found[1], &found[3], &found[2])
+            });
+            text = format!("{}{tail}", &trimmed[..at]);
         }
     }
+    let text = ANGLE_URL
+        .replace_all(&text, " <a href=\"$1\">$1</a>")
+        .into_owned();
+    let meet = description.contains("meet.google.com").then(|| {
+        MEET_JOIN
+            .captures(description)
+            .map(|found| found[1].to_owned())
+            .or_else(|| {
+                MEET_BARE
+                    .find(description)
+                    .map(|found| found.as_str().to_owned())
+            })
+    });
+    let teams = teams.or_else(|| {
+        description.contains("teams.microsoft.com").then(|| {
+            TEAMS_URL
+                .find(description)
+                .map(|found| found.as_str().to_owned())
+        })?
+    });
+    let zoom = description.contains("zoom.us").then(|| {
+        ZOOM_URL
+            .find(description)
+            .map(|found| found.as_str().to_owned())
+    });
+    let call = meet
+        .flatten()
+        .map(|url| ConferenceCall { label: "Meet", url })
+        .or_else(|| {
+            teams.map(|url| ConferenceCall {
+                label: "Teams",
+                url,
+            })
+        })
+        .or_else(|| {
+            zoom.flatten()
+                .map(|url| ConferenceCall { label: "Zoom", url })
+        });
+    (text, call)
 }
 
-impl Rsvp {
-    /// The answer Calendar's `responseStatus` names.
-    pub(super) fn parse(status: Option<&str>) -> Option<Self> {
-        Some(match status? {
-            "accepted" => Self::Accepted,
-            "tentative" => Self::Tentative,
-            "declined" => Self::Declined,
-            "needsAction" => Self::NeedsAction,
-            _ => return None,
-        })
+/// Returns the video entry-point URI on `source` (`hangoutLink` or `conferenceData` video entry).
+#[must_use]
+pub fn video_uri_of(source: &ApiEvent) -> Option<String> {
+    source.hangout_link.clone().or_else(|| {
+        let entries = source
+            .conference_data
+            .as_ref()?
+            .get("entryPoints")?
+            .as_array()?;
+        entries
+            .iter()
+            .find(|entry| {
+                entry.get("entryPointType").and_then(|kind| kind.as_str()) == Some("video")
+            })?
+            .get("uri")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
+/// Resolves an event's conference row from `conferenceData`, falling back to Meet/Zoom/Teams URLs
+/// embedded in `description` (such as `.ics` invites).
+#[must_use]
+pub fn conference_of(source: &ApiEvent, me: &str) -> Option<ResolvedConference> {
+    if let Some(data) = source.conference_data.as_ref()
+        && let Some(entries) = data.get("entryPoints").and_then(|v| v.as_array())
+        && let Some(entry) = entries
+            .iter()
+            .find(|entry| {
+                entry.get("entryPointType").and_then(|kind| kind.as_str()) == Some("video")
+            })
+            .or_else(|| entries.first())
+    {
+        let kind = entry.get("entryPointType")?.as_str()?;
+        let raw = entry.get("uri")?.as_str()?.to_owned();
+        let label = entry
+            .get("label")
+            .and_then(|label| label.as_str())
+            .map_or_else(
+                || raw.trim_start_matches("https://").to_owned(),
+                str::to_owned,
+            );
+        let solution = data.get("conferenceSolution");
+        let name = solution
+            .and_then(|solution| solution.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap_or_default();
+        let meet = solution
+            .and_then(|solution| solution.get("key"))
+            .and_then(|key| key.get("type"))
+            .and_then(|kind| kind.as_str())
+            == Some("hangoutsMeet")
+            || matches!(name, "Google Meet" | "Hangouts Meet");
+        let join = match (kind, name) {
+            ("video", "Microsoft Teams") => "Join Teams Call",
+            ("video", "Zoom Meeting") => "Join Zoom Call",
+            ("video", _) if meet => "Join Google Meet",
+            _ => "Join Meeting",
+        };
+        let web = crate::format::urls::web(&raw)?;
+        let (uri, copy) = if meet {
+            let mut link = url::Url::parse(&web).ok()?;
+            link.query_pairs_mut().append_pair("authuser", me);
+            (link.to_string(), label.clone())
+        } else {
+            (web.clone(), web)
+        };
+        return Some(ResolvedConference {
+            label,
+            uri,
+            raw,
+            copy,
+            join,
+        });
     }
+    let description = source.description.as_deref()?;
+    let (_, call) = extract_conference_text(description);
+    let call = call?;
+    let web = crate::format::urls::web(&call.url)?;
+    let (label, uri, copy, join) = match call.label {
+        "Meet" => {
+            let label = web.trim_start_matches("https://").to_owned();
+            let mut link = url::Url::parse(&web).ok()?;
+            link.query_pairs_mut().append_pair("authuser", me);
+            (label.clone(), link.to_string(), label, "Join Google Meet")
+        }
+        "Zoom" => (
+            web.trim_start_matches("https://").to_owned(),
+            web.clone(),
+            web,
+            "Join Zoom Call",
+        ),
+        "Teams" => (
+            "teams.microsoft.com/l/meetup-join/…".to_owned(),
+            web.clone(),
+            web,
+            "Join Teams Call",
+        ),
+        _ => return None,
+    };
+    Some(ResolvedConference {
+        label,
+        uri,
+        raw: call.url,
+        copy,
+        join,
+    })
 }
 
 /// How a block is drawn.
@@ -63,8 +244,10 @@ pub struct Event {
     pub title: String,
     pub start: Zoned,
     pub end: Zoned,
-    /// In the all-day row, because Calendar says it's all-day or it lasts a day or more.
+    /// True date-only all-day event (`EventDateTime.date` or `VALUE=DATE`).
     pub all_day: bool,
+    /// Placed in the grid's all-day header band (`all_day || duration >= 24 hours`).
+    pub span_row: bool,
     pub color: CalendarColor,
     /// My answer.
     pub rsvp: Option<Rsvp>,
@@ -91,6 +274,12 @@ pub struct Event {
 }
 
 impl Event {
+    /// Whether the event belongs in the calendar header's all-day band (`all_day` or `>= 24h`).
+    #[must_use]
+    pub const fn in_all_day_row(&self) -> bool {
+        self.span_row
+    }
+
     /// The `stored` event from `calendar`, for `me`, coloured by `colors` (each calendar's colour
     /// from the settings), its times in `tz`. `None` for an event without usable times.
     pub fn new(
@@ -103,8 +292,9 @@ impl Event {
         let event = &stored.event;
         let (start, all_day_start) = time(event.start.as_ref()?, tz)?;
         let (end, all_day_end) = time(event.end.as_ref()?, tz)?;
-        let all_day = (all_day_start && all_day_end)
-            || end.timestamp().duration_since(start.timestamp()).as_hours() >= 24;
+        let all_day = all_day_start && all_day_end;
+        let span_row =
+            all_day || end.timestamp().duration_since(start.timestamp()).as_hours() >= 24;
         let rsvp = my_attendance(event, me);
         let access = calendar.and_then(|calendar| calendar.access_role.as_deref());
         let private = matches!(
@@ -176,6 +366,7 @@ impl Event {
             start,
             end,
             all_day,
+            span_row,
             color,
             rsvp,
             busy,
@@ -197,16 +388,11 @@ impl Event {
             .attendees
             .iter()
             .find(|(_, email, _)| email.eq_ignore_ascii_case(me))
-            .map(|(_, _, response)| match response {
-                Response::Accepted => Rsvp::Accepted,
-                Response::Tentative => Rsvp::Tentative,
-                Response::Declined => Rsvp::Declined,
-                Response::NeedsAction => Rsvp::NeedsAction,
-            });
-        let (start, end) = (
-            invite.start.to_zoned(tz.clone()),
-            invite.end.to_zoned(tz.clone()),
-        );
+            .map(|(_, _, response)| *response);
+        let (start, end) = invite.zoned(tz);
+        let all_day = invite.all_day;
+        let span_row =
+            all_day || end.timestamp().duration_since(start.timestamp()).as_hours() >= 24;
         Self {
             key: format!("calendar-invite_{}", invite.uid),
             title: if invite.summary.is_empty() {
@@ -214,7 +400,8 @@ impl Event {
             } else {
                 invite.summary.clone()
             },
-            all_day: end.timestamp().duration_since(start.timestamp()).as_hours() >= 24,
+            all_day,
+            span_row,
             start,
             end,
             color,
@@ -240,12 +427,15 @@ impl Event {
         all_day: bool,
         color: CalendarColor,
     ) -> Self {
+        let span_row =
+            all_day || end.timestamp().duration_since(start.timestamp()).as_hours() >= 24;
         Self {
             key,
             title,
             start,
             end,
             all_day,
+            span_row,
             color,
             rsvp: None,
             busy: Rsvp::Accepted,
@@ -312,7 +502,7 @@ pub(crate) fn my_attendance(event: &ApiEvent, me: &str) -> Option<Rsvp> {
                     .is_some_and(|email| email.eq_ignore_ascii_case(me))
             })
         })?;
-    Rsvp::parse(mine.response_status.as_deref())
+    Rsvp::parse_opt(mine.response_status.as_deref())
 }
 
 /// An event's own colour, by Calendar's colour id.
@@ -460,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn a_day_long_timed_event_is_all_day() {
+    fn a_day_long_timed_event_uses_the_all_day_row_without_being_date_only() {
         let long = Event::new(
             &stored(timed(
                 "2026-12-09T09:00:00-05:00",
@@ -472,9 +662,38 @@ mod tests {
             &tz(),
         )
         .expect("event");
-        assert!(long.all_day);
+        assert!(
+            !long.all_day,
+            "not a date-only event for When/editing semantics"
+        );
+        assert!(
+            long.in_all_day_row(),
+            "placed in the header band because >= 24h"
+        );
         assert!(long.on("2026-12-10".parse().expect("date")));
         assert!(!long.on("2026-12-12".parse().expect("date")));
+    }
+
+    #[test]
+    fn extracts_meet_zoom_and_teams_calls() {
+        let (_, zoom) = extract_conference_text("Join Zoom: https://acme.zoom.us/j/91234567890");
+        assert_eq!(
+            zoom,
+            Some(ConferenceCall {
+                label: "Zoom",
+                url: "https://acme.zoom.us/j/91234567890".into(),
+            })
+        );
+        let from_desc = ApiEvent {
+            description: Some("Join with Google Meet: https://meet.google.com/abc-defg-hij".into()),
+            ..ApiEvent::default()
+        };
+        let resolved = conference_of(&from_desc, "maya@brightmoor.co").expect("resolved");
+        assert_eq!(resolved.join, "Join Google Meet");
+        assert_eq!(
+            resolved.uri,
+            "https://meet.google.com/abc-defg-hij?authuser=maya%40brightmoor.co"
+        );
     }
 
     #[test]

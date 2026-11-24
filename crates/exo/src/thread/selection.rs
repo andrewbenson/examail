@@ -48,7 +48,7 @@ impl ThreadView {
     /// The pointer over `href`, a `mailto:` link in a body, this frame. Hover intent shows the
     /// contact for the link's first address.
     pub(super) fn hover_mailto(&mut self, ctx: &Context, href: Option<String>) {
-        if let Some(href) = self.mailto_intent.update(ctx, href) {
+        if let Some(href) = self.hover.mailto_intent.update(ctx, href) {
             // Its first address.
             let address = crate::compose::mailto_fields(href).and_then(|fields| {
                 fields
@@ -56,7 +56,7 @@ impl ThreadView {
                     .into_iter()
                     .find(|address| !address.email.is_empty())
             });
-            self.contact =
+            self.hover.contact =
                 address.map(|address| Person::new(address.name.unwrap_or_default(), address.email));
         }
     }
@@ -67,7 +67,7 @@ impl ThreadView {
         let sent = self
             .message(id)?
             .date
-            .to_zoned(self.now.time_zone().clone());
+            .to_zoned(self.action.now.time_zone().clone());
         super::dates::resolve(text, &sent)
     }
 
@@ -83,6 +83,7 @@ impl ThreadView {
         actions: &mut Vec<Action>,
     ) {
         let over = self
+            .hover
             .hovered_body
             .clone()
             .and_then(|id| match bodies.hovered(&id) {
@@ -100,10 +101,10 @@ impl ThreadView {
             .as_ref()
             .filter(|(id, text, _)| self.date_on(id, text).is_some())
             .map(|(id, text, _)| (id.clone(), text.clone()));
-        if let Some((id, text)) = self.date_intent.update(ui.ctx(), target).cloned()
+        if let Some((id, text)) = self.hover.date_intent.update(ui.ctx(), target).cloned()
             && let (Some(date), Some((.., bounds))) = (self.date_on(&id, &text), over.as_ref())
         {
-            self.date_tip = Some(DateTip {
+            self.hover.date_tip = Some(DateTip {
                 id,
                 text,
                 bounds: *bounds,
@@ -112,14 +113,15 @@ impl ThreadView {
             actions.push(Action::ShowDay(date));
         }
         let Some(body) = self
+            .hover
             .date_tip
             .as_ref()
             .and_then(|tip| self.body_origin(&tip.id))
         else {
-            self.date_tip = None;
+            self.hover.date_tip = None;
             return;
         };
-        let Some(tip) = &mut self.date_tip else {
+        let Some(tip) = &mut self.hover.date_tip else {
             return;
         };
         let bounds = tip
@@ -142,7 +144,7 @@ impl ThreadView {
         if on_date || pointer.is_some_and(|at| rect.contains(at)) {
             tip.left_at = None;
         } else if now - *tip.left_at.get_or_insert(now) > TOOLTIP_HOVER {
-            self.date_tip = None;
+            self.hover.date_tip = None;
             return;
         } else {
             ui.ctx().request_repaint_after_secs(TOOLTIP_HOVER as f32);

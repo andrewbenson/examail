@@ -1,4 +1,4 @@
-//! Select-all and bulk actions (⌘⇧A, ⌘A, then triage), end to end on gmail-mock.
+//! Select-all and bulk actions (⌘⇧A, ⌘A, then triage), end to end on mock-servers.
 
 mod support;
 
@@ -226,7 +226,7 @@ fn bulk_actions_lists_get_me_to_zero_after_a_relaunch_and_still_undoes_it() {
 fn get_me_to_zero_dates_its_cutoff_from_now_not_from_when_exo_opened() {
     let mut app = start("get-me-to-zero-now");
     // A month after Exo opened, a week ago is after every conversation in the inbox.
-    let later = gmail_mock::Config::default()
+    let later = mock_servers::Config::default()
         .now
         .checked_add(jiff::SignedDuration::from_hours(30 * 24))
         .expect("in range");

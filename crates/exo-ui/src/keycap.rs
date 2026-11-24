@@ -4,13 +4,14 @@
 //! Exo Sans 12px bold whose baseline sits 13px below the cap's top in every placement measured
 //! (palette rows, the shortcuts sheet, tooltips). Each cap has a 4px left margin.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use egui::{
-    Color32, Context, CornerRadius, Painter, Pos2, Rect, Vec2, os::OperatingSystem, text::LayoutJob,
+    Color32, Context, CornerRadius, Galley, Painter, Pos2, Rect, Vec2, os::OperatingSystem,
+    text::LayoutJob,
 };
 
-use crate::{Family, Font, Palette, TextStyle, Theme, paint_job, pixel_snap};
+use crate::{Family, Font, Palette, TextStyle, Theme, layout, paint_text, pixel_snap};
 
 const LABEL: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 12.0, 12.0);
 const HEIGHT: f32 = 18.0;
@@ -118,8 +119,9 @@ pub struct Keycaps {
     baseline: f32,
 }
 
+#[derive(Clone)]
 struct Cap {
-    label: LayoutJob,
+    label: Arc<Galley>,
     label_width: f32,
     width: f32,
     divider: bool,
@@ -139,17 +141,12 @@ impl Keycaps {
                 let label = keycap_label(token.as_ref(), os);
                 let divider = label == "then" || text;
                 let color = if divider { colors.divider } else { colors.text };
-                let mut label = LayoutJob::single_section(label.into_owned(), LABEL.format(color));
+                let mut job = LayoutJob::single_section(label.into_owned(), LABEL.format(color));
                 // Chromium's inline box is the text's advance ceiled to its 1/64px layout unit,
                 // where egui would round it to 1/32px, so a cap's edges round as Chromium's do.
-                label.round_output_to_gui = false;
-                let label_width = (ctx
-                    .fonts_mut(|fonts| fonts.layout_job(label.clone()))
-                    .size()
-                    .x
-                    * 64.0)
-                    .ceil()
-                    / 64.0;
+                job.round_output_to_gui = false;
+                let label = layout(ctx, job);
+                let label_width = (label.size().x * 64.0).ceil() / 64.0;
                 // A divider keeps `min-width` but loses its padding. Text is as wide as it is.
                 let padding = if divider { 0.0 } else { 2.0 * PADDING_X };
                 let width = if text {
@@ -172,6 +169,33 @@ impl Keycaps {
             height: HEIGHT,
             gap: KEYCAP_GAP,
             baseline: BASELINE,
+        }
+    }
+
+    /// Returns the same laid-out keycaps recolored with `colors` without re-shaping text.
+    #[must_use]
+    pub fn with_colors(&self, colors: KeycapColors) -> Self {
+        let caps = self
+            .caps
+            .iter()
+            .map(|cap| {
+                let target = if cap.divider {
+                    colors.divider
+                } else {
+                    colors.text
+                };
+                Cap {
+                    label: crate::text::recolor_galley(&cap.label, target),
+                    ..cap.clone()
+                }
+            })
+            .collect();
+        Self {
+            caps,
+            colors,
+            height: self.height,
+            gap: self.gap,
+            baseline: self.baseline,
         }
     }
 
@@ -223,9 +247,11 @@ impl Keycaps {
                 );
             }
             let text_left = rect.center().x - cap.label_width / 2.0;
-            paint_job(
+            let pixels_per_point = painter.pixels_per_point();
+            let snapped_x = (text_left * pixels_per_point).floor() / pixels_per_point;
+            paint_text(
                 painter,
-                Pos2::new(text_left, line_top),
+                Pos2::new(snapped_x, line_top),
                 cap.label.clone(),
                 &LABEL,
             );

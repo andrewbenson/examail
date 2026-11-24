@@ -1,5 +1,5 @@
 //! The Writing and Advanced settings at work: Backtick as Escape and Convert Hyphen to Bulleted
-//! List in compose, the signature on replies, and where attachments download to, on gmail-mock.
+//! List in compose, the signature on replies, and where attachments download to, on mock-servers.
 
 mod support;
 

@@ -105,6 +105,19 @@ async fn clearing_a_newer_exos_cache_keeps_what_gmail_doesnt_have() {
         .expect("holds");
     harness
         .store
+        .save_draft(draft("draft00000000000003", "Pushed Exo draft"))
+        .await
+        .expect("saves");
+    harness.store.push_drafts().await.expect("pushes");
+    let pushed_draft_thread = harness
+        .store
+        .draft("draft00000000000003")
+        .await
+        .expect("reads")
+        .and_then(|d| d.thread)
+        .expect("Gmail assigned a thread");
+    harness
+        .store
         .save_draft(draft("draft00000000000002", "Only here"))
         .await
         .expect("saves");
@@ -154,7 +167,7 @@ async fn clearing_a_newer_exos_cache_keeps_what_gmail_doesnt_have() {
     harness.store.save_settings(&settings).await.expect("saves");
     let unsent = harness.store.unsent().await.expect("counts");
     let kept = drafts(&harness.store).await;
-    assert_eq!(kept.len(), 2);
+    assert_eq!(kept.len(), 3);
 
     let Harness {
         server, dir, store, ..
@@ -227,20 +240,20 @@ async fn clearing_a_newer_exos_cache_keeps_what_gmail_doesnt_have() {
         }
     }
     assert!(!backfilling, "the backfill finishes");
+    let inbox_after = store.list(&ListId::Inbox, None, 50).await.expect("lists");
+    assert!(!inbox_after.threads.is_empty(), "and comes back from Gmail");
     assert!(
-        !store
-            .list(&ListId::Inbox, None, 50)
-            .await
-            .expect("lists")
+        inbox_after
             .threads
-            .is_empty(),
-        "and comes back from Gmail"
+            .iter()
+            .any(|row| row.id == pushed_draft_thread && row.drafts == 1),
+        "Exo's pushed draft still routes to Inbox as Exo's own after clear_cache + sync"
     );
 }
 
 #[tokio::test]
 async fn clearing_a_file_that_isnt_a_database_starts_afresh() {
-    let server = gmail_mock::MockServer::start(gmail_mock::Config::default())
+    let server = mock_servers::MockServer::start(mock_servers::Config::default())
         .await
         .expect("the mock starts");
     let dir = support::TempDir::new();

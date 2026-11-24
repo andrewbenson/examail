@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use egui::{Color32, Id, Rect, Ui, pos2, vec2};
 use exo_ui::{Family, Font, TextStyle};
 use jiff::{Timestamp, tz::TimeZone};
+use unicode_normalization::UnicodeNormalization as _;
 
 use crate::time_suggest::zone_tables;
 
@@ -75,11 +76,94 @@ pub fn suggested(current: Option<&Found>, at: Timestamp, limit: usize) -> Vec<Fo
 /// The input's text, 12px/16px over `padding-bottom: 2px` and a 2px rule.
 const TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 16.0);
 const RULE: f32 = 2.0;
-/// Its list hangs 16px left of its box and 4px under it.
-const LIST_LEFT: f32 = 16.0;
-const LIST_BELOW: f32 = 4.0;
+/// Its list hangs 16px left of its box and 4px under it by default.
+pub const DEFAULT_LIST_OFFSET: egui::Vec2 = vec2(-16.0, 4.0);
 /// `#aeb1dd`, a Classic literal both themes keep.
 const RULE_INK: Color32 = Color32::from_rgb(0xae, 0xb1, 0xdd);
+
+/// How a Timezone input's list lays out its rows: their height, the padding over the first and
+/// under the last, where each row's 12px/16px text sits, and the list's Carbon fill.
+#[derive(Clone, Copy)]
+pub struct ZoneRows {
+    pub row: f32,
+    pub pad: f32,
+    pub bottom: f32,
+    pub text_top: f32,
+    pub carbon: Color32,
+}
+
+impl ZoneRows {
+    /// Share Availability's and Calendar Settings': 32px rows from 4px down, on `#27292d`.
+    pub const SIDEBAR: Self = Self {
+        row: 32.0,
+        pad: 4.0,
+        bottom: 5.0,
+        text_top: 8.0,
+        carbon: Color32::from_rgb(0x27, 0x29, 0x2d),
+    };
+    /// The event form's When (12px lines nudged `top: 3px`): 28px rows from 6px down, on the
+    /// form's `#27292d`.
+    pub const EDIT_EVENT: Self = Self {
+        row: 28.0,
+        pad: 6.0,
+        bottom: 3.0,
+        text_top: 6.0,
+        carbon: Color32::from_rgb(0x27, 0x29, 0x2d),
+    };
+}
+
+/// A Timezone input's list at `rect`: `rows` of a zone's offset (80px wide), name and, on the
+/// right, abbreviation (left out when it's an offset). Returns the row under a moving pointer and
+/// the row pressed.
+pub fn zone_list(
+    ui: &Ui,
+    id: Id,
+    rect: Rect,
+    zones: &[Found],
+    highlighted: usize,
+    rows: &ZoneRows,
+) -> (Option<usize>, Option<usize>) {
+    let ctx = ui.ctx().clone();
+    let palette = exo_ui::palette(&ctx);
+    super::share::dropdown(
+        ui,
+        id,
+        rect,
+        Some(rows.carbon),
+        zones.len(),
+        rows.row,
+        rows.pad,
+        highlighted,
+        |painter, row, index| {
+            let zone = &zones[index];
+            let line = row.top() + rows.text_top;
+            TEXT.paint_line(
+                painter,
+                pos2(row.left() + 15.0, line),
+                &zone.offset,
+                palette.ink(0.4, 0.4),
+                None,
+            );
+            TEXT.paint_line(
+                painter,
+                pos2(row.left() + 95.0, line),
+                &zone.name,
+                palette.ink(0.9, 0.9),
+                Some(row.width() - 95.0 - 60.0),
+            );
+            if !zone.abbreviation.chars().any(|ch| ch.is_ascii_digit()) {
+                let width = TEXT.width(&ctx, &zone.abbreviation);
+                TEXT.paint_line(
+                    painter,
+                    pos2(row.right() - 15.0 - width, line),
+                    &zone.abbreviation,
+                    palette.ink(0.9, 0.9),
+                    None,
+                );
+            }
+        },
+    )
+}
 
 /// A Timezone input's state: what's typed, and its list.
 #[derive(Default)]
@@ -103,12 +187,16 @@ pub struct ZoneField<'a> {
     /// The text's and the placeholder's colours.
     pub ink: Color32,
     pub placeholder: Color32,
+    /// Whether `ZoneInput::show` paints its own 2px underline.
+    pub show_rule: bool,
     /// Its rule always shows (in Calendar Settings), or only while it's focused.
     pub always_ruled: bool,
     /// A pick gives the keyboard up.
     pub blur_on_pick: bool,
     pub list_width: f32,
-    pub rows: super::share::ZoneRows,
+    /// Offset from `(field_box.left(), field_box.bottom())` to the list's top-left corner.
+    pub list_offset: egui::Vec2,
+    pub rows: ZoneRows,
 }
 
 /// What a Timezone input did this frame.
@@ -119,6 +207,24 @@ pub struct ZoneResponse {
 }
 
 impl ZoneInput {
+    /// Whether the suggestion dropdown currently holds items.
+    #[must_use]
+    pub fn has_suggestions(&self) -> bool {
+        !self.zones.is_empty()
+    }
+
+    /// Resets typed query text (used when Escape clears edited text in Share Availability).
+    pub fn clear_typed(&mut self) -> bool {
+        if self.typed {
+            self.typed = false;
+            self.zones.clear();
+            self.text.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Paints the input: the zone (`GMT+00:00       London`), or typed text with the zones it
     /// finds, picked with the pointer or ↑/↓ and Enter or Tab.
     pub fn show(&mut self, ui: &mut Ui, field: &ZoneField<'_>) -> ZoneResponse {
@@ -159,7 +265,7 @@ impl ZoneInput {
             field.line.min,
             vec2(field.line.width(), TEXT.line_height + 2.0 + RULE),
         );
-        if field.always_ruled || response.has_focus() {
+        if field.show_rule && (field.always_ruled || response.has_focus()) {
             ui.painter().rect_filled(
                 Rect::from_min_max(
                     pos2(field_box.left(), field_box.bottom() - RULE),
@@ -205,8 +311,8 @@ impl ZoneInput {
             let rows = &field.rows;
             let list = Rect::from_min_size(
                 pos2(
-                    field_box.left() - LIST_LEFT,
-                    field_box.bottom() + LIST_BELOW,
+                    field_box.left() + field.list_offset.x,
+                    field_box.bottom() + field.list_offset.y,
                 ),
                 vec2(
                     field.list_width,
@@ -214,7 +320,7 @@ impl ZoneInput {
                 ),
             );
             let (hovered, clicked) =
-                super::share::zone_list(ui, id.with("list"), list, &self.zones, self.pick, rows);
+                zone_list(ui, id.with("list"), list, &self.zones, self.pick, rows);
             self.pick = hovered.unwrap_or(self.pick);
             picked = picked.or_else(|| clicked.and_then(|index| self.zones.get(index).cloned()));
         }
@@ -257,19 +363,30 @@ fn last_segment(iana: &str) -> String {
     iana.rsplit('/').next().unwrap_or(iana).replace('_', " ")
 }
 
-/// A search key: lower-case letters only.
+/// A search key: lower-case ASCII letters, with diacritics stripped and Latin ligatures folded.
 fn search_key(text: &str) -> String {
-    text.chars()
-        .flat_map(char::to_lowercase)
-        .filter(char::is_ascii_lowercase)
-        .collect()
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars().flat_map(char::to_lowercase).nfd() {
+        match ch {
+            'a'..='z' => out.push(ch),
+            'ø' => out.push('o'),
+            'æ' => out.push_str("ae"),
+            'ß' => out.push_str("ss"),
+            'œ' => out.push_str("oe"),
+            'ł' => out.push('l'),
+            'đ' | 'ð' => out.push('d'),
+            'þ' => out.push_str("th"),
+            'ı' => out.push('i'),
+            _ => {}
+        }
+    }
+    out
 }
 
 type Entry = (&'static str, String);
 
 /// The search keys in their order and what each finds: places, then abbreviations (named by
-/// their zone), places' short names (as the place), then every zone by its last segment. A later
-/// key replaces an earlier one.
+/// their zone), places' short names (as the place), then every remaining zone by its last segment.
 fn index() -> &'static (Vec<String>, HashMap<String, Entry>) {
     static INDEX: OnceLock<(Vec<String>, HashMap<String, Entry>)> = OnceLock::new();
     INDEX.get_or_init(|| {
@@ -289,9 +406,20 @@ fn index() -> &'static (Vec<String>, HashMap<String, Entry>) {
                 entries.insert(search_key(short), entry);
             }
         }
-        for iana in zones.iter().filter(|iana| !iana.starts_with("Etc/GMT")) {
+        let mut ordered_zones: Vec<&'static str> = zones
+            .iter()
+            .map(String::as_str)
+            .filter(|iana| !iana.starts_with("Etc/GMT"))
+            .collect();
+        ordered_zones.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| a.cmp(b))
+        });
+        for iana in ordered_zones {
             let name = last_segment(iana);
-            entries.insert(search_key(&name), (iana, name));
+            entries.entry(search_key(&name)).or_insert((iana, name));
         }
         const FIRST: [&str; 10] = [
             "newyork",
@@ -371,5 +499,23 @@ mod tests {
         let new_york = current("America/New_York", at()).expect("zone");
         assert_eq!(new_york.text(), "GMT−05:00       New York");
         assert_eq!(new_york.abbreviation, "EST");
+    }
+
+    #[test]
+    fn plain_ascii_finds_accented_places() {
+        for (query, expected) in [
+            ("curacao", "Curaçao"),
+            ("reunion", "Réunion"),
+            ("aland", "Åland Islands"),
+        ] {
+            assert_eq!(
+                search(query, at(), 1)
+                    .first()
+                    .map(|found| found.name.as_str()),
+                Some(expected),
+                "searching {query:?}"
+            );
+        }
+        assert_eq!(search_key("Tromsø Ærø Straße"), "tromsoaerostrasse");
     }
 }

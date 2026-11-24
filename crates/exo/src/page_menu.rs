@@ -95,7 +95,7 @@ pub(crate) fn entries(target: &Target) -> Vec<Entry> {
     };
     let selected = !target.selection.is_empty();
     if let Some(link) = &target.link {
-        match link.strip_prefix("mailto:") {
+        match strip_mailto(link) {
             // The address alone: no `mailto:` and no query, decoded.
             Some(address) => out.push(item(
                 "Copy Email Address",
@@ -219,6 +219,13 @@ fn truncated(text: &str) -> String {
     out
 }
 
+/// Strips an ASCII-case-insensitive `mailto:` prefix from `url`.
+pub(crate) fn strip_mailto(url: &str) -> Option<&str> {
+    url.get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+        .map(|_| &url[7..])
+}
+
 /// Whether `Open Link` opens `url`. Only web links leave Exo, and `mailto:` opens compose.
 fn is_trusted(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "mailto"))
@@ -226,27 +233,7 @@ fn is_trusted(url: &str) -> bool {
 
 /// Percent-decodes `text`, keeping what doesn't decode as it is.
 fn decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let hex = |byte: u8| char::from(byte).to_digit(16);
-        match (
-            bytes[at],
-            bytes.get(at + 1).copied().and_then(hex),
-            bytes.get(at + 2).copied().and_then(hex),
-        ) {
-            (b'%', Some(high), Some(low)) => {
-                out.push((high * 16 + low) as u8);
-                at += 3;
-            }
-            (byte, _, _) => {
-                out.push(byte);
-                at += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+    String::from_utf8(exo_mail::percent_decode_bytes(text)).unwrap_or_else(|_| text.to_owned())
 }
 
 /// A right-click in a message body, waiting to show its menu: where on screen, what it landed
@@ -330,7 +317,9 @@ impl Mail {
         };
         match choice {
             Choice::CopyText(text) => ctx.copy_text(text),
-            Choice::OpenLink(url) if url.starts_with("mailto:") => self.compose_mailto(&url, false),
+            Choice::OpenLink(url) if strip_mailto(&url).is_some() => {
+                self.compose_mailto(&url, false)
+            }
             Choice::OpenLink(url) | Choice::Search(url) => self.open_url(&url),
             Choice::LookUp => match (&header, &body) {
                 (Some((text, Some((baseline, size)))), _) => {
@@ -384,7 +373,9 @@ impl Mail {
                     crate::clipboard::write_image(ctx, &image.pixels);
                 }
             }
-            Choice::OpenLink(url) if url.starts_with("mailto:") => self.compose_mailto(&url, false),
+            Choice::OpenLink(url) if strip_mailto(&url).is_some() => {
+                self.compose_mailto(&url, false)
+            }
             Choice::OpenLink(url) | Choice::Search(url) => self.open_url(&url),
             Choice::LookUp => {
                 if let Some((text, baseline)) = &selection {
@@ -504,6 +495,13 @@ mod tests {
             mail[0].1,
             Some(Choice::CopyText("priya+work@example.com".into()))
         );
+        let upper_mail = link("MAILTO:priya@example.com?subject=Hi");
+        assert_eq!(titles(&upper_mail), ["Copy Email Address", "Open Link"]);
+        assert_eq!(
+            upper_mail[0].1,
+            Some(Choice::CopyText("priya@example.com".into()))
+        );
+        assert!(strip_mailto("MAILTO:priya@example.com").is_some());
         assert_eq!(
             titles(&link("javascript:alert(1)")),
             ["Copy Link"],

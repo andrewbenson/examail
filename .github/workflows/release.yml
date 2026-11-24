@@ -30,6 +30,8 @@ jobs:
         with:
           bundler-cache: true
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build, sign and notarize
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}

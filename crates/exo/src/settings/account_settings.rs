@@ -7,7 +7,11 @@
 //! (negative margins, `line-height: 0` wrappers).
 
 use egui::{Color32, Context, CornerRadius, Rect, Sense, Ui, pos2, vec2};
-use exo_ui::{Dialog, DialogResponse, Family, Font, KeycapColors, Keycaps, TextStyle, motion};
+use exo_commands::{Commands, Region};
+use exo_ui::{
+    Dialog, DialogResponse, Family, Font, KeycapColors, Keycaps, SortableList, SortableRowMetrics,
+    TextStyle, motion,
+};
 
 use crate::accounts::{self, COLORS};
 
@@ -48,6 +52,19 @@ impl State {
     /// Whether the color picker is open, so that Escape closes it rather than the dialog.
     pub fn picker_open(&self) -> bool {
         self.picker.is_some()
+    }
+
+    /// Registers the open color picker's region shortcuts in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        if self.picker_open() {
+            crate::calendar::register_picker_keys(commands, &[Region::Dialog], |key| {
+                wrap(super::Action::AccountPicker(key))
+            });
+        }
     }
 
     /// What `key` does to the open color picker of `accounts`' rows, which is the color its
@@ -188,9 +205,6 @@ fn list(
         keycaps,
     };
     let mut event = None;
-    if let Some((_, offset)) = &mut state.drag {
-        *offset += ui.input(|input| input.pointer.delta().y);
-    }
     // The open picker's tooltip covers what's under it, rows included.
     let covered = state.picker.map(|index| {
         let swatch = swatch_rect(right, card_top + FIRST_ROW + ROW_STEP * index as f32);
@@ -200,74 +214,47 @@ fn list(
         );
         picker.with_min_y(picker.min.y - PICKER_PLACEMENT)
     });
-    let last = accounts.len().saturating_sub(1);
-    let dragging = state.drag.map(|(from, offset)| {
-        (
-            from,
-            offset,
-            ((from as f32 * ROW_STEP + offset) / ROW_STEP)
-                .round()
-                .clamp(0.0, last as f32) as usize,
-        )
-    });
-    for (index, account) in accounts.iter().enumerate() {
-        // Others make way for the dragged row (`animation: 150`).
-        let slot = match dragging {
-            Some((from, _, to)) if index != from && from < index && index <= to => index - 1,
-            Some((from, _, to)) if index != from && to <= index && index < from => index + 1,
-            _ => index,
-        };
-        let shift = motion::transition(
-            &ctx,
-            exo_ui::id(&ctx, ("account-row-shift", &account.email)),
-            slot != index,
-            0.15,
-            motion::CubicBezier::EASE,
-        ) * (slot as f32 - index as f32);
-        if dragging.is_some_and(|(from, ..)| from == index) {
-            continue;
-        }
-        let top = card_top + FIRST_ROW + ROW_STEP * (index as f32 + shift);
-        let pointer_free =
-            dragging.is_none() && !covered.is_some_and(|covered| ui.rect_contains_pointer(covered));
-        if let Some(clicked) = row(ui, &columns, top, index, account, pointer_free, state) {
-            event = Some(clicked);
-        }
-    }
-    if let Some((from, offset, to)) = dragging {
-        // The dragged copy: white with a 3px `#aeb1dd` bar on its left.
-        let top = card_top + FIRST_ROW + ROW_STEP * from as f32 + offset;
-        let rect = Rect::from_min_max(
-            pos2(body.left() - ROW_LEFT, top),
-            pos2(body.right() + ROW_RIGHT, top + ROW_HEIGHT),
-        );
-        let painter = ui.painter();
-        exo_ui::BoxShadow::new([1.0, 1.0], 4.0, 0.0, Color32::from_black_alpha(51)).paint(
-            painter,
-            rect,
-            CornerRadius::same(4),
-        );
-        painter.rect_filled(rect, CornerRadius::same(4), Color32::WHITE);
-        painter.rect_filled(
-            Rect::from_min_size(rect.min, vec2(3.0, ROW_HEIGHT)),
-            CornerRadius {
-                nw: 4,
-                sw: 4,
-                ne: 0,
-                se: 0,
+    let metrics = SortableRowMetrics {
+        first_top: card_top + FIRST_ROW,
+        row_step: ROW_STEP,
+        row_height: ROW_HEIGHT,
+        card_left: body.left() - ROW_LEFT,
+        card_width: body.width() + ROW_LEFT + ROW_RIGHT,
+    };
+    let mut drag = state.drag;
+    let reordered = SortableList::new(accounts.len(), metrics)
+        .sortable(accounts.len() > 1)
+        .show(
+            ui,
+            &mut drag,
+            |index| exo_ui::id(&ctx, ("account-row-shift", &accounts[index].email)),
+            |ui, index, top, is_dragging, row_drag| {
+                let pointer_free = !is_dragging
+                    && !covered.is_some_and(|covered| ui.rect_contains_pointer(covered));
+                state.drag = *row_drag;
+                if let Some(clicked) = row(
+                    ui,
+                    &columns,
+                    top,
+                    index,
+                    &accounts[index],
+                    pointer_free,
+                    state,
+                ) {
+                    event = Some(clicked);
+                }
+                *row_drag = state.drag;
             },
-            Color32::from_rgb(0xae, 0xb1, 0xdd),
+            |ui, from, top| {
+                paint_identity(ui, body.left(), top, &accounts[from]);
+            },
         );
-        paint_identity(ui, body.left(), top, &accounts[from]);
-        if ui.input(|input| input.pointer.any_released()) {
-            state.drag = None;
-            if to != from {
-                event = Some(Event::Move {
-                    email: accounts[from].email.clone(),
-                    to,
-                });
-            }
-        }
+    state.drag = drag;
+    if let Some((from, to)) = reordered {
+        event = Some(Event::Move {
+            email: accounts[from].email.clone(),
+            to,
+        });
     }
 
     let footer = card_top + FOOTER_TOP + ROW_STEP * accounts.len() as f32;

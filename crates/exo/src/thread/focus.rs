@@ -47,7 +47,7 @@ pub enum GutterKey {
 impl ThreadView {
     /// The focus region the thread view's keyboard is in.
     pub fn region(&self) -> Region {
-        match self.zone {
+        match self.action.zone {
             Zone::Messages => Region::ThreadMessages,
             Zone::Header(_) => Region::ThreadMessagesHeader,
             Zone::ActionPane { .. } => Region::ActionPane,
@@ -57,7 +57,7 @@ impl ThreadView {
 
     /// The header's focused control, while the header has the keyboard.
     pub(super) fn header_focus(&self) -> Option<Control> {
-        let Zone::Header(Some(at)) = self.zone else {
+        let Zone::Header(Some(at)) = self.action.zone else {
             return None;
         };
         self.header_controls().get(at).copied()
@@ -73,12 +73,12 @@ impl ThreadView {
                 .iter()
                 .position(|control| control.tab_index(start) == tab)
         };
-        self.zone = Zone::Header(with(self.header_tab).or_else(|| with(1)));
+        self.action.zone = Zone::Header(with(self.action.header_tab).or_else(|| with(1)));
     }
 
     /// A key in the header. Returns what Enter clicked.
     pub(crate) fn header_key(&mut self, key: HeaderKey) -> Option<Action> {
-        let Zone::Header(focused) = self.zone else {
+        let Zone::Header(focused) = self.action.zone else {
             return None;
         };
         let controls = self.header_controls();
@@ -88,7 +88,7 @@ impl ThreadView {
             .position(|control| *control == Control::Status);
         let control = focused.and_then(|at| controls.get(at).copied());
         match key {
-            HeaderKey::Escape => self.zone = Zone::Messages,
+            HeaderKey::Escape => self.action.zone = Zone::Messages,
             // ↑ from the status line gives the actions the keyboard, on Done, and the tab index to
             // come back to becomes 1. Without Done (in Spam) the keyboard stays.
             HeaderKey::Up if control == Some(Control::Status) => {
@@ -96,29 +96,31 @@ impl ThreadView {
                     .iter()
                     .position(|control| *control == Control::Done)
                 {
-                    self.zone = Zone::Header(Some(done));
+                    self.action.zone = Zone::Header(Some(done));
                 }
-                self.header_tab = 1;
+                self.action.header_tab = 1;
             }
             HeaderKey::Up => {}
             HeaderKey::Down => match (control, status) {
                 (Some(control), Some(status)) if control != Control::Status => {
-                    self.zone = Zone::Header(Some(status));
-                    self.header_tab = 1;
+                    self.action.zone = Zone::Header(Some(status));
+                    self.action.header_tab = 1;
                 }
-                _ => self.zone = Zone::Messages,
+                _ => self.action.zone = Zone::Messages,
             },
             HeaderKey::Step(-1) if focused.is_none() => {
-                self.zone = Zone::ActionPane { from_header: true }
+                self.action.zone = Zone::ActionPane { from_header: true }
             }
             HeaderKey::Step(delta) => {
                 let to = focused.map_or(0, |at| at as isize + delta);
                 if let Some(next) = usize::try_from(to).ok().filter(|to| *to < controls.len()) {
-                    self.zone = Zone::Header(Some(next));
-                    self.header_tab = controls[next].tab_index(start);
+                    self.action.zone = Zone::Header(Some(next));
+                    self.action.header_tab = controls[next].tab_index(start);
                 }
             }
-            HeaderKey::Enter => return control.map(|control| control.action(self.status.as_ref())),
+            HeaderKey::Enter => {
+                return control.map(|control| control.action(self.action.status.as_ref()));
+            }
         }
         None
     }
@@ -126,9 +128,9 @@ impl ThreadView {
     /// A key in the back gutter.
     pub fn gutter_key(&mut self, key: GutterKey) {
         let GutterKey::Right = key;
-        match self.zone {
+        match self.action.zone {
             Zone::ActionPane { from_header: true } => self.enter_header(),
-            Zone::ActionPane { from_header: false } => self.zone = Zone::Messages,
+            Zone::ActionPane { from_header: false } => self.action.zone = Zone::Messages,
             _ => {}
         }
     }
@@ -138,31 +140,31 @@ impl ThreadView {
     pub fn left(&mut self, repeat: bool) {
         if !self.scroll_sideways(-1)
             && !repeat
-            && matches!(self.zone, Zone::Messages | Zone::NewMessages)
+            && matches!(self.action.zone, Zone::Messages | Zone::NewMessages)
         {
-            self.zone = Zone::ActionPane { from_header: false };
+            self.action.zone = Zone::ActionPane { from_header: false };
         }
     }
 
     /// Whether the Show New Messages bar has the keyboard, so that Enter shows the new messages.
     pub fn new_messages_focused(&self) -> bool {
-        self.zone == Zone::NewMessages
+        self.action.zone == Zone::NewMessages
     }
 
     /// A click in the thread pane gives the messages the keyboard.
     pub(super) fn clicked_in_pane(&mut self) {
-        self.zone = Zone::Messages;
-        self.invite_focus = None;
+        self.action.zone = Zone::Messages;
+        self.invite_state.focus = None;
     }
 
     /// ↑ past the first message, not held, goes to the header, and ↓ past the last goes to the Show
     /// New Messages bar if there is one. ↑ on the bar goes back to the message. Returns whether the
     /// press was at an edge, so that the keyboard doesn't move on to another message.
     pub(super) fn arrow_out(&mut self, delta: isize, at: usize) -> bool {
-        if delta < 0 && self.zone == Zone::NewMessages {
+        if delta < 0 && self.action.zone == Zone::NewMessages {
             // Back onto the message it left from, unless that's the only one.
             if at > 0 {
-                self.zone = Zone::Messages;
+                self.action.zone = Zone::Messages;
                 self.focus_at(at, 0);
             }
             return true;
@@ -174,8 +176,8 @@ impl ThreadView {
             self.enter_header();
             true
         } else if delta > 0 && last(next) && last(at) {
-            if self.has_new {
-                self.zone = Zone::NewMessages;
+            if self.action.has_new {
+                self.action.zone = Zone::NewMessages;
             }
             true
         } else {

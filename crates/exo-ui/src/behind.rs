@@ -55,7 +55,7 @@ impl Behind {
 
     /// The blur of what's behind `card`, made now unless it was last pass.
     fn blurred(&self, ctx: &Context, card: Rect, radius: f32) -> Option<TextureHandle> {
-        let id = Id::new("exo_ui::behind");
+        let id = crate::id(ctx, "exo_ui::behind");
         let pass = ctx.cumulative_pass_nr();
         let key = (
             self.key,
@@ -166,18 +166,19 @@ impl Behind {
     /// Says what's behind the toasts' stack this frame: something it shows through (a photo),
     /// or nothing, which leaves its cards opaque.
     pub fn set_for_toasts(ctx: &Context, behind: Option<Self>) {
-        ctx.data_mut(|data| data.insert_temp(toasts_id(), behind));
+        let id = toasts_id(ctx);
+        ctx.data_mut(|data| data.insert_temp(id, behind));
     }
 
     /// What's behind the toasts' stack this frame, if it shows through.
     pub fn for_toasts(ctx: &Context) -> Option<Self> {
-        ctx.data(|data| data.get_temp::<Option<Self>>(toasts_id()))
-            .flatten()
+        let id = toasts_id(ctx);
+        ctx.data(|data| data.get_temp::<Option<Self>>(id)).flatten()
     }
 }
 
-fn toasts_id() -> Id {
-    Id::new("exo_ui::behind_toasts")
+fn toasts_id(ctx: &Context) -> Id {
+    crate::id(ctx, "exo_ui::behind_toasts")
 }
 
 #[cfg(test)]
@@ -205,5 +206,58 @@ mod tests {
         blur_rows(&mut step, 6, 1, 1.0);
         assert!(step[0][0] > 200.0, "{step:?}");
         assert!(step[5][0] < 5.0, "{step:?}");
+    }
+
+    #[test]
+    fn toasts_backdrop_is_scoped_per_viewport() {
+        let ctx = Context::default();
+        let main_vp = egui::ViewportId::ROOT;
+        let child_vp = egui::ViewportId::from_hash_of("popout-compose");
+
+        ctx.run_ui(
+            egui::RawInput {
+                viewport_id: main_vp,
+                ..Default::default()
+            },
+            |ui| {
+                Behind::set_for_toasts(ui.ctx(), Some(Behind::new(7, |_, _| None)));
+                assert_eq!(Behind::for_toasts(ui.ctx()).map(|b| b.key), Some(7));
+            },
+        )
+        .drop_without_applying_deltas();
+
+        ctx.run_ui(
+            egui::RawInput {
+                viewport_id: child_vp,
+                viewports: [(child_vp, egui::ViewportInfo::default())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(
+                    Behind::for_toasts(ui.ctx()).is_none(),
+                    "child viewport must not inherit main viewport's toast backdrop"
+                );
+                Behind::set_for_toasts(ui.ctx(), Some(Behind::new(42, |_, _| None)));
+                assert_eq!(Behind::for_toasts(ui.ctx()).map(|b| b.key), Some(42));
+            },
+        )
+        .drop_without_applying_deltas();
+
+        ctx.run_ui(
+            egui::RawInput {
+                viewport_id: main_vp,
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(
+                    Behind::for_toasts(ui.ctx()).map(|b| b.key),
+                    Some(7),
+                    "main viewport retains its own toast backdrop"
+                );
+            },
+        )
+        .drop_without_applying_deltas();
     }
 }

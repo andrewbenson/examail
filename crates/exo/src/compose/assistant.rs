@@ -7,13 +7,13 @@
 
 use std::collections::HashMap;
 
-use egui::{Color32, Id, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, Id, Rect, Ui, pos2, vec2};
 use exo_commands::{Command, Commands, Hint, Region};
 use exo_editor::{Trigger, TriggerKind};
 use exo_store::{Address, EmojiSkinTone};
 use exo_ui::{
-    ContactColumns, ContactListStyle, ContactRow, ContactSelectorList, Family, Font, TextStyle,
-    Theme,
+    AnchoredCard, AnchoredList, ContactRow, ContactSelectorList, Family, Font, TextStyle, Theme,
+    measure_contact_columns,
 };
 
 use super::{Action, Open, contacts, recipients};
@@ -51,10 +51,6 @@ fn left_offset(kind: TriggerKind) -> f32 {
 /// How many emoji the picker offers: eight, or five in a popped-out draft.
 const EMOJI_LIMIT: usize = 8;
 const EMOJI_LIMIT_POPPED: usize = 5;
-/// What reads as the start of an address.
-static ADDRESS_START: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^[a-z0-9!#$%&'*/=?^_`{|}~-]{1,20}(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]{1,20}){0,2}@?(?:[a-z0-9](?:[a-z0-9-]{0,20}[a-z0-9])?\.)?(?:[a-z0-9-]{0,20}[a-z0-9])?$").expect("valid regex")
-});
 
 /// A draft's To, Cc and Bcc.
 type Recipients = [Vec<Address>; 3];
@@ -130,13 +126,13 @@ pub(crate) enum Key {
 
 /// Takes the editor's trigger for this frame (emoji and contacts only).
 pub(super) fn note_trigger(open: &mut Open, trigger: Option<&Trigger>) {
-    open.assistant.trigger = trigger
+    open.popups.assistant.trigger = trigger
         .filter(|trigger| matches!(trigger.kind, TriggerKind::Emoji | TriggerKind::Contact(_)))
         .cloned();
-    if open.assistant.trigger.is_none() {
-        open.assistant.rows = Rows::None;
-        open.assistant.query = None;
-        open.assistant.partial = None;
+    if open.popups.assistant.trigger.is_none() {
+        open.popups.assistant.rows = Rows::None;
+        open.popups.assistant.query = None;
+        open.popups.assistant.partial = None;
     }
 }
 
@@ -158,7 +154,7 @@ pub(super) fn edit_mention(open: &mut Open, book: Option<&contacts::Index>) {
             || address.email.to_lowercase() == lower
     };
     if open.record.to.iter().any(named) {
-        open.assistant.partial = Some(name);
+        open.popups.assistant.partial = Some(name);
         open.editor.arm_trigger();
     }
 }
@@ -208,7 +204,7 @@ fn unambiguous(to: &[Address], name: &str, book: Option<&contacts::Index>) -> Op
 pub(super) fn undo_marks(open: &mut Open, undone: &[u64], redone: &[u64]) {
     for (marks, before) in [(undone, true), (redone, false)] {
         for mark in marks {
-            if let Some((was, became)) = open.assistant.marks.get(mark).cloned() {
+            if let Some((was, became)) = open.popups.assistant.marks.get(mark).cloned() {
                 let [to, cc, bcc] = if before { was } else { became };
                 open.record.to = to;
                 open.record.cc = cc;
@@ -266,7 +262,8 @@ pub(super) fn use_emoji(open: &mut Open, now: f64) {
 /// dropdown. While the dropdown is hidden on a date ([`show`]), it doesn't take the keys, so they
 /// go to the body.
 pub(super) fn register(commands: &mut Commands<commands::Action>, open: &Open, backtick: bool) {
-    if !open.assistant.shown() || open.date.is_some() {
+    let assistant = &open.popups.assistant;
+    if !assistant.shown() || open.body.date.is_some() {
         return;
     }
     const BODY: &[Region] = &[Region::ComposeForm];
@@ -275,18 +272,18 @@ pub(super) fn register(commands: &mut Commands<commands::Action>, open: &Open, b
             .keys(keys.iter().copied())
             .regions(BODY)
     };
-    let picks: &[&str] = if matches!(open.assistant.rows, Rows::NewAddress { .. }) {
+    let picks: &[&str] = if matches!(assistant.rows, Rows::NewAddress { .. }) {
         &["enter", "tab", "space"]
     } else {
         &["enter", "tab"]
     };
     commands.add(key("ASSISTANT_PICK", Key::Pick(None), picks));
     commands.add(key("ASSISTANT_ESCAPE", Key::Dismiss, &["esc"]).backtick_escape(backtick));
-    if !matches!(open.assistant.rows, Rows::NewAddress { .. }) {
+    if !matches!(assistant.rows, Rows::NewAddress { .. }) {
         commands.add(key("ASSISTANT_DOWN", Key::Move(1), &["down"]));
         commands.add(key("ASSISTANT_UP", Key::Move(-1), &["up"]));
     }
-    if matches!(open.assistant.rows, Rows::Emoji(_)) {
+    if matches!(assistant.rows, Rows::Emoji(_)) {
         commands.add(key("ASSISTANT_COLON", Key::Close, &[":"]));
     }
 }
@@ -339,7 +336,7 @@ fn contact_rows(
     if !found.is_empty() {
         return Rows::Contacts(found);
     }
-    if ADDRESS_START.is_match(query) {
+    if recipients::is_address_start(query) {
         return Rows::NewAddress {
             text: query.to_lowercase(),
             valid: recipients::is_valid(query),
@@ -359,7 +356,11 @@ fn removal_rows(open: &Open, query: &str, team: &[String]) -> Rows {
         .chain(&open.record.cc)
         .filter(|address| {
             recipients::is_valid(&address.email)
-                && !open.auto_bcc.emails.contains(&address.email.to_lowercase())
+                && !open
+                    .delivery
+                    .auto_bcc
+                    .emails
+                    .contains(&address.email.to_lowercase())
         })
         .collect();
     let domain = |address: &Address| {
@@ -422,18 +423,18 @@ impl crate::Mail {
             self.account.email(),
         );
         let thread_people = self.compose.thread_people.as_ref().map(|(_, index)| index);
-        let book = self.compose.book.as_ref().map(|(_, index)| index);
+        let book = self.compose.book.as_ref().map(|(_, index)| index.as_ref());
         let Some(id) = self.compose.focus.clone() else {
             return;
         };
         let Some(open) = self.compose.drafts.iter_mut().find(|open| open.id == id) else {
             return;
         };
-        let Some(trigger) = open.assistant.trigger.clone() else {
+        let Some(trigger) = open.popups.assistant.trigger.clone() else {
             return;
         };
         let asked = (trigger.kind, trigger.query.clone());
-        if open.assistant.query.as_ref() == Some(&asked) {
+        if open.popups.assistant.query.as_ref() == Some(&asked) {
             return;
         }
         let rows = match trigger.kind {
@@ -450,21 +451,21 @@ impl crate::Mail {
             TriggerKind::Snippet => Rows::None,
         };
         // A new query starts from the top.
-        let same = open
-            .assistant
+        let assistant = &mut open.popups.assistant;
+        let same = assistant
             .query
             .as_ref()
             .is_some_and(|(_, query)| *query == asked.1);
-        open.assistant.index = if same {
-            open.assistant.index.min(count(&rows).saturating_sub(1))
+        assistant.index = if same {
+            assistant.index.min(count(&rows).saturating_sub(1))
         } else {
             0
         };
         if !same {
-            open.assistant.scroll = 0.0;
+            assistant.scroll = 0.0;
         }
-        open.assistant.rows = rows;
-        open.assistant.query = Some(asked);
+        assistant.rows = rows;
+        assistant.query = Some(asked);
     }
 
     /// Carries out a dropdown key.
@@ -474,10 +475,11 @@ impl crate::Mail {
         };
         match key {
             Key::Move(delta) => {
-                let rows = count(&open.assistant.rows).max(1);
-                open.assistant.index =
-                    (open.assistant.index as isize + delta).rem_euclid(rows as isize) as usize;
-                open.assistant.reveal = true;
+                let assistant = &mut open.popups.assistant;
+                let rows = count(&assistant.rows).max(1);
+                assistant.index =
+                    (assistant.index as isize + delta).rem_euclid(rows as isize) as usize;
+                assistant.reveal = true;
             }
             Key::Dismiss => {
                 if open.state.field == super::Field::Subject {
@@ -485,18 +487,19 @@ impl crate::Mail {
                 } else {
                     open.editor.dismiss_trigger();
                 }
-                open.assistant.trigger = None;
-                open.assistant.rows = Rows::None;
-                open.assistant.partial = None;
+                open.popups.assistant.trigger = None;
+                open.popups.assistant.rows = Rows::None;
+                open.popups.assistant.partial = None;
             }
             Key::Pick(index) => {
                 if let Some(index) = index {
-                    open.assistant.index = index;
+                    open.popups.assistant.index = index;
                 }
                 self.assistant_insert(None, now);
             }
             Key::Close => {
                 let exact = open
+                    .popups
                     .assistant
                     .trigger
                     .as_ref()
@@ -514,19 +517,19 @@ impl crate::Mail {
             &self.snapshot.aliases,
             self.account.email(),
         );
-        let book = self.compose.book.as_ref().map(|(_, index)| index);
+        let book = self.compose.book.as_ref().map(|(_, index)| index.as_ref());
         let Some(id) = self.compose.focus.clone() else {
             return;
         };
         let Some(open) = self.compose.drafts.iter_mut().find(|open| open.id == id) else {
             return;
         };
-        let Some(trigger) = open.assistant.trigger.take() else {
+        let Some(trigger) = open.popups.assistant.trigger.take() else {
             return;
         };
-        let rows = std::mem::take(&mut open.assistant.rows);
-        open.assistant.query = None;
-        let index = open.assistant.index;
+        let rows = std::mem::take(&mut open.popups.assistant.rows);
+        open.popups.assistant.query = None;
+        let index = open.popups.assistant.index;
         let mut set_tone = false;
         match (&rows, trigger.kind) {
             (Rows::Emoji(found), _) => {
@@ -558,7 +561,7 @@ impl crate::Mail {
                 let before = recipients_of(open);
                 open.editor.replace(trigger.start, trigger.end, &shown);
                 move_to_to(open, &recipients::parse(text));
-                let mark = open.assistant.remember(before, recipients_of(open));
+                let mark = open.popups.assistant.remember(before, recipients_of(open));
                 open.editor.mark_undo(mark);
             }
             _ => return,
@@ -614,6 +617,7 @@ fn mention(
     let before = recipients_of(open);
     // Backspacing into a mention swaps the recipient the mention was for.
     let replaced = open
+        .popups
         .assistant
         .partial
         .take()
@@ -666,13 +670,13 @@ fn mention(
         move_to_to(open, address);
     }
     let after = recipients_of(open);
-    open.assistant.remember(before, after)
+    open.popups.assistant.remember(before, after)
 }
 
 /// Takes `person` (or everyone in the group) off the draft. A group spares the Auto Bcc
 /// addresses in Bcc. `team` is the team's domains.
 pub(super) fn remove(open: &mut Open, person: &Person, team: &[String]) {
-    let auto = open.auto_bcc.emails.clone();
+    let auto = open.delivery.auto_bcc.emails.clone();
     let gone = |address: &Address| -> bool {
         let domain = address
             .email
@@ -707,7 +711,7 @@ pub(super) fn register_removals(
     team: &[String],
 ) {
     const FORM: &[Region] = &[Region::ComposeForm, Region::RecipientList];
-    let auto = &open.auto_bcc.emails;
+    let auto = &open.delivery.auto_bcc.emails;
     let counted: Vec<&Address> = open
         .record
         .to
@@ -809,21 +813,39 @@ const LAYER_MARGIN: f32 = 22.5;
 /// mouse-down picks, and hovering with the mouse moving highlights. Draws nothing while the
 /// caret is on a date.
 pub(super) fn show(ui: &Ui, open: &mut Open, within: egui::Rangef, id: Id) -> Option<usize> {
-    let trigger = open.assistant.trigger.clone()?;
-    if !open.assistant.shown() || open.date.is_some() {
+    let trigger = open.popups.assistant.trigger.clone()?;
+    if !open.popups.assistant.shown() || open.body.date.is_some() {
         return None;
     }
     let ctx = ui.ctx().clone();
-    let width = match &open.assistant.rows {
+    let width = match &open.popups.assistant.rows {
         Rows::Emoji(_) => EMOJI_WIDTH,
         Rows::Contacts(people) => {
-            contact_widths(&ctx, &people.iter().map(row_text).collect::<Vec<_>>())
+            let texts: Vec<(String, String)> = people.iter().map(row_text).collect();
+            let rows: Vec<ContactRow<'_>> = texts
+                .iter()
+                .map(|(name, email)| ContactRow {
+                    name,
+                    email,
+                    disabled: false,
+                    avatar: None,
+                })
+                .collect();
+            measure_contact_columns(&ctx, &rows, &CONTACT, CELL_PADDING, NAME_MIN)
                 .iter()
                 .sum()
         }
-        Rows::NewAddress { text, .. } => contact_widths(&ctx, &[(String::new(), text.clone())])
-            .iter()
-            .sum(),
+        Rows::NewAddress { text, .. } => {
+            let rows = [ContactRow {
+                name: "",
+                email: text,
+                disabled: false,
+                avatar: None,
+            }];
+            measure_contact_columns(&ctx, &rows, &CONTACT, CELL_PADDING, NAME_MIN)
+                .iter()
+                .sum()
+        }
         Rows::None => 0.0,
     };
     // The subject's dropdown hangs from the trigger's left.
@@ -851,7 +873,7 @@ pub(super) fn show(ui: &Ui, open: &mut Open, within: egui::Rangef, id: Id) -> Op
         scroll,
         reveal,
         ..
-    } = &mut open.assistant;
+    } = &mut open.popups.assistant;
     match rows {
         Rows::Emoji(found) => emoji_picker(
             &ctx,
@@ -912,16 +934,6 @@ fn row_text(person: &Person) -> (String, String) {
     }
 }
 
-/// The dropdown's card: white (`#27292d` in Carbon), 4px corners, `0 2px 4px rgba(0,0,0,.1), 0 2px
-/// 12px rgba(0,0,0,.05)`.
-fn paint_card(painter: &egui::Painter, rect: Rect) {
-    let fill = match exo_ui::theme(painter.ctx()) {
-        Theme::Snow => Color32::WHITE,
-        Theme::Carbon => Color32::from_rgb(0x27, 0x29, 0x2d),
-    };
-    exo_ui::paint_editor_tooltip(painter, rect, fill);
-}
-
 /// The emoji picker with its top left at `at`, flipped above `above` when it doesn't fit.
 fn emoji_picker(
     ctx: &egui::Context,
@@ -953,101 +965,46 @@ fn emoji_picker(
         at.y
     };
     let card = Rect::from_min_size(pos2(at.x, top), vec2(EMOJI_WIDTH, height));
-    // The highlighted row: `hsl(220, 45%, 97%)`, `#464b53` in Carbon; the text
-    // `rgba(0, 0, 0, .85)`, white in Carbon.
-    let (selected, ink) = match palette.theme {
+    let (fill, selected, ink) = match palette.theme {
         Theme::Snow => (
+            Color32::WHITE,
             Color32::from_rgb(0xf4, 0xf6, 0xfb),
             Color32::from_black_alpha(217),
         ),
-        Theme::Carbon => (Color32::from_rgb(0x46, 0x4b, 0x53), Color32::WHITE),
+        Theme::Carbon => (
+            Color32::from_rgb(0x27, 0x29, 0x2d),
+            Color32::from_rgb(0x46, 0x4b, 0x53),
+            Color32::WHITE,
+        ),
     };
-    let pointer = ctx.input(|input| {
-        (
-            input.pointer.hover_pos(),
-            input.pointer.primary_pressed(),
-            input.pointer.is_moving(),
-        )
-    });
-    let mut picked = None;
-    egui::Area::new(id)
+    let out = AnchoredList::new(id, card, AnchoredCard::tooltip(fill, selected))
         .order(egui::Order::Foreground)
-        .fixed_pos(card.min)
-        .show(ctx, |area| {
-            paint_card(area.painter(), card);
-            let hit = area.allocate_rect(card, Sense::click());
-            if most > 0.0 && hit.hovered() {
-                *scroll =
-                    (*scroll - ctx.input(|input| input.smooth_scroll_delta.y)).clamp(0.0, most);
-            }
-            let visible = Rect::from_min_size(
-                pos2(card.left(), card.top() + EMOJI_PADDING),
-                vec2(EMOJI_WIDTH, shown),
+        .uniform_padding(EMOJI_PADDING)
+        .clip_rows()
+        .highlighted(Some(*index))
+        .scroll(scroll)
+        .show_uniform(ctx, found.len(), EMOJI_ROW, |painter, rect, at| {
+            let row = &found[at];
+            PREVIEW.paint_line(
+                painter,
+                pos2(rect.left() + EMOJI_INSET + 1.0, rect.top() + 5.0),
+                &row.emoji,
+                ink,
+                None,
             );
-            let painter = area.painter().with_clip_rect(visible);
-            for (at, row) in found.iter().enumerate() {
-                let rect = Rect::from_min_size(
-                    pos2(card.left(), visible.top() - *scroll + at as f32 * EMOJI_ROW),
-                    vec2(EMOJI_WIDTH, EMOJI_ROW),
-                );
-                if !rect.intersects(visible) {
-                    continue;
-                }
-                if at == *index {
-                    painter.rect_filled(exo_ui::pixel_snap(rect), 0.0, selected);
-                }
-                // The emoji sits 2px down, and Chromium sets the color glyph a pixel right of
-                // and lower than egui (measured).
-                PREVIEW.paint_line(
-                    &painter,
-                    pos2(rect.left() + EMOJI_INSET + 1.0, rect.top() + 5.0),
-                    &row.emoji,
-                    ink,
-                    None,
-                );
-                let name_left = rect.left() + EMOJI_INSET + PREVIEW_WIDTH + NAME_GAP;
-                NAME.paint_line(
-                    &painter,
-                    pos2(name_left, rect.top() + 7.0),
-                    &row.name,
-                    ink,
-                    Some(rect.right() - EMOJI_INSET - name_left),
-                );
-                if let (Some(pointer), pressed, moving) = pointer
-                    && rect.contains(pointer)
-                    && visible.contains(pointer)
-                {
-                    if moving {
-                        *index = at;
-                    }
-                    if pressed {
-                        picked = Some(at);
-                    }
-                }
-            }
+            let name_left = rect.left() + EMOJI_INSET + PREVIEW_WIDTH + NAME_GAP;
+            NAME.paint_line(
+                painter,
+                pos2(name_left, rect.top() + 7.0),
+                &row.name,
+                ink,
+                Some(rect.right() - EMOJI_INSET - name_left),
+            );
         });
-    picked
-}
-
-/// The widths of the contact list's name and address columns, padding included. The name column
-/// has no width when no row has a name.
-fn contact_widths(ctx: &egui::Context, rows: &[(String, String)]) -> [f32; 2] {
-    let name_width = rows
-        .iter()
-        .map(|(name, _)| CONTACT.width_unkerned(ctx, name))
-        .fold(0.0, f32::max)
-        + 2.0 * CELL_PADDING;
-    let name_width = if rows.iter().all(|(name, _)| name.is_empty()) {
-        0.0
-    } else {
-        name_width.max(NAME_MIN)
-    };
-    let email_width = rows
-        .iter()
-        .map(|(_, email)| CONTACT.width_unkerned(ctx, email))
-        .fold(0.0, f32::max)
-        + 2.0 * CELL_PADDING;
-    [name_width, email_width]
+    if let Some(hovered) = out.hovered {
+        *index = hovered;
+    }
+    out.pressed
 }
 
 /// The contact list with its top left at `at`, showing name and address cells with what's typed
@@ -1060,7 +1017,6 @@ fn contact_list(
     at: egui::Pos2,
     id: Id,
 ) -> exo_ui::ContactListResponse {
-    let [name_width, email_width] = contact_widths(ctx, rows);
     let shown: Vec<ContactRow<'_>> = rows
         .iter()
         .map(|(name, email)| ContactRow {
@@ -1070,29 +1026,18 @@ fn contact_list(
             avatar: None,
         })
         .collect();
-    let name = if name_width > 0.0 {
-        (CELL_PADDING, name_width - 2.0 * CELL_PADDING)
-    } else {
-        (0.0, 0.0)
-    };
-    let style = ContactListStyle {
-        text: CONTACT,
-        row: CONTACT_ROW,
-        padding: CONTACT_PADDING,
-        columns: ContactColumns {
-            avatar: None,
-            name,
-            email: (name_width + CELL_PADDING, email_width - 2.0 * CELL_PADDING),
-        },
-        force_snow: false,
-    };
-    ContactSelectorList::new(&shown, query, highlight, style).show(
+    let (list, width) = ContactSelectorList::auto_columns(
         ctx,
-        id,
-        at,
-        name_width + email_width,
-        egui::Order::Foreground,
-    )
+        &shown,
+        query,
+        highlight,
+        CONTACT,
+        CONTACT_ROW,
+        CONTACT_PADDING,
+        CELL_PADDING,
+        NAME_MIN,
+    );
+    list.show(ctx, id, at, width, egui::Order::Foreground)
 }
 
 #[cfg(test)]

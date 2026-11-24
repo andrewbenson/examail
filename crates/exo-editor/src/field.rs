@@ -56,6 +56,15 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '\'' | '’')
 }
 
+/// Keeps `slot` equal to `text` without reallocating when unchanged.
+fn remember_last(slot: &mut Option<String>, text: &str) {
+    match slot {
+        Some(last) if last == text => {}
+        Some(last) => text.clone_into(last),
+        None => *slot = Some(text.to_owned()),
+    }
+}
+
 impl FieldSpelling {
     /// Checks with `engine` from now on.
     pub fn set_engine(&mut self, engine: Box<dyn Spelling>) {
@@ -126,21 +135,29 @@ impl FieldSpelling {
         if !response.has_focus() {
             self.marks.clear();
             self.due = None;
-            self.last = Some(text.clone());
+            remember_last(&mut self.last, text);
             return response;
         }
-        let edited = self.last.as_ref().is_some_and(|last| last != text);
+        let edited = self
+            .last
+            .as_deref()
+            .is_some_and(|last| last != text.as_str());
         if edited {
-            self.follow_edit(self.last.clone().unwrap_or_default().as_str(), text);
+            let before = self.last.take().unwrap_or_default();
+            self.follow_edit(&before, text);
+            self.last = Some(before);
         }
-        let caret = TextEditState::load(&ctx, id)
+        let state = TextEditState::load(&ctx, id);
+        let caret = state
+            .as_ref()
             .and_then(|state| state.cursor.char_range())
             .filter(|range| range.primary == range.secondary)
             .map(|range| range.primary.index.0);
-        let chars: Vec<char> = text.chars().collect();
-        let in_word =
-            caret.is_some_and(|at| at > 0 && chars.get(at - 1).copied().is_some_and(is_word_char));
-        if edited && typed && !pasted && in_word {
+        let in_word = edited
+            && typed
+            && !pasted
+            && caret.is_some_and(|at| at > 0 && text.chars().nth(at - 1).is_some_and(is_word_char));
+        if in_word {
             // As in `CurrentWordIfTypingInPartialWord`, the word being typed isn't marked yet.
             let caret = caret.unwrap_or_default();
             self.marks
@@ -156,17 +173,29 @@ impl FieldSpelling {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64((due - now).max(0.0)));
         }
-        self.last = Some(text.clone());
-        let top = line.top() + exo_ui::misspelling_top(style, &ctx);
-        let painter = ui
-            .painter()
-            .with_clip_rect(ui.clip_rect().intersect(Rect::from_x_y_ranges(
-                line.x_range(),
-                line.top()..=line.bottom() + 4.0,
-            )));
-        for mark in &self.marks {
-            let x = |index| exo_ui::field_x(&ctx, text, line, style, index);
-            exo_ui::paint_misspelling(&painter, x(mark.start)..x(mark.end), top, line.left());
+        remember_last(&mut self.last, text);
+        if !self.marks.is_empty() {
+            let galley = style.without_ligatures().single_line(
+                ui.painter(),
+                text,
+                Color32::PLACEHOLDER,
+                None,
+            );
+            let origin = line.left() - exo_ui::field_scroll_offset(&ctx, id);
+            let top = line.top() + exo_ui::misspelling_top(style, &ctx);
+            let painter =
+                ui.painter()
+                    .with_clip_rect(ui.clip_rect().intersect(Rect::from_x_y_ranges(
+                        line.x_range(),
+                        line.top()..=line.bottom() + 4.0,
+                    )));
+            let x = |index| origin + galley.pos_from_cursor(CCursor::new(index)).min.x;
+            for mark in &self.marks {
+                let span = x(mark.start)..x(mark.end);
+                if span.end > line.left() && span.start < line.right() {
+                    exo_ui::paint_misspelling(&painter, span, top, origin);
+                }
+            }
         }
         response
     }
@@ -260,7 +289,7 @@ impl FieldSpelling {
             set_selection(ctx, id, CCursorRange::one(end));
         }
         self.check(text);
-        self.last = Some(text.clone());
+        remember_last(&mut self.last, text);
     }
 
     /// Adds `word` to the user's dictionary (`Add to Dictionary`) and checks the field again at

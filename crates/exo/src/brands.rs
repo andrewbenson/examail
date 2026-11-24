@@ -10,24 +10,20 @@
 //! most once a day. The logo and certificate are fetched once (HTTPS only), and the logo, drawn,
 //! is kept with the photos until the certificate expires, or until its CA's revocation list,
 //! fetched about once a day, revokes it. Nothing a message names is ever fetched: the record comes
-//! from DNS. `Block all remote images` stops these fetches, as the sender's DNS names their URLs,
-//! and leaves the logos already validated.
+//! from DNS. `Block all remote images` stops these DNS lookups and fetches, as the sender's DNS
+//! names their URLs, and leaves the logos already validated.
 
 mod certificate;
 mod dns;
 mod records;
 
-use std::{
-    collections::HashMap,
-    io::Read as _,
-    path::PathBuf,
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{io::Read as _, path::PathBuf, time::Duration};
 
 use exo_store::{BrandCheck, BrandRecord, Header, RemoteContentBlocking, Settings, Store};
 use exo_ui::AvatarPhoto;
 use jiff::Timestamp;
+
+use crate::avatar_cache::{self, AvatarCache};
 
 /// The shortest a lookup is kept: a record is looked up again at most once a day. A CA's
 /// revocation list is kept as long, and the logos are checked against it as often.
@@ -38,23 +34,88 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// recommends for a logo.
 const MAX_FILE: usize = 256 << 10;
 
-/// The validated logos so far, by domain. It lives in the context's data, so whatever draws an
-/// avatar can find it ([`logo`]).
-type Shown = Arc<Mutex<HashMap<String, AvatarPhoto>>>;
+const CACHE_ID: &str = "exo::brands";
 
-fn shown(ctx: &egui::Context) -> Shown {
-    ctx.data_mut(|data| {
-        data.get_temp_mut_or_default::<Shown>(egui::Id::new("exo::brands"))
-            .clone()
-    })
+/// `(account, domain)`, both lower-cased, scoping validated brand logos per signed-in account.
+type BrandKey = (String, String);
+
+#[derive(Clone, Default)]
+struct ActiveAccount(Option<String>);
+
+fn cache(ctx: &egui::Context) -> AvatarCache<BrandKey> {
+    AvatarCache::of(ctx, CACHE_ID)
 }
 
-/// The validated logo of `email`'s domain, once mail from it has earned one.
-pub(crate) fn logo(ctx: &egui::Context, email: &str) -> Option<AvatarPhoto> {
-    let domain = email.rsplit_once('@')?.1.to_lowercase();
-    let shown = shown(ctx);
-    let shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-    shown.get(&domain).cloned()
+fn active_id() -> egui::Id {
+    egui::Id::new("exo::brands::active")
+}
+
+/// Records which signed-in account is drawing on `ctx` this frame, for [`active_logo`].
+pub(crate) fn set_active_account(ctx: &egui::Context, account: &str) {
+    let lower = account.to_lowercase();
+    ctx.data_mut(|data| data.insert_temp(active_id(), ActiveAccount(Some(lower))));
+}
+
+/// The validated logo of `email`'s domain in `account`, once mail from it in `account` has earned
+/// one.
+pub(crate) fn logo(ctx: &egui::Context, account: &str, email: &str) -> Option<AvatarPhoto> {
+    let (_, domain) = email.rsplit_once('@')?;
+    cache(ctx).photo(&(account.to_lowercase(), domain.to_lowercase()))
+}
+
+/// [`logo`] for whichever account [`set_active_account`] marked as on screen.
+pub(crate) fn active_logo(ctx: &egui::Context, email: &str) -> Option<AvatarPhoto> {
+    let active = ctx
+        .data(|data| data.get_temp::<ActiveAccount>(active_id()))
+        .and_then(|active| active.0)?;
+    logo(ctx, &active, email)
+}
+
+/// `account` closed or cleared its cache: its validated brand logos show no more.
+pub(crate) fn forget(ctx: &egui::Context, account: &str) {
+    let lower = account.to_lowercase();
+    cache(ctx).retain(|(owner, _)| owner != &lower);
+    ctx.data_mut(|data| {
+        if data
+            .get_temp::<ActiveAccount>(active_id())
+            .and_then(|active| active.0)
+            .as_deref()
+            == Some(lower.as_str())
+        {
+            data.insert_temp(active_id(), ActiveAccount(None));
+        }
+    });
+}
+
+/// Whether `headers` pass DMARC under an enforcing policy aligned with `email`'s domain.
+pub(crate) fn passed_for(headers: &[Header], email: &str) -> bool {
+    let Some((_, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    records::passed(headers).is_some_and(|passed| passed.domain.eq_ignore_ascii_case(domain.trim()))
+}
+
+/// Whether `detail`'s message on screen for `email` (`focused` first, else their newest received
+/// message in the conversation) passed DMARC: `Some(false)` suppresses any cached logo for a
+/// spoofed message, `Some(true)` allows it, and `None` means `detail` has no received message from
+/// `email`.
+pub(crate) fn allowed_in_thread(
+    detail: &exo_store::ThreadDetail,
+    focused: Option<&str>,
+    email: &str,
+) -> Option<bool> {
+    let from_sender = |message: &&exo_store::MessageDetail| {
+        !message.is_draft()
+            && message
+                .from
+                .as_ref()
+                .is_some_and(|from| from.email.eq_ignore_ascii_case(email))
+    };
+    let message = focused
+        .and_then(|id| detail.messages.iter().find(|message| message.id == id))
+        .filter(from_sender)
+        .or_else(|| detail.messages.iter().rev().find(from_sender))?;
+    Some(passed_for(&message.headers, email))
 }
 
 /// An account's lookups: its store, which keeps them, its photo cache, which keeps the logos, and
@@ -62,21 +123,29 @@ pub(crate) fn logo(ctx: &egui::Context, email: &str) -> Option<AvatarPhoto> {
 #[derive(Clone)]
 pub(crate) struct Brands {
     ctx: egui::Context,
+    account: String,
     store: Store,
     dir: PathBuf,
     /// For logos and certificates, over HTTPS only.
     http: crate::remote_content::Client,
     /// For revocation lists, which CAs serve over plain HTTP: they're signed.
     lists: crate::remote_content::Client,
-    /// Whether DNS may be asked. Not on gmail-mock, whose domains aren't the world's.
+    /// Whether DNS may be asked. Not on mock-servers, whose domains aren't the world's.
     lookups: bool,
 }
 
 impl Brands {
-    /// `store`'s brands, whose logos are kept in `dir`, the account's photo cache.
-    pub(crate) fn new(ctx: &egui::Context, store: Store, dir: PathBuf, lookups: bool) -> Self {
+    /// `account`'s brands in `store`, whose logos are kept in `dir`, the account's photo cache.
+    pub(crate) fn new(
+        ctx: &egui::Context,
+        account: &str,
+        store: Store,
+        dir: PathBuf,
+        lookups: bool,
+    ) -> Self {
         Self {
             ctx: ctx.clone(),
+            account: account.to_lowercase(),
             store,
             dir,
             http: crate::remote_content::Client::https_only(FETCH_TIMEOUT),
@@ -90,10 +159,30 @@ impl Brands {
         &self.ctx
     }
 
+    /// The validated logo of `email`'s domain in this account, if already loaded.
+    pub(crate) fn logo(&self, email: &str) -> Option<AvatarPhoto> {
+        logo(&self.ctx, &self.account, email)
+    }
+
+    /// [`Self::logo_for`] when `headers` pass DMARC aligned with `email`'s domain.
+    pub(crate) async fn logo_for_sender(&self, email: &str, headers: &[Header]) -> Option<Vec<u8>> {
+        if !passed_for(headers, email) {
+            return None;
+        }
+        self.logo_for(headers).await
+    }
+
     /// The logo (a PNG) of the brand that sent the message with `headers`, looked up first when
     /// that's due, which shows wherever its people are drawn ([`logo`]) from then on. `None` when
     /// the message or its domain doesn't earn one.
     pub(crate) async fn logo_for(&self, headers: &[Header]) -> Option<Vec<u8>> {
+        self.logo_for_with(headers, look_up).await
+    }
+
+    async fn logo_for_with<F>(&self, headers: &[Header], lookup: F) -> Option<Vec<u8>>
+    where
+        F: AsyncFnOnce(&str, Timestamp) -> Option<BrandRecord>,
+    {
         let domain = records::passed(headers)?.domain;
         let now = Timestamp::now();
         let kept = match self.store.brands().await {
@@ -105,24 +194,25 @@ impl Brands {
         };
         let mut record = match kept {
             Some(record) if record.next > now => record,
-            _ if !self.lookups => return None,
             kept => {
-                let record = carried(kept, look_up(&domain, now).await?, now);
-                self.save(&domain, &record).await;
-                record
+                if self.blocked().await {
+                    kept?
+                } else if !self.lookups {
+                    return None;
+                } else {
+                    let record = carried(kept, lookup(&domain, now).await?, now);
+                    self.save(&domain, &record).await;
+                    record
+                }
             }
         };
         let png = self.checked_logo(&domain, &mut record, now).await;
-        let photo = png.as_deref().and_then(|png| decode(&self.ctx, png));
-        let shown = shown(&self.ctx);
-        let mut shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-        match photo {
-            Some(photo) => shown.insert(domain, photo),
-            // A domain whose record or certificate no longer earns it a logo.
-            None => shown.remove(&domain),
-        };
-        drop(shown);
-        self.ctx.request_repaint();
+        let photo = png
+            .as_deref()
+            .and_then(|png| avatar_cache::decode(&self.ctx, "brand logo", png))
+            .map(|photo| (photo, ()));
+        // A domain whose record or certificate no longer earns it a logo is removed.
+        cache(&self.ctx).set((self.account.clone(), domain), photo);
         png
     }
 
@@ -151,14 +241,14 @@ impl Brands {
             .filter(|(_, record)| is_valid(record.checked, now))
             .filter_map(|(domain, record)| {
                 let (png, _) = self.kept(&record)?;
-                Some((domain, decode(&self.ctx, &png)?))
+                Some((
+                    (self.account.clone(), domain),
+                    avatar_cache::decode(&self.ctx, "brand logo", &png)?,
+                    (),
+                ))
             })
             .collect();
-        shown(&self.ctx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(logos);
-        self.ctx.request_repaint();
+        cache(&self.ctx).extend(logos);
     }
 
     /// Checks the certificates of the logos validated so far against their CAs' revocation lists.
@@ -186,11 +276,7 @@ impl Brands {
             log::info!("{domain}'s certificate is revoked: its logo goes");
             record.checked = Some(BrandCheck::Invalid);
             self.save(&domain, &record).await;
-            shown(&self.ctx)
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&domain);
-            self.ctx.request_repaint();
+            cache(&self.ctx).remove(&(self.account.clone(), domain));
         }
     }
 
@@ -462,17 +548,6 @@ fn draw(svg: &[u8]) -> Option<Vec<u8>> {
     pixmap.encode_png().ok()
 }
 
-/// `png` decoded into an avatar's textures.
-fn decode(ctx: &egui::Context, png: &[u8]) -> Option<AvatarPhoto> {
-    let image = image::load_from_memory(png).ok()?.into_rgba8();
-    let size = [image.width() as usize, image.height() as usize];
-    Some(AvatarPhoto::new(
-        ctx,
-        "brand logo",
-        egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +636,245 @@ mod tests {
         let svgz = svgz.finish().expect("compressed");
         assert_eq!(uncompressed(svgz), Some(svg.clone()));
         assert_eq!(uncompressed(svg.clone()), Some(svg));
+    }
+
+    #[test]
+    fn validated_logos_stay_isolated_per_account_and_forget_cleanly() {
+        let ctx = egui::Context::default();
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#00aa55"/></svg>"##;
+        let png = draw(svg).expect("drawn");
+        let photo = avatar_cache::decode(&ctx, "brand logo", &png).expect("decoded");
+
+        cache(&ctx).set(
+            ("alice@work.example".into(), "paypal.com".into()),
+            Some((photo, ())),
+        );
+
+        assert!(logo(&ctx, "Alice@Work.example", "service@paypal.com").is_some());
+        assert!(
+            logo(&ctx, "bob@private.example", "service@paypal.com").is_none(),
+            "another signed-in account never sees Alice's cached brand logo"
+        );
+
+        set_active_account(&ctx, "bob@private.example");
+        assert!(active_logo(&ctx, "service@paypal.com").is_none());
+        set_active_account(&ctx, "alice@work.example");
+        assert!(active_logo(&ctx, "service@paypal.com").is_some());
+
+        forget(&ctx, "alice@work.example");
+        assert!(logo(&ctx, "alice@work.example", "service@paypal.com").is_none());
+        assert!(active_logo(&ctx, "service@paypal.com").is_none());
+    }
+
+    #[test]
+    fn spoofed_messages_suppress_cached_brand_logos_in_threads() {
+        use exo_store::{Body, Contact, MessageDetail, ThreadDetail, ThreadId};
+
+        let message = |id: &str, email: &str, headers: Vec<Header>| MessageDetail {
+            id: id.into(),
+            labels: vec!["INBOX".into()],
+            date: Timestamp::UNIX_EPOCH,
+            from: Some(Contact {
+                name: Some("PayPal".into()),
+                email: email.into(),
+                is_me: false,
+            }),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            subject: "Alert".into(),
+            snippet: String::new(),
+            rfc822_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            list_id: None,
+            list_unsubscribe: None,
+            list_unsubscribe_post: None,
+            headers,
+            body: Body::default(),
+            attachments: Vec::new(),
+            failure: None,
+            scheduled: None,
+            sending: false,
+        };
+        let hdr = |name: &str, value: &str| Header {
+            name: name.into(),
+            value: value.into(),
+        };
+        let legit = message(
+            "m1",
+            "service@paypal.com",
+            vec![
+                hdr("From", "PayPal <service@paypal.com>"),
+                hdr(
+                    "Authentication-Results",
+                    "mx.google.com; dmarc=pass (p=REJECT sp=REJECT) header.from=paypal.com",
+                ),
+            ],
+        );
+        let failed = message(
+            "m2",
+            "security@paypal.com",
+            vec![
+                hdr("From", "PayPal Security <security@paypal.com>"),
+                hdr(
+                    "Authentication-Results",
+                    "mx.google.com; dmarc=fail (p=REJECT sp=REJECT) header.from=paypal.com",
+                ),
+            ],
+        );
+        let misaligned = message(
+            "m3",
+            "security@paypal.com",
+            vec![
+                hdr("From", "PayPal Security <security@paypal.com>"),
+                hdr(
+                    "Authentication-Results",
+                    "mx.google.com; dmarc=pass (p=REJECT sp=REJECT) header.from=evil.example",
+                ),
+            ],
+        );
+        let detail = ThreadDetail {
+            id: ThreadId::new("t1"),
+            subject: "Alert".into(),
+            labels: vec!["INBOX".into()],
+            muted: false,
+            messages: vec![legit, failed, misaligned],
+            reminder: None,
+        };
+        assert_eq!(
+            allowed_in_thread(&detail, Some("m1"), "service@paypal.com"),
+            Some(true)
+        );
+        assert_eq!(
+            allowed_in_thread(&detail, Some("m2"), "security@paypal.com"),
+            Some(false)
+        );
+        assert_eq!(
+            allowed_in_thread(&detail, Some("m3"), "security@paypal.com"),
+            Some(false)
+        );
+        assert_eq!(
+            allowed_in_thread(&detail, None, "security@paypal.com"),
+            Some(false)
+        );
+        assert_eq!(allowed_in_thread(&detail, None, "other@stripe.com"), None);
+    }
+
+    #[tokio::test]
+    async fn blocking_all_remote_images_skips_bimi_dns_lookups() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "exo-brands-blocked-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let photos = root.join("photos");
+        std::fs::create_dir_all(&photos).expect("photos dir");
+        let store = Store::open(
+            &root,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens store");
+        let mut settings = Settings::default();
+        settings.remote_content_blocking = Some(RemoteContentBlocking::All);
+        store
+            .save_settings(&settings)
+            .await
+            .expect("saves settings");
+
+        let brands = Brands::new(
+            &egui::Context::default(),
+            "maya@brightmoor.co",
+            store.clone(),
+            photos,
+            true,
+        );
+        let headers = vec![
+            Header {
+                name: "From".into(),
+                value: "Brand <hello@brand.example>".into(),
+            },
+            Header {
+                name: "Authentication-Results".into(),
+                value: "mx.google.com; dmarc=pass (p=REJECT sp=REJECT) header.from=brand.example"
+                    .into(),
+            },
+        ];
+
+        // With no cached record and RemoteContentBlocking::All, DNS lookup is skipped.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let got = brands
+            .logo_for_with(&headers, async move |_domain, _now| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+            .await;
+        assert_eq!(got, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "DNS lookup skipped");
+
+        // With an expired record whose logo and certificate are already validated on disk, DNS
+        // lookup is still skipped while the cached logo continues to serve.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#123456"/></svg>"##;
+        let png = draw(svg).expect("draws logo");
+        let logo_url = "https://brand.example/logo.svg";
+        let cert_url = "https://brand.example/vmc.pem";
+        crate::people::save(&brands.file(logo_url), &png).expect("saves logo");
+        crate::people::save(&brands.file(cert_url), b"cached-pem").expect("saves cert");
+        let expired_record = BrandRecord {
+            next: Timestamp::UNIX_EPOCH,
+            logo: Some(logo_url.to_owned()),
+            certificate: Some(cert_url.to_owned()),
+            checked: Some(BrandCheck::Valid {
+                until: Timestamp::now() + jiff::SignedDuration::from_hours(24),
+            }),
+        };
+        store
+            .save_brand("brand.example", &expired_record)
+            .await
+            .expect("saves brand");
+
+        let counted = calls.clone();
+        let got = brands
+            .logo_for_with(&headers, async move |_domain, _now| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+            .await;
+        assert_eq!(got, Some(png));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "DNS lookup still skipped");
+
+        // Once remote content blocking is relaxed, an expired record performs the DNS lookup.
+        settings.remote_content_blocking = Some(RemoteContentBlocking::ReduceTracking);
+        store
+            .save_settings(&settings)
+            .await
+            .expect("saves settings");
+        let counted = calls.clone();
+        let _ = brands
+            .logo_for_with(&headers, async move |_domain, _now| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+            .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "DNS lookup runs when allowed"
+        );
+
+        drop(brands);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

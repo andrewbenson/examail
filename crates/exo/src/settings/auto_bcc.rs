@@ -7,6 +7,7 @@
 //! hover fill.
 
 use egui::{Color32, Context, CursorIcon, Rect, Sense, Ui, pos2, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::Settings as AccountSettings;
 use exo_ui::{Dialog, DialogInput, DialogResponse, Family, Font, TextStyle};
 
@@ -153,6 +154,29 @@ impl State {
         matches!(self.focus, Focus::Input(_))
     }
 
+    /// Registers the dialog's keyboard bindings in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::AutoBcc(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        commands.add(key("AUTO_BCC_TAB", Event::Tab(1), &["tab"]));
+        commands.add(key("AUTO_BCC_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
+        // Space types in the inputs. On a link or a trash can it works as Enter.
+        let activate: &[&str] = if self.typing() {
+            &["enter"]
+        } else {
+            &["enter", "space"]
+        };
+        commands.add(key("AUTO_BCC_ENTER", Event::Activate, activate));
+    }
+
     /// Carries out `event` on `settings` (the account's as they are), returning what to save.
     /// `domain` is the account's address's domain.
     pub fn handle(&mut self, event: Event, settings: &AccountSettings, domain: &str) -> Saved {
@@ -249,7 +273,8 @@ impl State {
             .into_iter()
             .filter(|entry| !existing.contains(&crate::compose::auto_bcc::normalize(entry)))
             .partition(|entry| {
-                recipients::is_valid(&recipients::parse(entry).email) || is_valid_domain(entry)
+                recipients::is_valid(&recipients::parse(entry).email)
+                    || recipients::is_valid_domain(entry)
             });
         if !valid.is_empty() {
             let mut list = settings.auto_bcc_exclusions.clone();
@@ -318,17 +343,6 @@ fn quoted(entries: &[String]) -> String {
         .map(|entry| format!("'{entry}'"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Whether `text` reads as a domain.
-fn is_valid_domain(text: &str) -> bool {
-    static DOMAIN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
-        )
-        .expect("valid regex")
-    });
-    DOMAIN.is_match(text)
 }
 
 /// The body's height for `settings`'s lists: the two subheaders, lists and inputs.

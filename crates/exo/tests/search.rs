@@ -1,4 +1,4 @@
-//! Search and filters driven by keys, end to end: gmail-mock, a fresh store, the bar.
+//! Search and filters driven by keys, end to end: mock-servers, a fresh store, the bar.
 
 mod support;
 

@@ -73,27 +73,23 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<Eml> {
         Some(html) => message
             .attachments()
             .fold(html.to_owned(), |html, part| match cid(part) {
-                Some(id)
-                    if html
-                        .to_lowercase()
-                        .contains(&format!("cid:{id}").to_lowercase()) =>
-                {
-                    shown.push(id.clone());
-                    replace_cid(
-                        &html,
-                        &id,
-                        &format!(
-                            "data:{};base64,{}",
-                            kind(part),
-                            base64::engine::general_purpose::STANDARD.encode(part.contents())
-                        ),
-                    )
+                Some(id) => {
+                    let data_url = format!(
+                        "data:{};base64,{}",
+                        kind(part),
+                        base64::engine::general_purpose::STANDARD.encode(part.contents())
+                    );
+                    let (replaced, matched) = replace_cid(&html, &id, &data_url);
+                    if matched {
+                        shown.push(id);
+                    }
+                    replaced
                 }
-                _ => html,
+                None => html,
             }),
         None => message
             .body_text(0)
-            .map(|text| format!("<pre>{}</pre>", escape(&text)))
+            .map(|text| format!("<pre>{}</pre>", exo_mail::escape_html_text(&text)))
             .unwrap_or_default(),
     };
     let files = message
@@ -125,25 +121,51 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<Eml> {
     })
 }
 
-/// `html` with every `cid:{cid}` (in any case) replaced by `url`.
-fn replace_cid(html: &str, cid: &str, url: &str) -> String {
-    let needle = format!("cid:{cid}").to_lowercase();
-    let lower = html.to_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut at = 0;
-    while let Some(found) = lower[at..].find(&needle) {
-        out.push_str(&html[at..at + found]);
-        out.push_str(url);
-        at += found + needle.len();
+/// `html` with every `cid:{cid}` (in any ASCII case, including RFC 3986 percent-encoded characters
+/// such as `%40` for `@`) replaced by `url`, plus whether at least one reference matched.
+///
+/// Uses `to_ascii_lowercase` so multi-byte Unicode characters (`İ`, `ẞ`) keep identical UTF-8 byte
+/// offsets in `html`.
+fn replace_cid(html: &str, cid: &str, url: &str) -> (String, bool) {
+    if cid.is_empty() {
+        return (html.to_owned(), false);
     }
-    out.push_str(&html[at..]);
-    out
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    let mut matched = false;
+    while let Some(found) = lower[cursor..].find("cid:") {
+        let start = cursor + found;
+        let standalone = start == 0 || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let value_start = start + 4;
+        if standalone {
+            let value_end = html[value_start..]
+                .find(|ch: char| {
+                    matches!(
+                        ch,
+                        '"' | '\'' | '>' | '<' | ')' | ';' | ' ' | '\t' | '\r' | '\n'
+                    ) || ch.is_control()
+                })
+                .map_or(html.len(), |offset| value_start + offset);
+            let token = &html[value_start..value_end];
+            if !token.is_empty() && exo_mail::percent_decode_lossy(token).eq_ignore_ascii_case(cid)
+            {
+                out.push_str(&html[copied..start]);
+                out.push_str(url);
+                copied = value_end;
+                cursor = value_end;
+                matched = true;
+                continue;
+            }
+        }
+        cursor = value_start;
+    }
+    if !matched {
+        return (html.to_owned(), false);
+    }
+    out.push_str(&html[copied..]);
+    (out, true)
 }
 
 #[cfg(test)]
@@ -197,5 +219,16 @@ mod tests {
         let eml = parse(b"Subject: Hi\r\n\r\n<b> & more").expect("a message");
         assert_eq!(eml.html, "<pre>&lt;b&gt; &amp; more</pre>");
         assert!(parse(b"").is_none_or(|eml| eml.html.is_empty()));
+    }
+
+    #[test]
+    fn cid_replacement_handles_multibyte_case_folding_and_percent_encoding() {
+        let raw = "From: a@b.co\r\nSubject: İẞ\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=r\r\n\r\n--r\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>İSTANBUL GROẞE</p><img src=\"cid:logo%40inn.example\"><img src='CID:logo@inn.example'>\r\n--r\r\nContent-Type: image/png\r\nContent-ID: <logo@inn.example>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--r--\r\n";
+        let eml = parse(raw.as_bytes()).expect("parsed");
+        assert_eq!(
+            eml.html,
+            "<p>İSTANBUL GROẞE</p><img src=\"data:image/png;base64,iVBORw0K\"><img src='data:image/png;base64,iVBORw0K'>"
+        );
+        assert!(eml.files.is_empty());
     }
 }

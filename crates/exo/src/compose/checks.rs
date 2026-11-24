@@ -117,7 +117,7 @@ pub(crate) fn check(
     }
     // A reminder must be neither in the past nor before the send time.
     if let Some(reminder) = open.record.reminder {
-        let send_at = open.record.send_later.as_ref().map(|later| later.at);
+        let send_at = open.scheduled_at();
         if reminder.at < now || send_at.is_some_and(|at| reminder.at < at) {
             let text = if send_at.is_some() {
                 "We can't set a reminder before the send time.\nPlease update either setting and try again."
@@ -288,7 +288,7 @@ mod tests {
             current_message_ids: Vec::new(),
         });
         assert_eq!(anyway(&draft), "Schedule anyway");
-        draft.unscheduled_by = Some("Ann".into());
+        draft.delivery.unscheduled_by = Some("Ann".into());
         assert_eq!(anyway(&draft), "Send anyway", "a reply called it off");
     }
 
@@ -369,7 +369,20 @@ mod tests {
             abort_on_reply: false,
             current_message_ids: Vec::new(),
         });
-        assert_eq!(first(&open, Bypass::default()).map(|problem| problem.text), Some("We can't set a reminder before the send time.\nPlease update either setting and try again.".to_owned()));
+        assert_eq!(
+            first(&open, Bypass::default()).map(|problem| problem.text),
+            Some(
+                "We can't set a reminder before the send time.\nPlease update either setting and try again."
+                    .to_owned()
+            )
+        );
+        // Once a reply has cancelled the scheduled send, stale send_later no longer blocks.
+        open.delivery.unscheduled_by = Some("Ann".into());
+        assert_eq!(
+            first(&open, Bypass::default()),
+            None,
+            "unscheduled draft ignores stale send_later timestamp"
+        );
     }
 
     #[test]

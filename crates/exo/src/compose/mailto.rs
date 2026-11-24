@@ -1,31 +1,39 @@
 //! Reads `mailto:` links into the fields of the new message that a click on one opens.
 
+pub(super) use exo_mail::escape_html as escape;
+use exo_mail::percent_decode_lossy as percent_decode;
+
 use super::{factory::Fields, recipients};
 
 /// The new message `url` asks for: its addresses (the path and `to=`), `cc`, `bcc`, `subject`
 /// and `body` (HTML-escaped, newlines as `<br>`, as compose takes it). `None` for a URL that
 /// isn't `mailto:`.
 pub(crate) fn fields(url: &str) -> Option<Fields> {
-    let rest = url
-        .get(..7)
-        .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
-        .map(|_| &url[7..])?;
+    let rest = exo_mail::strip_ascii_prefix(url, "mailto:")?;
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
     let mut fields = Fields::default();
-    let mut to: Vec<String> = Vec::new();
-    let path = percent_decode(path);
-    if !path.is_empty() {
-        to.extend(path.split(',').map(str::to_owned));
-    }
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        let list = |value: &str| value.split(',').map(recipients::parse).collect::<Vec<_>>();
-        match key.to_lowercase().as_str() {
-            "to" => to.extend(value.split(',').map(str::to_owned)),
-            "cc" => fields.cc = list(&value),
-            "bcc" => fields.bcc = list(&value),
+    let mut to = exo_mail::split_mailto_addresses(path);
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(raw_key);
+        let list = |raw: &str| {
+            exo_mail::split_mailto_addresses(raw)
+                .into_iter()
+                .map(|address| recipients::parse(address.trim()))
+                .filter(|address| !address.email.is_empty() || address.name.is_some())
+                .collect::<Vec<_>>()
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "to" => to.extend(exo_mail::split_mailto_addresses(raw_value)),
+            "cc" => fields.cc = list(raw_value),
+            "bcc" => fields.bcc = list(raw_value),
             // The subject is a single line, so line breaks go.
-            "subject" => fields.subject = value.replace(['\r', '\n'], ""),
-            "body" => fields.body = escape(&value).replace("\r\n", "\n").replace('\n', "<br>"),
+            "subject" => fields.subject = percent_decode(raw_value).replace(['\r', '\n'], ""),
+            "body" => {
+                fields.body = escape(&percent_decode(raw_value))
+                    .replace("\r\n", "\n")
+                    .replace('\n', "<br>");
+            }
             _ => {}
         }
     }
@@ -35,34 +43,6 @@ pub(crate) fn fields(url: &str) -> Option<Fields> {
         .filter(|address| !address.email.is_empty() || address.name.is_some())
         .collect();
     Some(fields)
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'%'
-            && let Some(byte) = text
-                .get(at + 1..at + 3)
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(byte);
-            at += 3;
-            continue;
-        }
-        out.push(bytes[at]);
-        at += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-pub(super) fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -95,5 +75,23 @@ mod tests {
     fn only_mailto() {
         assert!(fields("https://x.com").is_none());
         assert!(fields("MAILTO:a@x.com").is_some());
+    }
+
+    #[test]
+    fn preserves_plus_signs_encoded_commas_and_malformed_percent_sequences() {
+        let parsed = fields(
+            "mailto:%22Lee%2C%20Bob%22%20%3Cbob+vip@x.com%3E?to=ann+tag@x.com&subject=C++%201+1%20%+a&body=a+b%20%+a",
+        )
+        .expect("mailto");
+        assert_eq!(parsed.to.len(), 2);
+        assert_eq!(parsed.to[0].email, "bob+vip@x.com");
+        assert_eq!(parsed.to[0].name.as_deref(), Some("Bob Lee"));
+        assert_eq!(parsed.to[1].email, "ann+tag@x.com");
+        assert_eq!(parsed.subject, "C++ 1+1 %+a");
+        assert_eq!(parsed.body, "a+b %+a");
+
+        let plus_subject = fields("mailto:a@x.com?subject=1+1%3D2%20%+a").expect("mailto");
+        assert_eq!(plus_subject.subject, "1+1=2 %+a");
+        assert_eq!(percent_decode("%+a%-1%zz%41"), "%+a%-1%zzA");
     }
 }

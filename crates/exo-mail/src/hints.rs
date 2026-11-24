@@ -5,66 +5,71 @@
 
 use std::{collections::HashSet, fmt::Write as _};
 
-use crate::dom::{self, Style};
+use blitz_dom::{BaseDocument, NodeId};
+
+use crate::dom::Style;
 
 /// How many value-specific rules a body gets. Mail uses a handful of distinct values, but a
 /// hostile one could use thousands, and Blitz matches every rule against every element.
 const MAX_RULES: usize = 256;
 
-/// The rules for every presentational attribute in `html` (the first [`MAX_RULES`] values).
-pub(crate) fn stylesheet(html: &str) -> String {
-    let document = dom::parse(html);
-    let mut css = String::from(STATIC_RULES);
-    let mut seen = HashSet::new();
-    let mut once = |kind: &'static str, value: &str| {
-        seen.len() < MAX_RULES && seen.insert((kind, value.to_owned()))
-    };
-    for element in dom::select(&document, dom::is_element) {
-        let tag = dom::tag(&element).unwrap_or_default().to_ascii_lowercase();
-        let attr = |name: &str| {
-            dom::attr(&element, name)
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty())
-        };
+struct Rules {
+    css: String,
+    seen: HashSet<(&'static str, String)>,
+}
+
+impl Rules {
+    fn new(prefix: &str) -> Self {
+        Self {
+            css: String::from(prefix),
+            seen: HashSet::new(),
+        }
+    }
+
+    fn once(&mut self, kind: &'static str, value: &str) -> bool {
+        self.seen.len() < MAX_RULES && self.seen.insert((kind, value.to_owned()))
+    }
+
+    fn visit<'a>(&mut self, tag: &str, attr: impl Fn(&str) -> Option<&'a str>) {
         if tag == "table" {
             if let Some(value) = attr("cellspacing")
-                && let Some(px) = pixels(&value)
-                && once("cellspacing", &value)
+                && let Some(px) = pixels(value)
+                && self.once("cellspacing", value)
             {
                 let _ = writeln!(
-                    css,
+                    self.css,
                     ":where(table[cellspacing=\"{}\"]) {{ border-spacing: {px}px; }}",
-                    escape(&value)
+                    escape(value)
                 );
             }
             if let Some(value) = attr("cellpadding")
-                && let Some(px) = pixels(&value)
-                && once("cellpadding", &value)
+                && let Some(px) = pixels(value)
+                && self.once("cellpadding", value)
             {
-                let table = format!("table[cellpadding=\"{}\"]", escape(&value));
+                let table = format!("table[cellpadding=\"{}\"]", escape(value));
                 let _ = writeln!(
-                    css,
+                    self.css,
                     ":where({table} > * > tr > :is(td, th), {table} > tr > :is(td, th)) {{ padding: {px}px; }}"
                 );
             }
         }
         if tag == "font" {
             if let Some(value) = attr("color")
-                && once("color", &value)
+                && self.once("color", value)
             {
                 let color = if value.len() == 6 && value.chars().all(|c| c.is_ascii_hexdigit()) {
                     format!("#{value}")
                 } else {
-                    sanitize_value(&value)
+                    sanitize_value(value)
                 };
                 let _ = writeln!(
-                    css,
+                    self.css,
                     ":where(font[color=\"{}\"]) {{ color: {color}; }}",
-                    escape(&value)
+                    escape(value)
                 );
             }
             if let Some(value) = attr("face")
-                && once("face", &value)
+                && self.once("face", value)
             {
                 let families: Vec<String> = value
                     .split(',')
@@ -79,48 +84,93 @@ pub(crate) fn stylesheet(html: &str) -> String {
                     })
                     .collect();
                 let _ = writeln!(
-                    css,
+                    self.css,
                     ":where(font[face=\"{}\"]) {{ font-family: {}; }}",
-                    escape(&value),
+                    escape(value),
                     families.join(", ")
                 );
             }
             if let Some(value) = attr("size")
-                && let Some(size) = legacy_font_size(&value)
-                && once("size", &value)
+                && let Some(size) = legacy_font_size(value)
+                && self.once("size", value)
             {
                 let _ = writeln!(
-                    css,
+                    self.css,
                     ":where(font[size=\"{}\"]) {{ font-size: {size}; }}",
-                    escape(&value)
+                    escape(value)
                 );
             }
         }
         if let Some(style) = attr("style")
-            && let Some(size) = optical_size(&style)
-            && once("opsz", &style)
+            && let Some(size) = optical_size(style)
+            && self.once("opsz", style)
         {
             let _ = writeln!(
-                css,
+                self.css,
                 ":where([style=\"{}\"]) {{ font-variation-settings: \"opsz\" {size}; }}",
-                escape(&style)
+                escape(style)
             );
         }
         if matches!(
-            tag.as_str(),
+            tag,
             "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
         ) && let Some(value) = attr("background")
-            && once("background", &value)
+            && self.once("background", value)
         {
             let _ = writeln!(
-                css,
+                self.css,
                 ":where({tag}[background=\"{}\"]) {{ background-image: url(\"{}\"); }}",
-                escape(&value),
-                escape(&value)
+                escape(value),
+                escape(value)
             );
         }
     }
-    css
+}
+
+/// The dynamic value-specific rules for presentational attributes under `root` in Blitz's parsed
+/// [`BaseDocument`], or `None` when [`STATIC_RULES`] alone suffices.
+pub(crate) fn dynamic_rules(document: &BaseDocument, root: NodeId) -> Option<String> {
+    let mut rules = Rules::new("");
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(node) = document.get_node(id) else {
+            continue;
+        };
+        if let Some(element) = node.element_data() {
+            let tag = element.name.local.to_ascii_lowercase();
+            rules.visit(&tag, |name| {
+                element
+                    .attrs()
+                    .iter()
+                    .find(|attr| attr.name.prefix.is_none() && &*attr.name.local == name)
+                    .map(|attr| attr.value.trim())
+                    .filter(|v| !v.is_empty())
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    (!rules.css.is_empty()).then_some(rules.css)
+}
+
+/// The rules for every presentational attribute in `html` (the first [`MAX_RULES`] values).
+#[cfg(test)]
+pub(crate) fn stylesheet(html: &str) -> String {
+    use crate::dom;
+    let document = dom::parse(html);
+    let mut rules = Rules::new(STATIC_RULES);
+    for element in dom::select(&document, dom::is_element) {
+        let tag = dom::tag(&element).unwrap_or_default().to_ascii_lowercase();
+        let attrs = dom::attrs(&element);
+        rules.visit(&tag, |name| {
+            attrs
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.trim())
+                .filter(|v| !v.is_empty())
+        });
+    }
+    dom::drop_tree(document);
+    rules.css
 }
 
 const GENERIC_FAMILIES: &[&str] = &[
@@ -133,7 +183,7 @@ const GENERIC_FAMILIES: &[&str] = &[
 ];
 
 /// Hints with a fixed set of values.
-const STATIC_RULES: &str = "\
+pub(crate) const STATIC_RULES: &str = "\
 :where(:is(thead, tbody, tfoot, tr, td, th, col, colgroup)[valign=\"top\" i]) { vertical-align: top; }
 :where(:is(thead, tbody, tfoot, tr, td, th, col, colgroup)[valign=\"middle\" i]) { vertical-align: middle; }
 :where(:is(thead, tbody, tfoot, tr, td, th, col, colgroup)[valign=\"bottom\" i]) { vertical-align: bottom; }

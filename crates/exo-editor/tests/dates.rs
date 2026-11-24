@@ -62,6 +62,20 @@ fn dates_are_found_within_one_text_node_and_not_in_links() {
         None
     );
     assert_eq!(
+        active(
+            "<div>see <a href=\"https://x.co\"><b>Friday</b></a></div>",
+            6
+        ),
+        None
+    );
+    assert_eq!(
+        active(
+            "<div>see <a href=\"https://x.co\"><i>tomorrow</i></a></div>",
+            6
+        ),
+        None
+    );
+    assert_eq!(
         active("<div>see <b>Friday</b></div>", 6).as_deref(),
         Some("Friday")
     );

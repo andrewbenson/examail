@@ -2,9 +2,11 @@
 //! Autocorrect` switch, without `Languages`, because macOS's spellchecker detects each
 //! paragraph's language itself.
 
-use egui::{Color32, Context, CursorIcon, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, Context, Rect, Ui, pos2, vec2};
 use exo_commands::{Command, Commands};
-use exo_ui::{Dialog, DialogResponse, Family, Font, TextStyle};
+use exo_ui::{
+    DIALOG_SWITCH_ROW_HEIGHT, Dialog, DialogResponse, Family, Font, SwitchRow, TextStyle,
+};
 
 use super::{Action, Dialog as Which, Toggle};
 
@@ -14,12 +16,9 @@ const HEADER_GAP: f32 = 24.0;
 const INTRO: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
 const NUDGE: f32 = 3.0;
 const INTRO_GAP: f32 = 8.0;
-/// The switch row: `padding: 4px 0; margin: 16px 0 15px`, its label 12px/20px semibold (`top:
-/// 3px`), its switch 16px tall at the right.
+/// The switch row: `padding: 4px 0; margin: 16px 0 15px`.
 const SWITCH_ABOVE: f32 = 16.0;
-const SWITCH_PADDING: f32 = 4.0;
 const SWITCH_BELOW: f32 = 15.0;
-const LABEL: TextStyle = TextStyle::new(Font::new(Family::Sans, 600), 12.0, 20.0);
 /// The rule under the switch: 1px `rgba(0, 0, 0, .15)`, 16px above what follows.
 const RULE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 38);
 const SECTION_BELOW: f32 = 16.0;
@@ -42,8 +41,7 @@ pub fn dialog(ctx: &Context, area: Rect, open: bool, on: bool) -> DialogResponse
     let body = HEADER_GAP
         + intro
         + SWITCH_ABOVE
-        + 2.0 * SWITCH_PADDING
-        + LABEL.line_height
+        + DIALOG_SWITCH_ROW_HEIGHT
         + SWITCH_BELOW
         + 1.0
         + SECTION_BELOW;
@@ -64,36 +62,16 @@ fn show(ui: &Ui, body: Rect, paragraphs: &[Vec<String>], on: bool) -> Option<Act
         }
     }
     y += SWITCH_ABOVE;
-    let row = Rect::from_min_size(
+    let response = SwitchRow::dialog(
+        exo_ui::id(ui.ctx(), "autocorrect-use"),
         pos2(body.left(), y),
-        vec2(body.width(), 2.0 * SWITCH_PADDING + LABEL.line_height),
-    );
-    let response = ui
-        .interact(row, exo_ui::id(ui.ctx(), "autocorrect-use"), Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand);
-    LABEL.paint_line(
-        &painter,
-        pos2(row.left(), row.top() + SWITCH_PADDING + NUDGE),
+        body.width(),
         "Use Autocorrect",
-        INK,
-        None,
-    );
-    let slider = Rect::from_min_size(
-        pos2(
-            row.right() - exo_ui::SLIDER_SIZE.x,
-            row.top() + SWITCH_PADDING,
-        ),
-        exo_ui::SLIDER_SIZE,
-    );
-    exo_ui::paint_slider(
-        &painter,
-        slider,
         on,
-        false,
-        exo_ui::id(ui.ctx(), "autocorrect-use-slider"),
-        exo_ui::SliderColors::CLASSIC,
-    );
-    let rule = row.bottom() + SWITCH_BELOW;
+    )
+    .slider_id(exo_ui::id(ui.ctx(), "autocorrect-use-slider"))
+    .show(ui);
+    let rule = y + DIALOG_SWITCH_ROW_HEIGHT + SWITCH_BELOW;
     painter.rect_filled(
         Rect::from_min_size(pos2(body.left(), rule), vec2(body.width(), 1.0)),
         0.0,

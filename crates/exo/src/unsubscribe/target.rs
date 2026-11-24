@@ -200,6 +200,32 @@ fn sender(message: &MessageDetail) -> (String, String, String) {
     }
 }
 
+/// Extracts the list or `mailto:` recipient host domain from a `List-Id` identifier.
+fn list_host(list: &str) -> &str {
+    let rest = list
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+        .map_or(list, |_| &list[7..]);
+    let without_query = rest.split('?').next().unwrap_or_default().trim();
+    let host = without_query
+        .rsplit_once('@')
+        .map_or(without_query, |(_, host)| host);
+    host.trim().trim_matches('.')
+}
+
+/// Whether `host` equals `domain` or is a subdomain beneath `.{domain}` (case-insensitively).
+fn matches_domain(host: &str, domain: &str) -> bool {
+    let host = host.trim().trim_matches('.');
+    let domain = domain.trim().trim_matches('.');
+    if host.is_empty() || domain.is_empty() {
+        return false;
+    }
+    host.eq_ignore_ascii_case(domain)
+        || (host.len() > domain.len()
+            && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+            && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
+}
+
 /// `message`'s header unsubscribe. There's none for a draft, or for a list at one of your own
 /// domains (`List-Id` at one of `own_domains`). A `mailto:` comes first, then an `https:` link when
 /// one-click is allowed, then whatever link the header lists first.
@@ -208,14 +234,15 @@ fn from_header(message: &MessageDetail, own_domains: &[String]) -> Option<Unsubs
         return None;
     }
     let header = message.list_unsubscribe.as_deref()?;
-    if let Some(list) = message
+    if let Some(host) = message
         .list_id
         .as_deref()
         .map(list_id_address)
-        .filter(|list| !list.is_empty())
+        .map(list_host)
+        .filter(|host| !host.is_empty())
         && own_domains
             .iter()
-            .any(|domain| list.ends_with(domain.as_str()))
+            .any(|domain| matches_domain(host, domain))
     {
         return None;
     }
@@ -503,5 +530,20 @@ mod tests {
                 .map(|found| found.target),
             Some(Target::Web(web("https://shop.example/h")))
         );
+
+        let mut lookalike = message("m1", Some("<https://notshop.example/u>"), true);
+        lookalike.list_id = Some("Lookalike <news.notshop.example>".into());
+        assert!(
+            find(&thread(vec![lookalike]), &own, |_| None).is_some(),
+            "notshop.example is not a subdomain of shop.example"
+        );
+
+        let mut mailto_list_id = message("m1", Some("<https://shop.example/u>"), true);
+        mailto_list_id.list_id = Some("<mailto:team@lists.shop.example?subject=help>".into());
+        assert_eq!(find(&thread(vec![mailto_list_id]), &own, |_| None), None);
+
+        let mut spoofed_query = message("m1", Some("<https://evil.example/u>"), true);
+        spoofed_query.list_id = Some("<mailto:list@evil.example?domain=shop.example>".into());
+        assert!(find(&thread(vec![spoofed_query]), &own, |_| None).is_some());
     }
 }

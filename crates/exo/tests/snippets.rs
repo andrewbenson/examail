@@ -1,6 +1,6 @@
 //! Personal snippets end to end: the folder (`G` `;`), creating and saving one, opening it
 //! read-only, leaving it with unsaved changes, using it inline with `;` and with ⌘; (variables
-//! replaced), and counting its sends and replies, on gmail-mock.
+//! replaced), and counting its sends and replies, on mock-servers.
 
 mod support;
 
@@ -335,7 +335,6 @@ fn undo_send_into_the_pane_over_an_unsaved_snippet_asks_to_save_it() {
         "Save Snippet? before the draft comes back"
     );
     // `Don't save` (Delete, for one never saved), then the draft is back in the pane.
-    app.key(Key::Tab);
     app.key(Key::Tab);
     app.key(Key::Enter);
     assert!(

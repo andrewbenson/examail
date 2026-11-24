@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 
 use toasty::Executor;
 
-use crate::db::{AttachmentRow, BodyRow, ListEntry, MessageRow, ReminderRow, ThreadRow};
+use crate::db::{
+    AttachmentRow, BodyRow, ListEntry, MessageRow, ParticipantEntry, ReminderRow, TextDue,
+    ThreadRow,
+};
 use crate::error::Result;
 use crate::mutation::Step;
 use crate::parse::{Parsed, parse};
@@ -245,21 +248,20 @@ async fn insert_parts(
 
 /// Deletes messages with their attachments and bodies.
 pub(crate) async fn delete_messages(exec: &mut dyn Executor, ids: &[String]) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
+    for chunk in ids.chunks(crate::db::IN_LIST_CHUNK) {
+        MessageRow::filter(MessageRow::fields().id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
+        AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
+        BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
     }
-    MessageRow::filter(MessageRow::fields().id().in_list(ids))
-        .delete()
-        .exec(exec)
-        .await?;
-    AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(ids))
-        .delete()
-        .exec(exec)
-        .await?;
-    BodyRow::filter(BodyRow::fields().message_id().in_list(ids))
-        .delete()
-        .exec(exec)
-        .await?;
     Ok(())
 }
 
@@ -277,10 +279,119 @@ pub(crate) async fn delete_thread(exec: &mut dyn Executor, id: &str) -> Result<(
         .delete()
         .exec(exec)
         .await?;
+    ParticipantEntry::filter_by_thread_id(id)
+        .delete()
+        .exec(exec)
+        .await?;
+    TextDue::filter_by_thread_id(id).delete().exec(exec).await?;
+    crate::search::unindex(exec, id).await?;
     // Gone from Gmail, it has nothing to come back to.
     ReminderRow::filter_by_thread_id(id)
         .delete()
         .exec(exec)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn delete_thread_unindexes_participants_text_due_and_fts() {
+        let dir =
+            std::env::temp_dir().join(format!("exo-store-delete-thread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        let msg = gmail::Message {
+            id: Some("m1".into()),
+            thread_id: Some("t1".into()),
+            internal_date: Some(1_794_900_000_000),
+            label_ids: vec!["INBOX".into()],
+            payload: Some(gmail::MessagePart {
+                mime_type: Some("text/plain".into()),
+                headers: vec![
+                    gmail::MessagePartHeader {
+                        name: "Subject".into(),
+                        value: "Zeppelin".into(),
+                    },
+                    gmail::MessagePartHeader {
+                        name: "From".into(),
+                        value: "Ada <ada@example.com>".into(),
+                    },
+                ],
+                body: Some(gmail::MessagePartBody {
+                    data: Some(b"uniquezeppelinbody".to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            let parsed = crate::parse::parse(&msg, true).expect("parses");
+            save_message(write.exec(), parsed).await.expect("saves");
+            crate::store::reindex(write.exec(), "t1", &store.inner.router())
+                .await
+                .expect("indexes");
+            write.commit().await.expect("commits");
+        }
+        assert_eq!(
+            store
+                .recent_threads("ada@example.com", 10)
+                .await
+                .expect("recent")
+                .len(),
+            1
+        );
+        assert_eq!(
+            TextDue::filter_by_thread_id("t1")
+                .exec(&mut db)
+                .await
+                .expect("due")
+                .len(),
+            1
+        );
+
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            delete_thread(write.exec(), "t1").await.expect("deletes");
+            write.commit().await.expect("commits");
+        }
+        assert!(
+            store
+                .recent_threads("ada@example.com", 10)
+                .await
+                .expect("recent")
+                .is_empty()
+        );
+        assert!(
+            TextDue::filter_by_thread_id("t1")
+                .exec(&mut db)
+                .await
+                .expect("due")
+                .is_empty()
+        );
+        let mut s = crate::Search::new("uniquezeppelinbody");
+        assert!(
+            store
+                .search(&mut s, 10, false, 10)
+                .await
+                .expect("search")
+                .results
+                .is_empty()
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

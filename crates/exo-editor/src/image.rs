@@ -9,6 +9,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use egui::{ColorImage, TextureHandle, TextureOptions, Vec2, vec2};
+use exo_mail::dom::Style;
 
 use crate::model::Element;
 
@@ -316,9 +317,9 @@ impl ImageBox {
 
 /// Whether an `<img>` is `display: block`.
 fn is_block(image: &Element) -> bool {
-    declarations(image.attr("style").unwrap_or_default())
-        .iter()
-        .any(|(property, value)| property == "display" && value.starts_with("block"))
+    Style::parse(image.attr("style").unwrap_or_default())
+        .get("display")
+        .starts_with("block")
 }
 
 /// An `<img>`'s used size (CSS 2.1 sections 10.3.2, 10.6.2 and 10.4) under the editor's
@@ -326,13 +327,10 @@ fn is_block(image: &Element) -> bool {
 /// its attributes), with the missing one taken from its aspect ratio (its pixels', or its
 /// attributes' while it loads), clamped to the block.
 fn css_size(image: &Element, natural: Option<Vec2>, container: f32) -> Vec2 {
-    let style = declarations(image.attr("style").unwrap_or_default());
+    let style = Style::parse(image.attr("style").unwrap_or_default());
     let property = |name: &str| {
-        style
-            .iter()
-            .rev()
-            .find(|(property, _)| property == name)
-            .map(|(_, value)| value.as_str())
+        let value = style.get(name);
+        (!value.is_empty()).then_some(value)
     };
     let width = match property("width") {
         Some(value) => length(value, Some(container)),
@@ -469,9 +467,8 @@ pub(crate) fn pasted(image: &mut Element, cid: &str) {
 /// Gives an inserted image with no width yet its resolution and Best Fit's width once it loads.
 pub(crate) fn fit_on_load(image: &mut Element, natural: Vec2, picture_retina: u32) {
     image.set_attr("data-retina", &picture_retina.max(1).to_string());
-    let style = declarations(image.attr("style").unwrap_or_default());
-    if image.attr("width").is_some_and(|width| !width.is_empty())
-        || style.iter().any(|(property, _)| property == "width")
+    let style = Style::parse(image.attr("style").unwrap_or_default());
+    if image.attr("width").is_some_and(|width| !width.is_empty()) || !style.get("width").is_empty()
     {
         return;
     }
@@ -493,35 +490,13 @@ pub(crate) fn resize(image: &mut Element, width: f32, natural: Vec2) {
     }
 }
 
-/// A `style` attribute's declarations, in order, names lowercased.
-fn declarations(style: &str) -> Vec<(String, String)> {
-    style
-        .split(';')
-        .filter_map(|declaration| {
-            let (property, value) = declaration.split_once(':')?;
-            Some((
-                property.trim().to_ascii_lowercase(),
-                value.trim().to_owned(),
-            ))
-        })
-        .filter(|(property, value)| !property.is_empty() && !value.is_empty())
-        .collect()
-}
-
 /// Sets one property through the CSSOM (`element.style.width = …`), which writes the whole
 /// attribute back as Chromium serializes it, as `name: value;` declarations separated by spaces,
 /// with the property kept in its place or added last.
 fn set_style(image: &mut Element, property: &str, value: &str) {
-    let mut style = declarations(image.attr("style").unwrap_or_default());
-    match style.iter_mut().find(|(name, _)| name == property) {
-        Some((_, existing)) => value.clone_into(existing),
-        None => style.push((property.to_owned(), value.to_owned())),
-    }
-    let written: Vec<String> = style
-        .iter()
-        .map(|(name, value)| format!("{name}: {value};"))
-        .collect();
-    image.set_attr("style", &written.join(" "));
+    let mut style = Style::parse(image.attr("style").unwrap_or_default());
+    style.set(property, value, false);
+    image.set_attr("style", &style.css());
 }
 
 /// A CSS `<length>` or `<percentage>` (of `percent_of`; `None` makes a percentage `auto`) in px.
@@ -870,5 +845,22 @@ mod tests {
         );
         let carbon = egui::Color32::from_rgba_unmultiplied(106, 134, 173, 254);
         assert_eq!(selection_tint(carbon), carbon);
+    }
+
+    #[test]
+    fn inline_style_semicolons_in_data_urls_stay_intact() {
+        let mut image = img(&[(
+            "style",
+            "background: url(data:image/png;base64,iVBORw0K); width: 200px;",
+        )]);
+        assert_eq!(
+            css_size(&image, Some(vec2(400.0, 200.0)), 640.0),
+            vec2(200.0, 100.0)
+        );
+        resize(&mut image, 160.0, vec2(400.0, 200.0));
+        assert_eq!(
+            image.attr("style"),
+            Some("background: url(data:image/png;base64,iVBORw0K); width: 160px; height: 80px;")
+        );
     }
 }

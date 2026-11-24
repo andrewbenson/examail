@@ -13,7 +13,7 @@
 use egui::{
     Color32, ColorImage, CornerRadius, CursorIcon, Id, Key, LayerId, Modifiers, Order, Painter,
     Pos2, Rect, TextureId, Ui, Vec2,
-    epaint::{ClippedPrimitive, Primitive},
+    epaint::{ClippedPrimitive, Primitive, Vertex},
     pos2,
 };
 
@@ -137,7 +137,7 @@ impl Editor {
             return;
         }
         if !drag.dragging {
-            self.view.toolbar.reset();
+            self.close_toolbar();
             self.set_selection(Selection::caret(self.hit(rect.min, drag.press)));
         } else if let Some(at) = drag.drop {
             let smart = self.view.word_selection == Some(self.selection);
@@ -170,7 +170,7 @@ impl Editor {
             return false;
         };
         let at = self.hit(rect.min, dropped.at);
-        self.view.toolbar.reset();
+        self.close_toolbar();
         if dropped.source == Some(id) {
             let smart = self.view.word_selection == Some(self.selection);
             self.drop_selection(at, dropped.copy, smart);
@@ -269,9 +269,9 @@ impl Editor {
 
 /// Draws the font texture's triangles of `primitives` into a transparent picture of `bounds`, at
 /// `pixels_per_point`, as egui's renderer would. Each pixel gets the premultiplied vertex colour
-/// times the texel nearest its centre, blended over what's there, and is drawn by one triangle of
-/// a quad. Emoji and images, drawn from other textures, are left out. Returns the picture and the
-/// rect it covers, on whole pixels.
+/// times the texel nearest its centre, blended over what's there, with a direct UV scan over
+/// axis-aligned glyph and rect quads. Emoji and images, drawn from other textures, are left out.
+/// Returns the picture and the rect it covers, on whole pixels.
 fn rasterize(
     primitives: &[ClippedPrimitive],
     atlas: &ColorImage,
@@ -282,12 +282,12 @@ fn rasterize(
         (bounds.min.x * pixels_per_point).floor(),
         (bounds.min.y * pixels_per_point).floor(),
     );
+    let offset = Vec2::new(left, top);
     let (width, height) = (
         ((bounds.max.x * pixels_per_point).ceil() - left).max(1.0) as usize,
         ((bounds.max.y * pixels_per_point).ceil() - top).max(1.0) as usize,
     );
     let mut pixels = vec![Color32::TRANSPARENT; width * height];
-    let [atlas_width, atlas_height] = atlas.size;
     for primitive in primitives {
         let Primitive::Mesh(mesh) = &primitive.primitive else {
             continue;
@@ -296,80 +296,40 @@ fn rasterize(
             continue;
         }
         let clip = Rect::from_min_max(
-            primitive.clip_rect.min * pixels_per_point,
-            primitive.clip_rect.max * pixels_per_point,
+            primitive.clip_rect.min * pixels_per_point - offset,
+            primitive.clip_rect.max * pixels_per_point - offset,
         );
-        for triangle in mesh.indices.as_chunks::<3>().0 {
-            let [a, b, c] = [0, 1, 2].map(|corner| &mesh.vertices[triangle[corner] as usize]);
-            let [pa, pb, pc] =
-                [a, b, c].map(|vertex| vertex.pos * pixels_per_point - Vec2::new(left, top));
-            let area = (pb - pa).x * (pc - pa).y - (pb - pa).y * (pc - pa).x;
-            if area.abs() < f32::EPSILON {
+        let mut index = 0;
+        while index + 3 <= mesh.indices.len() {
+            if index + 6 <= mesh.indices.len()
+                && let Some(quad) = Quad::from_indices(
+                    &mesh.vertices,
+                    &mesh.indices[index..index + 6],
+                    pixels_per_point,
+                    offset,
+                )
+            {
+                rasterize_quad(&quad, clip, atlas, &mut pixels, width, height);
+                index += 6;
                 continue;
             }
-            let x_range = (pa
-                .x
-                .min(pb.x)
-                .min(pc.x)
-                .max(clip.min.x - left)
-                .floor()
-                .max(0.0) as usize)
-                ..(pa
-                    .x
-                    .max(pb.x)
-                    .max(pc.x)
-                    .min(clip.max.x - left)
-                    .ceil()
-                    .min(width as f32)
-                    .max(0.0) as usize);
-            let y_range = (pa
-                .y
-                .min(pb.y)
-                .min(pc.y)
-                .max(clip.min.y - top)
-                .floor()
-                .max(0.0) as usize)
-                ..(pa
-                    .y
-                    .max(pb.y)
-                    .max(pc.y)
-                    .min(clip.max.y - top)
-                    .ceil()
-                    .min(height as f32)
-                    .max(0.0) as usize);
-            for y in y_range {
-                for x in x_range.clone() {
-                    // Just off the centre, so a centre on the edge two triangles share (a
-                    // square quad's diagonal) is drawn once.
-                    let p = pos2(x as f32 + 0.5 + 1e-3, y as f32 + 0.5 + 2e-3);
-                    let edge = |from: Pos2, to: Pos2| {
-                        ((to - from).x * (p - from).y - (to - from).y * (p - from).x) / area
-                    };
-                    let (wa, wb, wc) = (edge(pb, pc), edge(pc, pa), edge(pa, pb));
-                    if wa < 0.0 || wb < 0.0 || wc < 0.0 {
-                        continue;
-                    }
-                    let uv = a.uv.to_vec2() * wa + b.uv.to_vec2() * wb + c.uv.to_vec2() * wc;
-                    let texel_x = ((uv.x * atlas_width as f32) as usize).min(atlas_width - 1);
-                    let texel_y = ((uv.y * atlas_height as f32) as usize).min(atlas_height - 1);
-                    let texel = atlas.pixels[texel_y * atlas_width + texel_x].to_array();
-                    let color = [a, b, c].map(|vertex| vertex.color.to_array());
-                    let source: [f32; 4] = std::array::from_fn(|channel| {
-                        let vertex = f32::from(color[0][channel]) * wa
-                            + f32::from(color[1][channel]) * wb
-                            + f32::from(color[2][channel]) * wc;
-                        vertex * f32::from(texel[channel]) / 255.0
-                    });
-                    let under = pixels[y * width + x].to_array();
-                    let over: [u8; 4] = std::array::from_fn(|channel| {
-                        (source[channel] + f32::from(under[channel]) * (1.0 - source[3] / 255.0))
-                            .round()
-                            .clamp(0.0, 255.0) as u8
-                    });
-                    pixels[y * width + x] =
-                        Color32::from_rgba_premultiplied(over[0], over[1], over[2], over[3]);
-                }
-            }
+            let triangle = [
+                mesh.indices[index],
+                mesh.indices[index + 1],
+                mesh.indices[index + 2],
+            ];
+            rasterize_triangle(
+                &mesh.vertices,
+                triangle,
+                pixels_per_point,
+                offset,
+                clip,
+                atlas,
+                &mut pixels,
+                width,
+                height,
+            );
+            index += 3;
         }
     }
     let covers = Rect::from_min_size(
@@ -377,6 +337,208 @@ fn rasterize(
         Vec2::new(width as f32, height as f32) / pixels_per_point,
     );
     (ColorImage::new([width, height], pixels), covers)
+}
+
+/// An axis-aligned textured rectangle of one vertex colour, as egui's text glyphs and rects emit.
+struct Quad {
+    rect: Rect,
+    uv_min: Pos2,
+    uv_max: Pos2,
+    color: [f32; 4],
+}
+
+impl Quad {
+    fn from_indices(
+        vertices: &[Vertex],
+        indices: &[u32],
+        scale: f32,
+        offset: Vec2,
+    ) -> Option<Self> {
+        let &[i0, i1, i2, i3, i4, i5] = indices else {
+            return None;
+        };
+        let corners = if i3 == i0 && i4 == i2 {
+            [i0, i1, i2, i5]
+        } else if i3 == i0 && i5 == i1 {
+            [i0, i4, i1, i2]
+        } else if (i3 == i2 && i4 == i1) || (i3 == i1 && i5 == i2) {
+            [i0, i1, if i3 == i2 { i5 } else { i4 }, i2]
+        } else {
+            return None;
+        };
+        let v = [
+            vertices.get(corners[0] as usize)?,
+            vertices.get(corners[1] as usize)?,
+            vertices.get(corners[2] as usize)?,
+            vertices.get(corners[3] as usize)?,
+        ];
+        if v[0].color != v[1].color || v[0].color != v[2].color || v[0].color != v[3].color {
+            return None;
+        }
+        let min_corner = (0..4).min_by(|&a, &b| {
+            (v[a].pos.x, v[a].pos.y)
+                .partial_cmp(&(v[b].pos.x, v[b].pos.y))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let tl = v[min_corner];
+        let br = v[(min_corner + 2) % 4];
+        let (adj1, adj2) = (v[(min_corner + 1) % 4], v[(min_corner + 3) % 4]);
+        let (tr, bl) = if (tl.pos.y - adj1.pos.y).abs() <= f32::EPSILON {
+            (adj1, adj2)
+        } else {
+            (adj2, adj1)
+        };
+        let aligned = (tl.pos.y - tr.pos.y).abs() <= f32::EPSILON
+            && (tr.pos.x - br.pos.x).abs() <= f32::EPSILON
+            && (br.pos.y - bl.pos.y).abs() <= f32::EPSILON
+            && (bl.pos.x - tl.pos.x).abs() <= f32::EPSILON
+            && (tl.uv.y - tr.uv.y).abs() <= f32::EPSILON
+            && (tr.uv.x - br.uv.x).abs() <= f32::EPSILON
+            && (br.uv.y - bl.uv.y).abs() <= f32::EPSILON
+            && (bl.uv.x - tl.uv.x).abs() <= f32::EPSILON;
+        if !aligned {
+            return None;
+        }
+        let rect = Rect::from_min_max(tl.pos * scale - offset, br.pos * scale - offset);
+        if rect.width() < f32::EPSILON || rect.height() < f32::EPSILON {
+            return None;
+        }
+        Some(Self {
+            rect,
+            uv_min: tl.uv,
+            uv_max: br.uv,
+            color: tl.color.to_array().map(f32::from),
+        })
+    }
+}
+
+fn rasterize_quad(
+    quad: &Quad,
+    clip: Rect,
+    atlas: &ColorImage,
+    pixels: &mut [Color32],
+    width: usize,
+    height: usize,
+) {
+    let [atlas_width, atlas_height] = atlas.size;
+    let x0 = (quad.rect.min.x - 0.5)
+        .ceil()
+        .max(clip.min.x.floor())
+        .max(0.0) as usize;
+    let x1 = (quad.rect.max.x - 0.5)
+        .ceil()
+        .min(clip.max.x.ceil())
+        .min(width as f32)
+        .max(0.0) as usize;
+    let y0 = (quad.rect.min.y - 0.5)
+        .ceil()
+        .max(clip.min.y.floor())
+        .max(0.0) as usize;
+    let y1 = (quad.rect.max.y - 0.5)
+        .ceil()
+        .min(clip.max.y.ceil())
+        .min(height as f32)
+        .max(0.0) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let du = (quad.uv_max.x - quad.uv_min.x) / quad.rect.width();
+    let dv = (quad.uv_max.y - quad.uv_min.y) / quad.rect.height();
+    for y in y0..y1 {
+        let v = (quad.uv_min.y + (y as f32 + 0.5 - quad.rect.min.y) * dv).max(0.0);
+        let texel_y = ((v * atlas_height as f32) as usize).min(atlas_height - 1);
+        let atlas_row = &atlas.pixels[texel_y * atlas_width..(texel_y + 1) * atlas_width];
+        let out_row = &mut pixels[y * width..(y + 1) * width];
+        for (x, dst) in out_row.iter_mut().enumerate().take(x1).skip(x0) {
+            let u = (quad.uv_min.x + (x as f32 + 0.5 - quad.rect.min.x) * du).max(0.0);
+            let texel_x = ((u * atlas_width as f32) as usize).min(atlas_width - 1);
+            *dst = blend_over(*dst, quad.color, atlas_row[texel_x]);
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the fallback rasterizer's mesh, clip and target buffer"
+)]
+fn rasterize_triangle(
+    vertices: &[Vertex],
+    triangle: [u32; 3],
+    scale: f32,
+    offset: Vec2,
+    clip: Rect,
+    atlas: &ColorImage,
+    pixels: &mut [Color32],
+    width: usize,
+    height: usize,
+) {
+    let [atlas_width, atlas_height] = atlas.size;
+    let [a, b, c] = triangle.map(|corner| &vertices[corner as usize]);
+    let [pa, pb, pc] = [a, b, c].map(|vertex| vertex.pos * scale - offset);
+    let area = (pb - pa).x * (pc - pa).y - (pb - pa).y * (pc - pa).x;
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let x_range = (pa.x.min(pb.x).min(pc.x).max(clip.min.x).floor().max(0.0) as usize)
+        ..(pa
+            .x
+            .max(pb.x)
+            .max(pc.x)
+            .min(clip.max.x)
+            .ceil()
+            .min(width as f32)
+            .max(0.0) as usize);
+    let y_range = (pa.y.min(pb.y).min(pc.y).max(clip.min.y).floor().max(0.0) as usize)
+        ..(pa
+            .y
+            .max(pb.y)
+            .max(pc.y)
+            .min(clip.max.y)
+            .ceil()
+            .min(height as f32)
+            .max(0.0) as usize);
+    let colors = [a, b, c].map(|vertex| vertex.color.to_array());
+    for y in y_range {
+        for x in x_range.clone() {
+            // Just off the centre, so a centre on the edge two triangles share (a square quad's
+            // diagonal) is drawn once.
+            let p = pos2(x as f32 + 0.5 + 1e-3, y as f32 + 0.5 + 2e-3);
+            let edge = |from: Pos2, to: Pos2| {
+                ((to - from).x * (p - from).y - (to - from).y * (p - from).x) / area
+            };
+            let (wa, wb, wc) = (edge(pb, pc), edge(pc, pa), edge(pa, pb));
+            if wa < 0.0 || wb < 0.0 || wc < 0.0 {
+                continue;
+            }
+            let uv = a.uv.to_vec2() * wa + b.uv.to_vec2() * wb + c.uv.to_vec2() * wc;
+            let texel_x = ((uv.x.max(0.0) * atlas_width as f32) as usize).min(atlas_width - 1);
+            let texel_y = ((uv.y.max(0.0) * atlas_height as f32) as usize).min(atlas_height - 1);
+            let vertex_color: [f32; 4] = std::array::from_fn(|channel| {
+                f32::from(colors[0][channel]) * wa
+                    + f32::from(colors[1][channel]) * wb
+                    + f32::from(colors[2][channel]) * wc
+            });
+            let dst = &mut pixels[y * width + x];
+            *dst = blend_over(
+                *dst,
+                vertex_color,
+                atlas.pixels[texel_y * atlas_width + texel_x],
+            );
+        }
+    }
+}
+
+fn blend_over(under: Color32, vertex: [f32; 4], texel: Color32) -> Color32 {
+    let texel = texel.to_array();
+    let source: [f32; 4] =
+        std::array::from_fn(|channel| vertex[channel] * f32::from(texel[channel]) / 255.0);
+    let under = under.to_array();
+    let over: [u8; 4] = std::array::from_fn(|channel| {
+        (source[channel] + f32::from(under[channel]) * (1.0 - source[3] / 255.0))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    });
+    Color32::from_rgba_premultiplied(over[0], over[1], over[2], over[3])
 }
 
 #[cfg(test)]
@@ -420,5 +582,59 @@ mod tests {
         assert_eq!(covers, Rect::from_min_size(pos2(0.0, 0.0), vec2(4.0, 2.0)));
         assert_eq!(image.pixels[0], red, "the opaque texel times the colour");
         assert_eq!(image.pixels[3], Color32::TRANSPARENT, "outside the quad");
+    }
+
+    #[test]
+    fn egui_rects_hit_the_quad_fast_path_and_non_axis_aligned_triangles_fall_back() {
+        let mut mesh = Mesh::default();
+        let blue = Color32::from_rgba_premultiplied(0, 0, 200, 200);
+        mesh.add_rect_with_uv(
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(2.0, 2.0)),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            blue,
+        );
+        assert!(
+            Quad::from_indices(&mesh.vertices, &mesh.indices, 1.0, Vec2::ZERO).is_some(),
+            "egui's add_rect_with_uv indices take the quad fast path"
+        );
+
+        let atlas = ColorImage::new([1, 1], vec![Color32::WHITE]);
+        let tri = Mesh {
+            vertices: vec![
+                Vertex {
+                    pos: pos2(0.0, 0.0),
+                    uv: pos2(0.0, 0.0),
+                    color: blue,
+                },
+                Vertex {
+                    pos: pos2(3.0, 0.0),
+                    uv: pos2(0.0, 0.0),
+                    color: blue,
+                },
+                Vertex {
+                    pos: pos2(0.0, 3.0),
+                    uv: pos2(0.0, 0.0),
+                    color: blue,
+                },
+            ],
+            indices: vec![0, 1, 2],
+            ..Mesh::default()
+        };
+        let primitive = ClippedPrimitive {
+            clip_rect: Rect::EVERYTHING,
+            primitive: Primitive::Mesh(tri),
+        };
+        let (image, _) = rasterize(
+            &[primitive],
+            &atlas,
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(3.0, 3.0)),
+            1.0,
+        );
+        assert_eq!(image.pixels[0], blue, "inside the triangle");
+        assert_eq!(
+            image.pixels[8],
+            Color32::TRANSPARENT,
+            "outside its hypotenuse"
+        );
     }
 }

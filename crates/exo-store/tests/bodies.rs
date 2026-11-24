@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use exo_store::{ListId, Mutation, Options, Quota, Search, ThreadId, ThreadSummary};
 use gmail::Format;
-use gmail_mock::Config;
+use mock_servers::Config;
 use serde_json::{Value, json};
 use support::Harness;
 

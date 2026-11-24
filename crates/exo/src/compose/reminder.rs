@@ -181,7 +181,7 @@ pub(super) fn paint_flourish(
 /// How far the Remind label's flourish is at `now`, while it shows. It runs from the time
 /// Automatic Reminders put the draft's reminder on, and only while that reminder is still theirs.
 pub(super) fn flourish_progress(open: &super::draft::Open, now: f64) -> Option<f32> {
-    let start = open.automatic.flourish.filter(|_| {
+    let start = open.delivery.automatic.flourish.filter(|_| {
         open.record
             .reminder
             .is_some_and(|reminder| reminder.automatic)
@@ -224,6 +224,9 @@ impl Mail {
     pub(super) fn automatic_reminders(&mut self, now: f64) {
         let settings = self.account.settings();
         let reminders = settings.reminders.clone();
+        if reminders.default_reminders_trigger != "EXTERNAL" {
+            return;
+        }
         let team = team_domains(settings, &self.snapshot.aliases, self.account.email());
         let auto_bcc = super::auto_bcc::emails(&settings.auto_bcc);
         let me = self
@@ -241,13 +244,13 @@ impl Mail {
             .compose
             .drafts
             .iter_mut()
-            .filter(|open| !open.is_snippet())
+            .filter(|open| open.persists_to_gmail())
         {
+            if open.delivery.automatic.removed {
+                continue;
+            }
             let seen = participants(&open.record);
-            if open.automatic.seen.replace(seen) == Some(seen)
-                || reminders.default_reminders_trigger != "EXTERNAL"
-                || open.automatic.removed
-            {
+            if open.delivery.automatic.seen.replace(seen) == Some(seen) {
                 continue;
             }
             let external =
@@ -255,12 +258,12 @@ impl Mail {
             match open.record.reminder {
                 Some(reminder) if reminder.automatic && !external => {
                     open.record.reminder = None;
-                    open.automatic.flourish = None;
+                    open.delivery.automatic.flourish = None;
                 }
                 None if external => {
                     let at = remind::in_days(
                         &local,
-                        reminders.days,
+                        reminders.days.max(1),
                         reminders.weekdays_only(),
                         reminders.hour,
                         reminders.minute,
@@ -270,11 +273,13 @@ impl Mail {
                         keep_on_reply: reminders.trigger_condition == TriggerCondition::Regardless,
                         automatic: true,
                     });
-                    open.automatic.flourish = Some(now);
+                    open.delivery.automatic.flourish = Some(now);
                 }
                 _ => continue,
             }
-            save_changes(open, &self.account, &aliases, &local);
+            if open.is_stored() || !open.can_discard_silently() {
+                save_changes(open, &self.account, &aliases, &local);
+            }
         }
     }
 
@@ -282,7 +287,7 @@ impl Mail {
     /// the draft alone while it's open.
     pub(crate) fn reminder_removed(&mut self, id: &str) {
         if let Some(open) = self.compose.get_mut(id) {
-            open.automatic.removed = true;
+            open.delivery.automatic.removed = true;
         }
     }
 
@@ -563,5 +568,90 @@ mod tests {
             "the last frame is the ink, but at its end"
         );
         assert_ne!(flourish_at(99.0, 100.0, 1.0, ink), ink);
+    }
+
+    #[test]
+    fn enabling_automatic_reminders_applies_to_open_drafts_clamps_zero_days_and_skips_blank_save() {
+        let ctx = egui::Context::default();
+        let _ = exo_ui::install(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "exo-auto-remind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = crate::account::Account::open(
+            &dir,
+            crate::account::Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: std::sync::Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let fixed_now: jiff::Zoned = "2026-11-17T09:00[America/New_York]".parse().expect("now");
+        let mut mail = Mail::new(
+            &ctx,
+            &crate::assets_dir(),
+            account,
+            crate::Clock::fixed(fixed_now.clone()),
+        );
+
+        // Start with Automatic Reminders OFF and open an untouched reply to an external sender.
+        let mut reply_record = record(&[("Grace", "grace@outside.org")], "Re: Coffee");
+        reply_record.action = exo_store::DraftAction::Reply;
+        reply_record.fingerprint = super::super::factory::fingerprint(&reply_record);
+        let open = super::super::draft::Open::new("draft-1".into(), None, reply_record);
+        assert!(open.can_discard_silently() && !open.is_stored());
+        mail.compose.drafts.push(open);
+
+        mail.automatic_reminders(1.0);
+        assert!(
+            mail.compose.drafts[0].record.reminder.is_none(),
+            "off initially"
+        );
+        assert!(
+            mail.compose.drafts[0].delivery.automatic.seen.is_none(),
+            "must not record participants while Automatic Reminders is off"
+        );
+
+        // Turn Automatic Reminders ON with days == 0 -> clamps to 1 day and applies to the open draft.
+        mail.account.update_settings(|settings| {
+            settings.reminders.default_reminders_trigger = "EXTERNAL".into();
+            settings.reminders.days = 0;
+            settings.reminders.business_days_only = Some(false);
+            settings.reminders.hour = 8;
+            settings.reminders.minute = 0;
+        });
+        mail.automatic_reminders(2.0);
+        let expected_at = remind::in_days(&fixed_now, 1, false, 8, 0);
+        assert_eq!(
+            mail.compose.drafts[0].record.reminder.map(|r| r.at),
+            Some(expected_at),
+            "zero days clamps to 1 day and applies to already-open draft"
+        );
+        assert!(
+            !mail.compose.drafts[0].is_stored(),
+            "untouched draft must not be persisted to Gmail just because an automatic reminder attached"
+        );
+
+        // Once the draft is modified, automatic reminder removal saves changes.
+        mail.compose.drafts[0].editor.type_text("Hello");
+        mail.compose.drafts[0].record.to = vec![Address {
+            name: Some("Tom".into()),
+            email: "tom@brightmoor.co".into(),
+        }];
+        mail.automatic_reminders(3.0);
+        assert!(mail.compose.drafts[0].record.reminder.is_none());
+        assert!(
+            mail.compose.drafts[0].is_stored(),
+            "modified draft persists when automatic reminder changes"
+        );
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

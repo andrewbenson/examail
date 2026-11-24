@@ -2,8 +2,12 @@
 //! before an event. Everything applies at once.
 
 use egui::{Color32, Context, CornerRadius, Id, Rect, Sense, Ui, pos2, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::{DeviceSettings, Settings};
-use exo_ui::{CalendarColor, Dialog, DialogResponse, Family, Font, Menu, TextStyle};
+use exo_ui::{
+    CalendarColor, Dialog, DialogMenuKind, DialogResponse, DialogSelect, DialogSelectEvent,
+    DialogSelectState, Family, Font, TextStyle,
+};
 
 use crate::calendar::ListedCalendar;
 
@@ -51,8 +55,6 @@ const NOTIFY_GAP: f32 = 16.0;
 const NOTIFY_BELOW: f32 = 20.0;
 const VALUE_LEFT: f32 = 5.0;
 const VALUE_TOP: f32 = 5.0;
-/// The open list: 18px left of the value and 26px under the button.
-const MENU_OFFSET: egui::Vec2 = vec2(-18.0, 26.0);
 
 /// `Notify me:`'s choices, in seconds.
 pub const LEAD_TIMES: [(i64, &str); 3] = [
@@ -72,6 +74,10 @@ pub enum Event {
     EnableCalendar,
     /// Open or close `Notify me:`'s list.
     ToggleMenu,
+    /// ↓ (1) or ↑ (-1) in `Notify me:`'s open list.
+    MenuMove(isize),
+    /// Enter or Tab in `Notify me:`'s open list.
+    MenuPick,
     /// The pointer on a row of the list.
     Highlight(usize),
     /// A lead time, in seconds.
@@ -89,7 +95,7 @@ pub enum Event {
 /// The open list's highlighted row, between frames.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    menu: Option<usize>,
+    menu: DialogSelectState,
     /// The colour picker, while it's open.
     picker: Option<Picker>,
 }
@@ -106,14 +112,13 @@ struct Picker {
 impl State {
     /// Closes the list.
     pub fn reset(&mut self) {
-        self.menu = None;
+        self.menu.close();
         self.picker = None;
     }
 
-    /// Whether the list or the colour picker is open, so that Escape closes it rather than the
-    /// dialog.
-    pub fn menu_open(&self) -> bool {
-        self.menu.is_some() || self.picker.is_some()
+    #[cfg(test)]
+    fn menu_open(&self) -> bool {
+        self.menu.is_open() || self.picker.is_some()
     }
 
     /// Whether the colour picker is open, in which case it has the keyboard.
@@ -121,17 +126,50 @@ impl State {
         self.picker.is_some()
     }
 
+    /// Registers the dialog's keyboard bindings in `Region::Dialog` (and the colour picker's when
+    /// open).
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        if self.picker_open() {
+            crate::calendar::register_picker_keys(commands, crate::calendar::PICKER, |key| {
+                wrap(super::Action::Notifications(Event::PickerKey(key)))
+            });
+            return;
+        }
+        if self.menu.is_open() {
+            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+                Command::shortcut(id, wrap(super::Action::Notifications(event)))
+                    .keys(keys.iter().copied())
+                    .regions(DIALOG)
+            };
+            commands.add(key(
+                "NOTIFY_ME_DOWN",
+                Event::MenuMove(1),
+                &["down", "j", "n"],
+            ));
+            commands.add(key("NOTIFY_ME_UP", Event::MenuMove(-1), &["up", "k", "p"]));
+            commands.add(key("NOTIFY_ME_PICK", Event::MenuPick, &["enter", "tab"]));
+            commands.add(key("NOTIFY_ME_ESCAPE", Event::Escape, &["esc"]));
+        }
+    }
+
     /// Applies `event` to the list, and returns what's left for the account.
     pub fn handle(&mut self, event: Event, lead: i64) -> Option<Event> {
         match event {
-            Event::ToggleMenu => {
-                self.menu = if self.menu.is_some() {
-                    None
-                } else {
-                    Some(lead_index(lead))
-                }
+            Event::ToggleMenu => self.menu.toggle(lead_index(lead)),
+            Event::MenuMove(step) => {
+                self.menu
+                    .step(step, LEAD_TIMES.len(), lead_index(lead), true, true);
             }
-            Event::Highlight(row) => self.menu = Some(row),
+            Event::MenuPick => {
+                let row = self.menu.confirm()?;
+                return Some(Event::Lead(LEAD_TIMES[row].0));
+            }
+            Event::Highlight(row) => self.menu.open_at(row),
             Event::Swatch(id, color) => {
                 let index = picker_index(color);
                 self.picker = if self.picker.as_ref().is_some_and(|picker| picker.id == id) {
@@ -147,7 +185,7 @@ impl State {
             Event::Escape if self.picker.is_some() => {
                 return self.handle(Event::PickerKey(exo_ui::PickerKey::Escape), lead);
             }
-            Event::Escape => self.menu = None,
+            Event::Escape => self.menu.close(),
             Event::Recolor(_, color) => {
                 if let Some(picker) = &mut self.picker {
                     picker.current = picker_index(color);
@@ -175,7 +213,7 @@ impl State {
                 return Some(recolor);
             }
             Event::Lead(_) => {
-                self.menu = None;
+                self.menu.close();
                 return Some(event);
             }
             other => return Some(other),
@@ -460,42 +498,25 @@ fn draw<'a>(
         None,
     );
     let lead = shown.settings.notifications.calendar_events.lead_time();
-    let button = exo_ui::paint_dialog_dropdown(
-        ui,
+    let current = lead_index(lead);
+    let names = LEAD_TIMES.map(|(_, name)| name);
+    if let Some(select_event) = DialogSelect::new(
+        exo_ui::id(ui.ctx(), "notifications-lead"),
         pos2(left + label + VALUE_LEFT, notify + VALUE_TOP),
-        LEAD_TIMES[lead_index(lead)].1,
-    );
-    let response = ui
-        .interact(
-            button,
-            exo_ui::id(ui.ctx(), "notifications-lead"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.clicked() {
-        event = Some(Event::ToggleMenu);
-    }
-    if let Some(highlighted) = state.menu {
-        let names = LEAD_TIMES.map(|(_, name)| name);
-        let list = Menu {
-            items: &names,
-            highlighted,
-        }
-        .show_tall_in_dialog(
-            ui,
-            exo_ui::id(ui.ctx(), "notifications-lead-list"),
-            button.left_top() + MENU_OFFSET,
-        );
-        if let Some(clicked) = list.clicked {
-            event = Some(Event::Lead(LEAD_TIMES[clicked].0));
-        } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-            event = Some(Event::Highlight(hovered));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
-            event = Some(Event::ToggleMenu);
-        }
+        LEAD_TIMES[current].1,
+        &names,
+        state.menu.highlighted(),
+    )
+    .current(current)
+    .kind(DialogMenuKind::Tall)
+    .show(ui)
+    {
+        event = Some(match select_event {
+            DialogSelectEvent::Toggle => Event::ToggleMenu,
+            DialogSelectEvent::Highlight(row) => Event::Highlight(row),
+            DialogSelectEvent::Pick(row) => Event::Lead(LEAD_TIMES[row].0),
+            DialogSelectEvent::Close => Event::Escape,
+        });
     }
     event
 }
@@ -508,16 +529,17 @@ mod tests {
     fn the_list_opens_on_the_lead_time_and_a_choice_closes_it() {
         let mut state = State::default();
         assert_eq!(state.handle(Event::ToggleMenu, 300), None);
-        assert_eq!(state.menu, Some(2));
-        state.handle(Event::Highlight(0), 300);
-        assert_eq!(state.handle(Event::Lead(60), 300), Some(Event::Lead(60)));
+        assert_eq!(state.menu.highlighted(), Some(2));
+        state.handle(Event::MenuMove(1), 300);
+        assert_eq!(state.menu.highlighted(), Some(0), "arrows wrap round");
+        assert_eq!(state.handle(Event::MenuPick, 300), Some(Event::Lead(60)));
         assert!(!state.menu_open());
         assert_eq!(
             state.handle(Event::ToggleMenu, 45),
             None,
             "a lead time it doesn't offer shows the default"
         );
-        assert_eq!(state.menu, Some(1));
+        assert_eq!(state.menu.highlighted(), Some(1));
         assert_eq!(
             state.handle(Event::ToggleEmail, 45),
             Some(Event::ToggleEmail)

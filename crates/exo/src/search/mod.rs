@@ -80,7 +80,7 @@ pub(crate) enum Action {
 struct Book {
     contacts: Arc<Vec<ScoredContact>>,
     excluded: BTreeMap<String, String>,
-    kept: contacts::Index,
+    kept: Arc<contacts::Index>,
     removed: contacts::Index,
 }
 
@@ -110,8 +110,6 @@ pub(crate) struct Search {
     instant: Option<(String, Option<f64>)>,
     /// The account's address book, indexed, which the bar suggests people from.
     book: Option<Book>,
-    /// Whether the address book was asked for.
-    pub book_asked: bool,
     /// The thread the cursor was on when the bar took the keyboard.
     last_focused: Option<String>,
     /// Whether the bar has the keyboard. Otherwise the results do.
@@ -148,7 +146,6 @@ impl Search {
             opened_with: Some(value.clone()).filter(|value| !value.trim().is_empty()),
             instant: None,
             book: None,
-            book_asked: false,
             last_focused: None,
             focused: true,
             select_all: false,
@@ -246,14 +243,19 @@ impl Search {
         if value.is_empty() {
             effects.push(Effect::Contact(None));
         }
-        let old = self.underlay.as_deref().map(str::to_lowercase);
+        let old = self.underlay.clone();
         effects.extend(self.set_value(&value));
-        if !old
-            .as_deref()
-            .is_some_and(|old| old.starts_with(&self.value.to_lowercase()))
-        {
+        let keeps_underlay = old.as_deref().is_some_and(|old| {
+            exo_ui::find_case_insensitive(old, &self.value).is_some_and(|found| found.start == 0)
+        });
+        if !keeps_underlay {
             let mut underlay = self.value.clone();
-            if let Some(tail) = old.as_deref().and_then(|old| old.get(self.value.len()..)) {
+            let typed_chars = self.value.chars().count();
+            if let Some(tail) = old.as_deref().and_then(|old| {
+                old.char_indices()
+                    .nth(typed_chars)
+                    .map(|(at, _)| &old[at..])
+            }) {
                 underlay.push_str(tail);
             }
             self.underlay = Some(underlay);
@@ -357,10 +359,23 @@ impl Search {
     /// Indexes the account's address book once it's read (or read again), and again when
     /// `Remove Suggestion` takes an address out or puts one back (`excluded`). Suggestions
     /// waiting on people are worked out again.
+    #[cfg(test)]
     pub fn set_book(
         &mut self,
         book: &Arc<Vec<ScoredContact>>,
         excluded: &BTreeMap<String, String>,
+    ) -> Vec<Effect> {
+        let kept = Arc::new(contacts::Index::book_without(book, excluded));
+        self.set_shared_book(book, excluded, kept)
+    }
+
+    /// Updates the address-book index using the shared non-excluded [`contacts::Index`] built on
+    /// [`crate::Mail`], building only the small excluded-contacts index alongside it.
+    pub(crate) fn set_shared_book(
+        &mut self,
+        book: &Arc<Vec<ScoredContact>>,
+        excluded: &BTreeMap<String, String>,
+        kept: Arc<contacts::Index>,
     ) -> Vec<Effect> {
         if self.book.as_ref().is_some_and(|indexed| {
             Arc::ptr_eq(&indexed.contacts, book) && indexed.excluded == *excluded
@@ -370,7 +385,7 @@ impl Search {
         self.book = Some(Book {
             contacts: book.clone(),
             excluded: excluded.clone(),
-            kept: contacts::Index::book_without(book, excluded),
+            kept,
             removed: contacts::Index::excluded(book, excluded),
         });
         if autocomplete::wants_contacts(&self.value) && self.focused && self.query.is_none() {
@@ -459,12 +474,10 @@ impl Search {
             Kind::Label | Kind::Category => suggestion.completion.as_deref()?,
             _ => suggestion.replacement.as_str(),
         };
-        let original = suggestion.original.to_lowercase();
-        if !replacement.to_lowercase().starts_with(&original) {
-            return None;
-        }
-        let rest = replacement.get(suggestion.original.len()..)?;
-        let end = self.value.to_lowercase().rfind(&original)? + original.len();
+        let prefix = exo_ui::find_case_insensitive(replacement, &suggestion.original)
+            .filter(|range| range.start == 0)?;
+        let rest = &replacement[prefix.end..];
+        let end = exo_ui::rfind_case_insensitive(&self.value, &suggestion.original)?.end;
         if self.value.len() == end {
             Some(rest.to_owned())
         } else if self.value.len() == end + 1 && self.value.ends_with(' ') && rest.starts_with(' ')
@@ -481,10 +494,13 @@ impl Search {
         if let Some(operator) = OPERATOR.find(&original) {
             original = operator.as_str().to_owned();
         }
-        let value = self.value.to_lowercase();
-        value
-            .rfind(&original)
-            .or_else(|| format!("in:{value}").rfind(&original))
+        exo_ui::rfind_case_insensitive(&self.value, &original)
+            .map(|range| range.start)
+            .or_else(|| {
+                let synthetic = format!("in:{}", self.value);
+                exo_ui::rfind_case_insensitive(&synthetic, &original)
+                    .map(|range| range.start.saturating_sub("in:".len()))
+            })
     }
 
     /// The text with the suggestion in place of the word it completes.
@@ -499,10 +515,10 @@ impl Search {
                 .replace(suggestion.replacement.trim_start(), ":")
                 .into_owned(),
         };
-        let head = self
+        let end = self
             .value
-            .get(..suggestion.start.unwrap_or_default().min(self.value.len()))
-            .unwrap_or_default();
+            .floor_char_boundary(suggestion.start.unwrap_or_default().min(self.value.len()));
+        let head = &self.value[..end];
         format!("{}{inserted}", TRAILING_COLON.replace(head, ":"))
     }
 
@@ -738,9 +754,6 @@ pub(crate) fn history_kind(value: &str) -> Option<SearchHistoryKind> {
     static ADDRESSED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#""?((?:[^\\"]|\\.)*)"?\s*<\s*([^<>]+@[^@<>]+)\s*>"#).expect("valid regex")
     });
-    static VALID: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])$").expect("valid regex")
-    });
     static WORD: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9$%&'*+.\-/=?^_`{}|~ ]*$").expect("valid regex"));
     let value = value.trim();
@@ -758,7 +771,7 @@ pub(crate) fn history_kind(value: &str) -> Option<SearchHistoryKind> {
         None => (String::new(), value.to_owned()),
     };
     let name = if name == email { String::new() } else { name };
-    match (VALID.is_match(&email), WORD.is_match(&name)) {
+    match (exo_mail::is_valid_email(&email), WORD.is_match(&name)) {
         (true, false) => None,
         (true, true) => Some(SearchHistoryKind::Contact),
         (false, _) => Some(SearchHistoryKind::Query),
@@ -1186,5 +1199,79 @@ mod tests {
             initial_query(&ListId::Inbox, &[], &[], Some("is:unread")),
             "is:unread "
         );
+    }
+
+    #[test]
+    fn case_folding_characters_preserve_preceding_terms_and_completions() {
+        let mut search = search();
+        let person = |name: &str, email: &str| ScoredContact {
+            email: email.into(),
+            name: Some(name.into()),
+            score: 1.0,
+        };
+        search.set_book(
+            &Arc::new(vec![
+                person("Ana Ruiz", "ana@letters.anaruiz.com"),
+                person("İzmir Liman", "izmir@example.com"),
+                person("GROẞE Halle", "halle@example.com"),
+            ]),
+            &BTreeMap::new(),
+        );
+
+        // `'İ'` (2 bytes → 3 lowercased bytes) before the completed token must not shift `start`
+        // or drop `auto_completion`.
+        search.edit("İbrahim an");
+        assert_eq!(
+            search.underlay.as_deref(),
+            Some("İbrahim ana@letters.anaruiz.com")
+        );
+        assert_eq!(search.lozenge_start, Some("İbrahim ".len()));
+        search.key(Key::Tab, &[]);
+        assert_eq!(search.value, "İbrahim ana@letters.anaruiz.com ");
+
+        // `'ẞ'` (3 bytes → 2 lowercased bytes) before the completed token must not slice early.
+        search.edit("GROẞE an");
+        assert_eq!(
+            search.underlay.as_deref(),
+            Some("GROẞE ana@letters.anaruiz.com")
+        );
+        search.key(Key::Tab, &[]);
+        assert_eq!(search.value, "GROẞE ana@letters.anaruiz.com ");
+
+        // Completing a name containing `'ẞ'` via `'ß'` keeps the remaining characters intact.
+        search.edit("report groß");
+        assert_eq!(
+            search.underlay.as_deref(),
+            Some("report großE Halle ⇥ halle@example.com")
+        );
+        search.key(Key::Tab, &[]);
+        assert_eq!(search.value, "report halle@example.com ");
+
+        // Completing a token starting with `'İ'` after another `'İ'` never lands off a UTF-8
+        // boundary or erases preceding terms.
+        search.edit("İbrahim İzm");
+        assert_eq!(
+            search.underlay.as_deref(),
+            Some("İbrahim İzmir Liman ⇥ izmir@example.com")
+        );
+        search.key(Key::Tab, &[]);
+        assert_eq!(search.value, "İbrahim izmir@example.com ");
+    }
+
+    #[test]
+    fn start_point_synthetic_in_fallback_subtracts_prefix_offset() {
+        let mut search = search();
+        search.edit("sent");
+        let suggestion = Suggestion {
+            kind: Kind::Label,
+            replacement: "in:sent".into(),
+            completion: Some("in:sent".into()),
+            original: "n:sent".into(),
+            start: None,
+        };
+        assert_eq!(search.start_point(&suggestion), Some(0));
+        let mut positioned = suggestion;
+        positioned.start = search.start_point(&positioned);
+        assert_eq!(search.composite(&positioned), "in:sent");
     }
 }

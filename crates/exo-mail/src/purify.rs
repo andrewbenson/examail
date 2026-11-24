@@ -13,7 +13,7 @@ const HTML: &str = "\
     h2 h3 h4 h5 h6 head header hgroup hr html i img input ins kbd label legend li main map \
     mark marquee menu menuitem meter nav nobr ol optgroup option output p picture pre progress \
     q rp rt ruby s samp search section select shadow slot small source spacer span strike \
-    strong style sub summary sup table tbody td template textarea tfoot th thead time tr track \
+    strong style sub summary sup table tbody td textarea tfoot th thead time tr track \
     tt u ul var video wbr";
 const SVG: &str = "\
     a altglyph altglyphdef altglyphitem animatecolor animatemotion animatetransform circle \

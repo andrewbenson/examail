@@ -42,8 +42,29 @@ fn tables() -> &'static Tables {
             .iter()
             .map(|(name, _)| name.to_lowercase())
             .collect();
-        let by_segment: Vec<(String, &'static str)> =
-            ZONES.iter().map(|zone| (segment(zone), *zone)).collect();
+        let mut seen_segments = HashSet::new();
+        let mut by_segment: Vec<(String, &'static str)> = Vec::new();
+        // Prefer three-segment canonical zones (`America/Argentina/Buenos_Aires`) when a two-segment
+        // alias (`America/Buenos_Aires`) shares the same leaf name.
+        let mut ordered: Vec<&'static str> = zones().iter().map(String::as_str).collect();
+        ordered.sort_by(|a, b| {
+            b.matches('/')
+                .count()
+                .cmp(&a.matches('/').count())
+                .then_with(|| a.starts_with("Etc/").cmp(&b.starts_with("Etc/")))
+                .then_with(|| a.cmp(b))
+        });
+        for zone in ordered {
+            let seg = segment(zone);
+            if seen_segments.insert(seg.clone()) {
+                by_segment.push((seg, zone));
+            }
+        }
+        by_segment.sort_by(|(_, a), (_, b)| {
+            a.starts_with("Etc/")
+                .cmp(&b.starts_with("Etc/"))
+                .then_with(|| a.cmp(b))
+        });
         let places: Vec<String> = PLACE_ABBREVIATIONS
             .iter()
             .map(|(name, _)| name.to_lowercase())
@@ -180,8 +201,8 @@ type Table = &'static [(&'static str, &'static str)];
 
 /// The tables as other searches read them: places, abbreviations, places' short names and IANA
 /// zones.
-pub(crate) fn tables_for_search() -> (Table, Table, Table, &'static [&'static str]) {
-    (PLACES, ABBREVIATIONS, PLACE_ABBREVIATIONS, ZONES)
+pub(crate) fn tables_for_search() -> (Table, Table, Table, &'static [String]) {
+    (PLACES, ABBREVIATIONS, PLACE_ABBREVIATIONS, zones())
 }
 
 /// Abbreviations, matched upper-cased and shown that way.
@@ -666,377 +687,49 @@ const PLACES: &[(&str, &str)] = &[
     ("Saskatchewan", "America/Regina"),
 ];
 
-/// IANA zones, each also known by its last segment (`london`).
-const ZONES: &[&str] = &[
-    "Africa/Abidjan",
-    "Africa/Accra",
-    "Africa/Algiers",
-    "Africa/Bissau",
-    "Africa/Cairo",
-    "Africa/Casablanca",
-    "Africa/Ceuta",
-    "Africa/Dar_es_Salaam",
-    "Africa/El_Aaiun",
-    "Africa/Johannesburg",
-    "Africa/Juba",
-    "Africa/Khartoum",
-    "Africa/Kinshasa",
-    "Africa/Lagos",
-    "Africa/Maputo",
-    "Africa/Monrovia",
-    "Africa/Nairobi",
-    "Africa/Ndjamena",
-    "Africa/Sao_Tome",
-    "Africa/Tripoli",
-    "Africa/Tunis",
-    "Africa/Windhoek",
-    "America/Adak",
-    "America/Anchorage",
-    "America/Araguaina",
-    "America/Argentina/Buenos_Aires",
-    "America/Argentina/Catamarca",
-    "America/Argentina/Cordoba",
-    "America/Argentina/Jujuy",
-    "America/Argentina/La_Rioja",
-    "America/Argentina/Mendoza",
-    "America/Argentina/Rio_Gallegos",
-    "America/Argentina/Salta",
-    "America/Argentina/San_Juan",
-    "America/Argentina/San_Luis",
-    "America/Argentina/Tucuman",
-    "America/Argentina/Ushuaia",
-    "America/Asuncion",
-    "America/Atikokan",
-    "America/Bahia",
-    "America/Bahia_Banderas",
-    "America/Barbados",
-    "America/Belem",
-    "America/Belize",
-    "America/Blanc-Sablon",
-    "America/Boa_Vista",
-    "America/Bogota",
-    "America/Boise",
-    "America/Cambridge_Bay",
-    "America/Campo_Grande",
-    "America/Cancun",
-    "America/Caracas",
-    "America/Cayenne",
-    "America/Chicago",
-    "America/Chihuahua",
-    "America/Costa_Rica",
-    "America/Creston",
-    "America/Cuiaba",
-    "America/Curacao",
-    "America/Danmarkshavn",
-    "America/Dawson",
-    "America/Dawson_Creek",
-    "America/Denver",
-    "America/Detroit",
-    "America/Edmonton",
-    "America/Eirunepe",
-    "America/El_Salvador",
-    "America/Fort_Nelson",
-    "America/Fortaleza",
-    "America/Glace_Bay",
-    "America/Godthab",
-    "America/Goose_Bay",
-    "America/Grand_Turk",
-    "America/Guatemala",
-    "America/Guayaquil",
-    "America/Guyana",
-    "America/Halifax",
-    "America/Havana",
-    "America/Hermosillo",
-    "America/Indiana/Indianapolis",
-    "America/Indiana/Knox",
-    "America/Indiana/Marengo",
-    "America/Indiana/Petersburg",
-    "America/Indiana/Tell_City",
-    "America/Indiana/Vevay",
-    "America/Indiana/Vincennes",
-    "America/Indiana/Winamac",
-    "America/Inuvik",
-    "America/Iqaluit",
-    "America/Jamaica",
-    "America/Juneau",
-    "America/Kentucky/Louisville",
-    "America/Kentucky/Monticello",
-    "America/La_Paz",
-    "America/Lima",
-    "America/Los_Angeles",
-    "America/Maceio",
-    "America/Managua",
-    "America/Manaus",
-    "America/Martinique",
-    "America/Matamoros",
-    "America/Mazatlan",
-    "America/Menominee",
-    "America/Merida",
-    "America/Metlakatla",
-    "America/Mexico_City",
-    "America/Miquelon",
-    "America/Moncton",
-    "America/Monterrey",
-    "America/Montevideo",
-    "America/Nassau",
-    "America/New_York",
-    "America/Nipigon",
-    "America/Nome",
-    "America/Noronha",
-    "America/North_Dakota/Beulah",
-    "America/North_Dakota/Center",
-    "America/North_Dakota/New_Salem",
-    "America/Ojinaga",
-    "America/Panama",
-    "America/Pangnirtung",
-    "America/Paramaribo",
-    "America/Phoenix",
-    "America/Port-au-Prince",
-    "America/Port_of_Spain",
-    "America/Porto_Velho",
-    "America/Puerto_Rico",
-    "America/Punta_Arenas",
-    "America/Rainy_River",
-    "America/Rankin_Inlet",
-    "America/Recife",
-    "America/Regina",
-    "America/Resolute",
-    "America/Rio_Branco",
-    "America/Santarem",
-    "America/Santiago",
-    "America/Santo_Domingo",
-    "America/Sao_Paulo",
-    "America/Scoresbysund",
-    "America/Sitka",
-    "America/St_Johns",
-    "America/Swift_Current",
-    "America/Tegucigalpa",
-    "America/Thule",
-    "America/Thunder_Bay",
-    "America/Tijuana",
-    "America/Toronto",
-    "America/Vancouver",
-    "America/Whitehorse",
-    "America/Winnipeg",
-    "America/Yakutat",
-    "America/Yellowknife",
-    "Antarctica/Casey",
-    "Asia/Almaty",
-    "Asia/Amman",
-    "Asia/Anadyr",
-    "Asia/Aqtau",
-    "Asia/Aqtobe",
-    "Asia/Ashgabat",
-    "Asia/Atyrau",
-    "Asia/Baghdad",
-    "Asia/Baku",
-    "Asia/Bangkok",
-    "Asia/Barnaul",
-    "Asia/Beirut",
-    "Asia/Bishkek",
-    "Asia/Brunei",
-    "Asia/Chita",
-    "Asia/Choibalsan",
-    "Asia/Colombo",
-    "Asia/Damascus",
-    "Asia/Dhaka",
-    "Asia/Dili",
-    "Asia/Dubai",
-    "Asia/Dushanbe",
-    "Asia/Famagusta",
-    "Asia/Gaza",
-    "Asia/Hebron",
-    "Asia/Ho_Chi_Minh",
-    "Asia/Hong_Kong",
-    "Asia/Hovd",
-    "Asia/Irkutsk",
-    "Asia/Jakarta",
-    "Asia/Jayapura",
-    "Asia/Jerusalem",
-    "Asia/Kabul",
-    "Asia/Kamchatka",
-    "Asia/Karachi",
-    "Asia/Kathmandu",
-    "Asia/Khandyga",
-    "Asia/Kolkata",
-    "Asia/Krasnoyarsk",
-    "Asia/Kuala_Lumpur",
-    "Asia/Kuching",
-    "Asia/Macau",
-    "Asia/Magadan",
-    "Asia/Makassar",
-    "Asia/Manila",
-    "Asia/Nicosia",
-    "Asia/Novokuznetsk",
-    "Asia/Novosibirsk",
-    "Asia/Omsk",
-    "Asia/Oral",
-    "Asia/Pontianak",
-    "Asia/Pyongyang",
-    "Asia/Qatar",
-    "Asia/Qyzylorda",
-    "Asia/Riyadh",
-    "Asia/Sakhalin",
-    "Asia/Samarkand",
-    "Asia/Seoul",
-    "Asia/Shanghai",
-    "Asia/Singapore",
-    "Asia/Srednekolymsk",
-    "Asia/Taipei",
-    "Asia/Tashkent",
-    "Asia/Tbilisi",
-    "Asia/Tehran",
-    "Asia/Thimphu",
-    "Asia/Tokyo",
-    "Asia/Tomsk",
-    "Asia/Ulaanbaatar",
-    "Asia/Urumqi",
-    "Asia/Ust-Nera",
-    "Asia/Vladivostok",
-    "Asia/Yakutsk",
-    "Asia/Yangon",
-    "Asia/Yekaterinburg",
-    "Asia/Yerevan",
-    "Atlantic/Azores",
-    "Atlantic/Bermuda",
-    "Atlantic/Canary",
-    "Atlantic/Cape_Verde",
-    "Atlantic/Faroe",
-    "Atlantic/Madeira",
-    "Atlantic/Reykjavik",
-    "Atlantic/South_Georgia",
-    "Atlantic/Stanley",
-    "Australia/Adelaide",
-    "Australia/Brisbane",
-    "Australia/Broken_Hill",
-    "Australia/Currie",
-    "Australia/Darwin",
-    "Australia/Eucla",
-    "Australia/Hobart",
-    "Australia/Lindeman",
-    "Australia/Lord_Howe",
-    "Australia/Melbourne",
-    "Australia/Perth",
-    "Australia/Sydney",
-    "Europe/Amsterdam",
-    "Europe/Andorra",
-    "Europe/Astrakhan",
-    "Europe/Athens",
-    "Europe/Belgrade",
-    "Europe/Berlin",
-    "Europe/Brussels",
-    "Europe/Bucharest",
-    "Europe/Budapest",
-    "Europe/Chisinau",
-    "Europe/Copenhagen",
-    "Europe/Dublin",
-    "Europe/Gibraltar",
-    "Europe/Helsinki",
-    "Europe/Istanbul",
-    "Europe/Kaliningrad",
-    "Europe/Kyiv",
-    "Europe/Kirov",
-    "Europe/Lisbon",
-    "Europe/London",
-    "Europe/Luxembourg",
-    "Europe/Madrid",
-    "Europe/Malta",
-    "Europe/Minsk",
-    "Europe/Monaco",
-    "Europe/Moscow",
-    "Europe/Oslo",
-    "Europe/Paris",
-    "Europe/Prague",
-    "Europe/Riga",
-    "Europe/Rome",
-    "Europe/Samara",
-    "Europe/Saratov",
-    "Europe/Simferopol",
-    "Europe/Sofia",
-    "Europe/Stockholm",
-    "Europe/Tallinn",
-    "Europe/Tirane",
-    "Europe/Ulyanovsk",
-    "Europe/Uzhgorod",
-    "Europe/Vienna",
-    "Europe/Vilnius",
-    "Europe/Volgograd",
-    "Europe/Warsaw",
-    "Europe/Zaporozhye",
-    "Europe/Zurich",
-    "Indian/Chagos",
-    "Indian/Christmas",
-    "Indian/Cocos",
-    "Indian/Kerguelen",
-    "Indian/Mahe",
-    "Indian/Maldives",
-    "Indian/Mauritius",
-    "Indian/Reunion",
-    "Pacific/Apia",
-    "Pacific/Auckland",
-    "Pacific/Bougainville",
-    "Pacific/Chatham",
-    "Pacific/Chuuk",
-    "Pacific/Easter",
-    "Pacific/Efate",
-    "Pacific/Enderbury",
-    "Pacific/Fakaofo",
-    "Pacific/Fiji",
-    "Pacific/Funafuti",
-    "Pacific/Galapagos",
-    "Pacific/Gambier",
-    "Pacific/Guadalcanal",
-    "Pacific/Guam",
-    "Pacific/Honolulu",
-    "Pacific/Kiritimati",
-    "Pacific/Kosrae",
-    "Pacific/Kwajalein",
-    "Pacific/Majuro",
-    "Pacific/Marquesas",
-    "Pacific/Nauru",
-    "Pacific/Niue",
-    "Pacific/Norfolk",
-    "Pacific/Noumea",
-    "Pacific/Pago_Pago",
-    "Pacific/Palau",
-    "Pacific/Pitcairn",
-    "Pacific/Pohnpei",
-    "Pacific/Port_Moresby",
-    "Pacific/Rarotonga",
-    "Pacific/Tahiti",
-    "Pacific/Tarawa",
-    "Pacific/Tongatapu",
-    "Pacific/Wake",
-    "Pacific/Wallis",
-    "Etc/UTC",
-    "Etc/GMT",
-    "Etc/GMT+1",
-    "Etc/GMT+2",
-    "Etc/GMT+3",
-    "Etc/GMT+4",
-    "Etc/GMT+5",
-    "Etc/GMT+6",
-    "Etc/GMT+7",
-    "Etc/GMT+8",
-    "Etc/GMT+9",
-    "Etc/GMT+10",
-    "Etc/GMT+11",
-    "Etc/GMT+12",
-    "Etc/GMT-1",
-    "Etc/GMT-2",
-    "Etc/GMT-3",
-    "Etc/GMT-4",
-    "Etc/GMT-5",
-    "Etc/GMT-6",
-    "Etc/GMT-7",
-    "Etc/GMT-8",
-    "Etc/GMT-9",
-    "Etc/GMT-10",
-    "Etc/GMT-11",
-    "Etc/GMT-12",
-    "Etc/GMT-13",
-    "Etc/GMT-14",
-];
+/// IANA zones from the system database, each also known by its last segment (`london`).
+fn zones() -> &'static [String] {
+    static ZONES: OnceLock<Vec<String>> = OnceLock::new();
+    ZONES.get_or_init(|| {
+        let mut list: Vec<String> = jiff::tz::db()
+            .available()
+            .map(|name| name.to_string())
+            .filter(|zone| is_iana_zone(zone))
+            .collect();
+        list.sort_by(|a, b| {
+            a.starts_with("Etc/")
+                .cmp(&b.starts_with("Etc/"))
+                .then_with(|| a.cmp(b))
+        });
+        list.dedup();
+        list
+    })
+}
+
+fn is_iana_zone(zone: &str) -> bool {
+    const AREAS: &[&str] = &[
+        "Africa/",
+        "America/",
+        "Antarctica/",
+        "Arctic/",
+        "Asia/",
+        "Atlantic/",
+        "Australia/",
+        "Europe/",
+        "Indian/",
+        "Pacific/",
+    ];
+    if AREAS.iter().any(|area| zone.starts_with(area)) {
+        return true;
+    }
+    match zone {
+        "Etc/UTC" | "Etc/GMT" => true,
+        _ => zone
+            .strip_prefix("Etc/GMT+")
+            .or_else(|| zone.strip_prefix("Etc/GMT-"))
+            .is_some_and(|offset| offset != "0" && offset.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1055,5 +748,19 @@ mod tests {
         assert!(resolve("eastern time").tz.is_ok_and(|tz| tz.is_none()));
         assert_eq!(starting_with("new").map(<[String]>::len), Some(10));
         assert!(is_place("london") && !is_place("pst") && is_well_known("paris"));
+        for (token, iana) in [
+            ("nuuk", "America/Nuuk"),
+            ("ciudad_juarez", "America/Ciudad_Juarez"),
+            ("kanton", "Pacific/Kanton"),
+        ] {
+            assert_eq!(
+                resolve(token)
+                    .tz
+                    .ok()
+                    .flatten()
+                    .and_then(|tz| tz.iana_name().map(str::to_owned)),
+                Some(iana.to_owned())
+            );
+        }
     }
 }

@@ -28,51 +28,100 @@ static EXTERNAL_BANNER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// bordered boxes, button-like links, or the `Superhuman-marketing` marker class. Delivery-status
 /// notifications never are.
 pub(crate) fn is_marketing(root: &NodeRef, sender: &str) -> bool {
+    is_marketing_nodes(std::slice::from_ref(root), sender)
+}
+
+/// [`is_marketing`] over a slice of detached or attached subtree roots in a single DOM pass.
+pub(crate) fn is_marketing_nodes(roots: &[NodeRef], sender: &str) -> bool {
     if is_delivery_status_sender(sender) {
         return false;
     }
-    let any = |matches: fn(&NodeRef) -> bool| dom::select_first(root, matches).is_some();
-    let centered = any(|n| {
-        dom::attr(n, "align").is_some_and(|a| a.eq_ignore_ascii_case("center")) && counts(n)
-    });
-    let bordered = any(|n| {
-        if !dom::attr(n, "style").is_some_and(|s| s.contains("border:")) {
-            return false;
-        }
-        let style = Style::of(n);
-        let outlook =
-            style.get("border-color") == "windowtext" && style.get("border-width") == "1pt";
-        let border = style.get("border");
-        !outlook
-            && !is_excluded(n)
-            && !border.is_empty()
-            && border != "none"
-            && !border_is_zero(border)
-    });
-    let marked = any(|n| dom::has_class(n, "Superhuman-marketing"));
-    let centered_text = any(|n| {
-        dom::attr(n, "style").is_some_and(|s| s.contains("text-align"))
-            && Style::of(n).get("text-align") == "center"
-            && counts(n)
-    });
-    let button = any(|n| {
-        if !dom::is(n, "a")
-            || !dom::attr(n, "style").is_some_and(|s| s.contains("display"))
-            || is_excluded(n)
-        {
-            return false;
-        }
-        let style = Style::of(n);
-        matches!(style.get("display"), "block" | "inline-block")
-            && [
-                style.get("padding"),
-                style.get("height"),
-                style.get("line-height"),
-            ]
-            .iter()
-            .any(|v| has_positive_length(v))
-    });
-    centered || bordered || marked || (centered_text && button)
+    let mut centered_text = false;
+    let mut button = false;
+    let mut stack: Vec<(NodeRef, bool)> = roots
+        .iter()
+        .rev()
+        .map(|node| (node.clone(), false))
+        .collect();
+    while let Some((node, ancestor_excluded)) = stack.pop() {
+        let excluded = if dom::is_element(&node) {
+            if dom::has_class(&node, "Superhuman-marketing") {
+                return true;
+            }
+            let raw_style = dom::attr(&node, "style");
+            let parsed_style = raw_style.as_deref().and_then(|s| {
+                (contains_ignore_ascii_case(s, "display")
+                    || s.contains("border:")
+                    || s.contains("text-align"))
+                .then(|| Style::parse(s))
+            });
+            let self_excluded = dom::has_class(&node, "exo-external-warning-banner")
+                || parsed_style
+                    .as_ref()
+                    .is_some_and(|style| style.get("display") == "none");
+            let excluded = ancestor_excluded || self_excluded;
+            if !excluded {
+                if dom::attr(&node, "align").is_some_and(|a| a.eq_ignore_ascii_case("center"))
+                    && !is_horizontal_rule(&node)
+                {
+                    return true;
+                }
+                if let (Some(raw), Some(style)) = (raw_style.as_deref(), parsed_style.as_ref()) {
+                    if raw.contains("border:") {
+                        let outlook = style.get("border-color") == "windowtext"
+                            && style.get("border-width") == "1pt";
+                        let border = style.get("border");
+                        if !outlook
+                            && !border.is_empty()
+                            && border != "none"
+                            && !border_is_zero(border)
+                        {
+                            return true;
+                        }
+                    }
+                    if !centered_text
+                        && raw.contains("text-align")
+                        && style.get("text-align") == "center"
+                        && !is_horizontal_rule(&node)
+                    {
+                        centered_text = true;
+                    }
+                    if !button
+                        && dom::is(&node, "a")
+                        && raw.contains("display")
+                        && matches!(style.get("display"), "block" | "inline-block")
+                        && [
+                            style.get("padding"),
+                            style.get("height"),
+                            style.get("line-height"),
+                        ]
+                        .iter()
+                        .any(|v| has_positive_length(v))
+                    {
+                        button = true;
+                    }
+                    if centered_text && button {
+                        return true;
+                    }
+                }
+            }
+            excluded
+        } else {
+            ancestor_excluded
+        };
+        let children = dom::children(&node);
+        stack.extend(children.into_iter().rev().map(|child| (child, excluded)));
+    }
+    false
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// Whether a `border` shorthand's width is zero.
@@ -100,16 +149,6 @@ fn is_delivery_status_sender(email: &str) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     user == "mailer-daemon" || user == "postmaster"
-}
-
-/// Whether an element counts as a signal. Rules and hidden or banner content don't.
-fn counts(node: &NodeRef) -> bool {
-    !is_horizontal_rule(node) && !is_excluded(node)
-}
-
-fn is_excluded(node: &NodeRef) -> bool {
-    is_hidden_by_display(node)
-        || dom::closest(node, |n| dom::has_class(n, "exo-external-warning-banner")).is_some()
 }
 
 /// `display: none` on the element or an ancestor.

@@ -239,7 +239,6 @@ pub fn matches(text: &str, query: &str) -> Vec<Range<usize>> {
 /// A match of a folded query in a text.
 struct Matched {
     bytes: Range<usize>,
-    chars: Range<usize>,
 }
 
 fn fold_query(query: &str) -> Vec<char> {
@@ -268,7 +267,6 @@ fn found_in(text: &str, query: &[char]) -> Vec<Matched> {
             let (first, last) = (&folded[at], &folded[at + query.len() - 1]);
             found.push(Matched {
                 bytes: first.bytes.start..last.bytes.end,
-                chars: first.char..last.char + 1,
             });
             at += query.len();
         } else {
@@ -404,7 +402,7 @@ pub(crate) fn darken_matches(ctx: &Context, galley: &mut Arc<Galley>) {
     }
     let pieces: Vec<_> = found
         .iter()
-        .flat_map(|matched| pieces(galley, &matched.chars, Pos2::ZERO, 0.0, 0.0, &|x| x))
+        .flat_map(|matched| pieces(galley, &matched.bytes, Pos2::ZERO, 0.0, 0.0, &|x| x))
         .collect();
     let galley = Arc::make_mut(galley);
     for (row, glyphs, _) in pieces {
@@ -452,7 +450,7 @@ fn register(
     .value();
     let pieces: Vec<Pieces> = found
         .iter()
-        .map(|matched| pieces(galley, &matched.chars, origin, ascent, descent, &snap))
+        .map(|matched| pieces(galley, &matched.bytes, origin, ascent, descent, &snap))
         .collect();
     with(ctx, |state| {
         pieces
@@ -481,47 +479,142 @@ fn register(
     })
 }
 
-/// The highlight of characters `chars` of `galley` (painted at `origin`), as a box per row over
-/// the font's content area (`ascent` above the baseline, `descent` below, as Chromium bounds a
-/// text fragment), with the row and the glyphs in it. A match in text cut off by an ellipsis
-/// is a box as wide as nothing where it was cut.
+/// The highlight of UTF-8 byte range `bytes` of `galley` (painted at `origin`), as a box per row
+/// over the font's content area (`ascent` above the baseline, `descent` below, as Chromium bounds
+/// a text fragment), with the row and the glyphs in it. A match in text cut off by an ellipsis is
+/// a box as wide as nothing where it was cut.
+///
+/// Matching operates on `Glyph::cluster` UTF-8 byte offsets and visual glyph clusters rather than
+/// raw `char`-to-glyph index equality so OpenType ligatures (`fi`, `fl`, `ffi`) and multi-codepoint
+/// emoji (`👨‍👩‍👧‍👦`, `👍🏽`, `1️⃣`) recolor and highlight accurately.
 fn pieces(
     galley: &Galley,
-    chars: &Range<usize>,
+    bytes: &Range<usize>,
     origin: Pos2,
     ascent: f32,
     descent: f32,
     snap: &impl Fn(f32) -> f32,
 ) -> Pieces {
+    let text = galley.text();
     let mut pieces = Vec::new();
-    let mut start = 0;
+    let mut row_byte_start = 0;
     let last = galley.rows.len().saturating_sub(1);
+
     for (index, placed) in galley.rows.iter().enumerate() {
-        // An elided galley's last glyph is the ellipsis, which stands for no character.
-        let shown = placed.glyphs.len()
-            - usize::from(galley.elided && index == last && !placed.glyphs.is_empty());
-        let (from, to) = (chars.start.max(start), chars.end.min(start + shown));
-        let baseline = |glyph: usize| placed.glyphs.get(glyph).map_or(0.0, |glyph| glyph.pos.y);
-        if from < to {
-            let x = |column: usize| {
-                snap(
-                    origin.x
-                        + placed.pos.x
-                        + placed.x_offset(egui::text::CharIndex(column - start)),
-                )
-            };
-            let y = origin.y + placed.pos.y + baseline(from - start);
-            let rect = Rect::from_min_max(
-                pos2(x(from), snap(y - ascent)),
-                pos2(x(to), snap(y + descent)),
-            );
-            pieces.push((index, from - start..to - start, rect));
-        } else if index == last
-            && galley.elided
-            && chars.start >= start + shown
-            && pieces.is_empty()
+        let elided_here = galley.elided
+            && index == last
+            && galley.job.wrap.overflow_character.is_some()
+            && !placed.glyphs.is_empty();
+        let shown = &placed.glyphs[..placed.glyphs.len() - usize::from(elided_here)];
+        if let Some(first_glyph) = shown.first() {
+            row_byte_start = (first_glyph.cluster as usize).max(row_byte_start);
+        }
+
+        let row_byte_end = if index < last {
+            if placed.ends_with_newline {
+                text[row_byte_start..]
+                    .find('\n')
+                    .map_or(text.len(), |rel| row_byte_start + rel)
+            } else {
+                galley.rows[index + 1]
+                    .glyphs
+                    .first()
+                    .map_or(text.len(), |next| next.cluster as usize)
+            }
+        } else if galley.elided {
+            if shown.is_empty() {
+                row_byte_start
+            } else {
+                let last_cluster = shown.last().map_or(row_byte_start, |g| g.cluster as usize);
+                let ellipsis_cluster = if elided_here {
+                    placed.glyphs.last().map_or(0, |g| g.cluster as usize)
+                } else {
+                    0
+                };
+                if ellipsis_cluster > last_cluster {
+                    ellipsis_cluster.min(text.len())
+                } else {
+                    cluster_text_end(text, last_cluster)
+                }
+            }
+        } else {
+            text.len()
+        };
+
+        let (from_byte, to_byte) = (bytes.start.max(row_byte_start), bytes.end.min(row_byte_end));
+        let baseline = |glyph_idx: usize| shown.get(glyph_idx).map_or(0.0, |glyph| glyph.pos.y);
+
+        if from_byte < to_byte && !shown.is_empty() {
+            let mut glyph_range: Option<Range<usize>> = None;
+            let mut x_min = f32::INFINITY;
+            let mut x_max = f32::NEG_INFINITY;
+
+            let mut g_start = 0;
+            while g_start < shown.len() {
+                let mut g_end = g_start + 1;
+                while g_end < shown.len() {
+                    let prev = &shown[g_end - 1];
+                    let curr = &shown[g_end];
+                    let same_cluster = curr.cluster == prev.cluster;
+                    let ligature_continuation = shown[g_start].advance_width > 0.0
+                        && curr.advance_width == 0.0
+                        && curr.uv_rect.is_nothing()
+                        && !matches!(curr.chr, '\u{200B}' | '\u{200C}' | '\u{FEFF}');
+                    if same_cluster || ligature_continuation {
+                        g_end += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let c_start = (shown[g_start].cluster as usize).clamp(row_byte_start, row_byte_end);
+                let c_end = if g_end < shown.len() {
+                    (shown[g_end].cluster as usize).clamp(c_start, row_byte_end)
+                } else {
+                    row_byte_end.max(c_start)
+                };
+
+                if c_start < to_byte && from_byte < c_end {
+                    glyph_range = Some(match glyph_range {
+                        Some(prev) => prev.start.min(g_start)..prev.end.max(g_end),
+                        None => g_start..g_end,
+                    });
+                    let cluster_left = shown[g_start].pos.x;
+                    let cluster_width: f32 =
+                        shown[g_start..g_end].iter().map(|g| g.advance_width).sum();
+                    let (sub_left, sub_right) = if from_byte <= c_start && to_byte >= c_end {
+                        (cluster_left, cluster_left + cluster_width)
+                    } else {
+                        subcluster_x(
+                            &text[c_start..c_end],
+                            from_byte.saturating_sub(c_start)..to_byte.min(c_end) - c_start,
+                            cluster_left,
+                            cluster_width,
+                        )
+                    };
+                    x_min = x_min.min(sub_left);
+                    x_max = x_max.max(sub_right);
+                }
+
+                g_start = g_end;
+            }
+
+            if let Some(glyphs) = glyph_range
+                && x_min.is_finite()
+                && x_max.is_finite()
+            {
+                let first_glyph = glyphs.start;
+                let y = origin.y + placed.pos.y + baseline(first_glyph);
+                let rect = Rect::from_min_max(
+                    pos2(snap(origin.x + placed.pos.x + x_min), snap(y - ascent)),
+                    pos2(snap(origin.x + placed.pos.x + x_max), snap(y + descent)),
+                );
+                pieces.push((index, glyphs, rect));
+            }
+        } else if index == last && galley.elided && bytes.start >= row_byte_end && pieces.is_empty()
         {
-            let x = origin.x + placed.pos.x + placed.x_offset(egui::text::CharIndex(shown));
+            let end_x = shown.last().map_or(0.0, |g| g.pos.x + g.advance_width);
+            let x = origin.x + placed.pos.x + end_x;
             let y = origin.y + placed.pos.y + baseline(0);
             pieces.push((
                 index,
@@ -529,9 +622,77 @@ fn pieces(
                 Rect::from_min_max(pos2(x, y - ascent), pos2(x, y + descent)),
             ));
         }
-        start += placed.char_count_including_newline().0;
+
+        row_byte_start = row_byte_end + usize::from(placed.ends_with_newline);
     }
     pieces
+}
+
+fn cluster_text_end(text: &str, cluster_start: usize) -> usize {
+    let Some(tail) = text.get(cluster_start..) else {
+        return text.len();
+    };
+    if !tail.is_ascii()
+        && let Some(fastframe_emoji::Piece::Emoji(cluster)) =
+            fastframe_emoji::pieces(tail).into_iter().next()
+    {
+        return cluster_start + cluster.len();
+    }
+    let mut chars = tail.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return cluster_start;
+    };
+    let mut len = first.len_utf8();
+    for (rel, ch) in chars {
+        if unicode_normalization::char::is_combining_mark(ch)
+            || matches!(ch, '\u{FE00}'..='\u{FE0F}' | '\u{20E3}')
+        {
+            len = rel + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    cluster_start + len
+}
+
+fn subcluster_x(
+    cluster_str: &str,
+    sub_bytes: Range<usize>,
+    cluster_left: f32,
+    cluster_width: f32,
+) -> (f32, f32) {
+    let mut slots: Vec<(Range<usize>, usize)> = Vec::new();
+    let mut total_slots = 0usize;
+    for (rel, ch) in cluster_str.char_indices() {
+        let range = rel..rel + ch.len_utf8();
+        let is_attacher = unicode_normalization::char::is_combining_mark(ch)
+            || matches!(ch, '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{20E3}');
+        if is_attacher && total_slots > 0 {
+            slots.push((range, total_slots - 1));
+        } else {
+            slots.push((range, total_slots));
+            total_slots += 1;
+        }
+    }
+    if total_slots <= 1 {
+        return (cluster_left, cluster_left + cluster_width);
+    }
+    let mut min_slot = total_slots;
+    let mut max_slot = 0usize;
+    for (range, slot) in slots {
+        if range.start < sub_bytes.end && sub_bytes.start < range.end {
+            min_slot = min_slot.min(slot);
+            max_slot = max_slot.max(slot + 1);
+        }
+    }
+    if min_slot >= max_slot {
+        return (cluster_left, cluster_left + cluster_width);
+    }
+    let step = cluster_width / total_slots as f32;
+    (
+        cluster_left + min_slot as f32 * step,
+        cluster_left + max_slot as f32 * step,
+    )
 }
 
 /// Paints glyphs `glyphs` of `placed` in `color`.
@@ -1043,5 +1204,119 @@ mod tests {
             "out of view both ways"
         );
         assert_eq!(super::reveal(&ctx, scope), None, "once");
+    }
+
+    #[test]
+    fn ligatures_and_multi_codepoint_emoji_highlight_and_recolor_accurately() {
+        use egui::{Shape, epaint::TextShape};
+        let ctx = Context::default();
+        crate::install(&ctx).expect("the system fonts load");
+        // Keep ligatures enabled so `"final"` shapes `"fi"` into one ligature glyph.
+        let style = TextStyle::new(crate::Font::new(crate::Family::Sans, 400), 16.0, 24.0);
+
+        let run_query = |line_text: &str, needle: &str| {
+            search(&ctx, Some(needle));
+            let mut last_shapes = Vec::new();
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    style.paint_line(
+                        ui.painter(),
+                        pos2(10.0, 10.0),
+                        line_text,
+                        Color32::WHITE,
+                        None,
+                    );
+                });
+                last_shapes = std::mem::take(&mut output.shapes)
+                    .into_iter()
+                    .map(|clipped| clipped.shape)
+                    .collect();
+                output.drop_without_applying_deltas();
+            }
+            last_shapes
+        };
+
+        // Partial ligature match `"in"` inside `"final"`: highlight box must have wider width than
+        // `'n'` alone and must recolor the `"fi"` ligature quad to `MATCH_TEXT`.
+        let shapes_in = run_query("final", "in");
+        let rect_in = shapes_in
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .expect("highlight rect for 'in' in 'final'");
+        let shapes_n = run_query("final", "n");
+        let rect_n = shapes_n
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .expect("highlight rect for 'n' in 'final'");
+        assert!(
+            rect_in.left() < rect_n.left() - 1.0 && (rect_in.right() - rect_n.right()).abs() < 0.5,
+            "matching 'in' in 'final' includes 'i' inside the 'fi' ligature ({rect_in:?} vs {rect_n:?})"
+        );
+        let text_shape = shapes_in
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .expect("text shape");
+        assert_eq!(
+            text_shape.galley.rows[0].visuals.mesh.vertices[0].color, MATCH_TEXT,
+            "the 'fi' ligature quad at vertex 0 is recolored to MATCH_TEXT"
+        );
+
+        // Multi-codepoint ZWJ family (`👨‍👩‍👧‍👦`, 7 chars) and skin-tone emoji (`👍🏽`, 2 chars)
+        // followed by `"final"` must neither shift subsequent highlights nor collapse emoji boxes.
+        let emoji_line = "👨‍👩‍👧‍👦 👍🏽 final";
+        let shapes_family = run_query(emoji_line, "👨‍👩‍👧‍👦");
+        let rect_family = shapes_family
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .expect("highlight rect for family emoji");
+        assert!(
+            (rect_family.width() - 20.0).abs() < 1.0,
+            "family emoji highlight spans its 20px cell, got {}",
+            rect_family.width()
+        );
+
+        let shapes_after = run_query(emoji_line, "final");
+        let rect_after = shapes_after
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Rect(rect) => Some(rect.rect),
+                _ => None,
+            })
+            .expect("highlight rect for 'final' after multi-codepoint emoji");
+        let text_after: &TextShape = shapes_after
+            .iter()
+            .find_map(|shape| match shape {
+                Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .expect("text shape");
+        let row = &text_after.galley.rows[0];
+        let expected_left = 10.0
+            + row
+                .glyphs
+                .iter()
+                .find(|g| g.chr == 'f')
+                .expect("'f' glyph")
+                .pos
+                .x;
+        let expected_right = 10.0 + row.size.x;
+        assert!(
+            (rect_after.left() - expected_left).abs() <= 1.0
+                && (rect_after.right() - expected_right).abs() <= 1.0,
+            "highlight after multi-codepoint emoji aligns with 'final' ({rect_after:?}, expected {expected_left}..{expected_right})"
+        );
+        search(&ctx, None);
     }
 }

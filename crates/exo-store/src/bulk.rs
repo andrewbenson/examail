@@ -240,10 +240,10 @@ fn before_query(query: Option<&str>, filter: Option<Filter>, before: Timestamp) 
     Ok(parts.join(" "))
 }
 
-/// `{query} after:{t}`, which finds what the list has dated after the cutoff, whatever the
-/// filter. `t` is the second after the cutoff's, as [`before_query`] takes it.
+/// `{query} after:{t}`, which finds what the list has dated at or after the cutoff's second,
+/// whatever the filter.
 fn after_query(query: Option<&str>, before: Timestamp) -> String {
-    let seconds = before.as_second() + 1;
+    let seconds = before.as_second();
     match query.filter(|query| !query.trim().is_empty()) {
         Some(query) => format!("({query}) after:{seconds}"),
         None => format!("after:{seconds}"),
@@ -303,10 +303,82 @@ impl Store {
     }
 
     /// Every thread of `cutoff`'s list that Gmail finds with mail since the cutoff's date.
+    /// Gmail's `after:` has 1-second resolution, so threads whose newest mail falls in the
+    /// cutoff's own second are checked by millisecond `internalDate`.
     async fn find_after(&self, cutoff: &ListCutoff) -> Result<Vec<ThreadId>> {
-        let mut query = self.scope_query(&cutoff.scope).await?;
-        query.q = Some(after_query(query.q.as_deref(), cutoff.before));
-        self.find(query).await
+        let base = self.scope_query(&cutoff.scope).await?;
+        let sec = cutoff.before.as_second();
+        let next_sec = Timestamp::from_second(sec.saturating_add(1)).unwrap_or(Timestamp::MAX);
+        let mut strictly_after = base.clone();
+        strictly_after.q = Some(after_query(base.q.as_deref(), next_sec));
+        let mut newer: HashSet<ThreadId> = self.find(strictly_after).await?.into_iter().collect();
+
+        let before_ms = cutoff.before.as_millisecond();
+        let next_ms = next_sec.as_millisecond();
+        let required_labels = base.label_ids.clone();
+        let include_spam_trash = base.include_spam_trash;
+        let mut boundary = base;
+        boundary.q = Some(format!(
+            "{} before:{}",
+            after_query(boundary.q.as_deref(), cutoff.before),
+            sec.saturating_add(1)
+        ));
+        let candidates: Vec<ThreadId> = self
+            .find(boundary)
+            .await?
+            .into_iter()
+            .filter(|thread| !newer.contains(thread))
+            .collect();
+        let drafts_count = matches!(cutoff.scope, Scope::List(ListId::Drafts));
+        let sent_scope = matches!(cutoff.scope, Scope::List(ListId::Sent));
+        for round in candidates.chunks(CONCURRENCY) {
+            let fetched = futures::future::join_all(round.iter().map(|thread| {
+                let id = thread.as_str().to_owned();
+                async move {
+                    let result = self
+                        .inner
+                        .api
+                        .call(Lane::Sync, ATTEMPTS, |gmail| {
+                            gmail.thread(&id, gmail::Format::Minimal, &[])
+                        })
+                        .await;
+                    (thread.clone(), result)
+                }
+            }))
+            .await;
+            for (thread, result) in fetched {
+                match result {
+                    Ok(full) => {
+                        let has_newer = full.messages.iter().any(|message| {
+                            let date = message.internal_date.unwrap_or_default();
+                            if date <= before_ms || date >= next_ms {
+                                return false;
+                            }
+                            let has = |label: &str| message.label_ids.iter().any(|l| l == label);
+                            let draft = !drafts_count && has(crate::ids::labels::DRAFT);
+                            let chat = has(crate::ids::labels::CHAT);
+                            let spam_or_trash = !include_spam_trash
+                                && (has(crate::ids::labels::SPAM)
+                                    || has(crate::ids::labels::TRASH));
+                            let own_reply = !sent_scope
+                                && has(crate::ids::labels::SENT)
+                                && !has(crate::ids::labels::INBOX);
+                            !draft
+                                && !chat
+                                && !spam_or_trash
+                                && !own_reply
+                                && required_labels.iter().all(|label| has(label))
+                        });
+                        if has_newer {
+                            newer.insert(thread);
+                        }
+                    }
+                    Err(failure) if failure.is_not_found() => {}
+                    Err(failure) => return Err(failure.into()),
+                }
+            }
+        }
+        Ok(newer.into_iter().collect())
     }
 
     /// How Gmail is asked for `scope`'s threads: the list's own query (the one backfill uses),
@@ -321,13 +393,11 @@ impl Store {
                     addresses: &router.me.addresses,
                     name: router.me.name.as_deref(),
                 };
-                let q = crate::query::SearchQuery::parse(raw).to_gmail(
-                    &labels,
-                    &router.me.addresses,
-                    &important_definition(&me),
-                );
+                let parsed = crate::query::SearchQuery::parse(raw);
+                let q = parsed.to_gmail(&labels, &router.me.addresses, &important_definition(&me));
                 ListQuery {
                     q: Some(q),
+                    include_spam_trash: parsed.includes_spam_trash(),
                     ..ListQuery::default()
                 }
             }
@@ -549,32 +619,38 @@ impl Store {
         Ok((threads, carried))
     }
 
-    /// Of the stored `threads`, those that `cutoff`'s list has at or before the cutoff's date and
-    /// that its filter passes. For a search, they're all its own.
+    /// Of the stored `threads`, those that `cutoff`'s list or search has at or before the
+    /// cutoff's date and that its filter passes.
     async fn listed_by(
         &self,
         cutoff: &ListCutoff,
         threads: &[String],
         db: &mut toasty::Db,
     ) -> Result<HashSet<String>> {
-        let Scope::List(list) = &cutoff.scope else {
-            return Ok(threads.iter().cloned().collect());
-        };
         let fields = ListEntry::fields();
         let mut listed = HashSet::new();
         let before = cutoff.before.as_millisecond();
         for chunk in threads.chunks(CHUNK) {
-            let in_list = ListEntry::filter(
-                fields
-                    .thread_id()
-                    .in_list(chunk)
-                    .and(fields.list_id().in_list(list.members()))
-                    .and(fields.sort().le(before)),
-            )
-            .exec(db)
-            .await?;
-            let mut passing: HashSet<String> =
-                in_list.into_iter().map(|entry| entry.thread_id).collect();
+            let mut passing: HashSet<String> = match &cutoff.scope {
+                Scope::List(list) => ListEntry::filter(
+                    fields
+                        .thread_id()
+                        .in_list(chunk)
+                        .and(fields.list_id().in_list(list.members()))
+                        .and(fields.sort().le(before)),
+                )
+                .exec(db)
+                .await?
+                .into_iter()
+                .map(|entry| entry.thread_id)
+                .collect(),
+                Scope::Search(_) => load_views(db, chunk)
+                    .await?
+                    .into_iter()
+                    .filter(|(_, view)| view.gmail_sort() <= before)
+                    .map(|(id, _)| id)
+                    .collect(),
+            };
             if let Some(filter) = cutoff.filter {
                 let filtered: HashSet<String> = ListEntry::filter(
                     fields
@@ -1006,10 +1082,77 @@ mod tests {
             before_query(Some("in:inbox"), Some(Filter::NoReply), at),
             Err(Error::Unsearchable(_))
         ));
+        let after_sec = at.as_second();
         assert_eq!(
             after_query(Some("-in:INBOX OR x"), at),
-            format!("(-in:INBOX OR x) after:{seconds}")
+            format!("(-in:INBOX OR x) after:{after_sec}")
         );
-        assert_eq!(after_query(None, at), format!("after:{seconds}"));
+        assert_eq!(after_query(None, at), format!("after:{after_sec}"));
+    }
+
+    #[tokio::test]
+    async fn search_listed_by_filters_out_stored_threads_newer_than_cutoff() {
+        let dir =
+            std::env::temp_dir().join(format!("exo-store-bulk-listed-by-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        let insert = |id: &str, thread_id: &str, ms: i64| gmail::Message {
+            id: Some(id.into()),
+            thread_id: Some(thread_id.into()),
+            internal_date: Some(ms),
+            label_ids: vec!["INBOX".into()],
+            payload: Some(gmail::MessagePart {
+                mime_type: Some("text/plain".into()),
+                headers: vec![gmail::MessagePartHeader {
+                    name: "From".into(),
+                    value: "Tom <tom@brightmoor.co>".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            for (m, t, ms) in [
+                ("m1", "t_before", 1_794_319_200_250),
+                ("m2", "t_subsec_after", 1_794_319_200_750),
+            ] {
+                let parsed = crate::parse::parse(&insert(m, t, ms), false).expect("parses");
+                crate::provider::save_message(write.exec(), parsed)
+                    .await
+                    .expect("saves");
+                crate::store::reindex(write.exec(), t, &store.inner.router())
+                    .await
+                    .expect("indexes");
+            }
+            write.commit().await.expect("commits");
+        }
+
+        let cutoff = ListCutoff {
+            scope: Scope::Search("from:tom@brightmoor.co".into()),
+            filter: None,
+            keep: Vec::new(),
+            before: Timestamp::from_millisecond(1_794_319_200_250).unwrap(),
+        };
+        let listed = store
+            .listed_by(
+                &cutoff,
+                &["t_before".to_owned(), "t_subsec_after".to_owned()],
+                &mut db,
+            )
+            .await
+            .expect("listed");
+        assert_eq!(listed, HashSet::from(["t_before".to_owned()]));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

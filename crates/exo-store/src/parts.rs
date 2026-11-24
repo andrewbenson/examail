@@ -8,13 +8,16 @@
 //! of its own, and a conversation's parts go when eviction lets its bodies go.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::{StreamExt, stream};
-use toasty::stmt::Value;
 
+use crate::db;
 use crate::error::Result;
 use crate::ids::labels::{INBOX, SPAM, TRASH};
 use crate::store::Store;
+
+static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
 
 /// The most a file prefetched for an inbox conversation may weigh.
 const MAX_FILE: i64 = 25 << 20;
@@ -90,8 +93,15 @@ impl Store {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| {
                 // Write the whole file or nothing, so a reader never sees half a file.
-                let partial = path.with_extension("partial");
-                std::fs::write(&partial, data).and_then(|()| std::fs::rename(&partial, &path))
+                let n = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+                let partial = PathBuf::from(format!("{}.{n}.partial", path.display()));
+                std::fs::write(&partial, data).and_then(|()| {
+                    let renamed = std::fs::rename(&partial, &path);
+                    if renamed.is_err() {
+                        let _ = std::fs::remove_file(&partial);
+                    }
+                    renamed
+                })
             });
         if let Err(error) = written {
             log::debug!("keeping a part: {error}");
@@ -122,37 +132,27 @@ impl Store {
             return Ok(0);
         };
         let mut db = self.inner.db.clone();
-        let rows = toasty::sql::query(WANTED)
-            .bind(MAX_FILE)
-            .bind(i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX))
-            .bind(SPAM)
-            .bind(TRASH)
-            .bind(INBOX)
-            .exec(&mut db)
-            .await?;
+        let rows = db::query_rows::<(String, String, Option<String>, i64)>(
+            &mut db,
+            toasty::sql::query(WANTED)
+                .bind(MAX_FILE)
+                .bind(i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX))
+                .bind(SPAM)
+                .bind(TRASH)
+                .bind(INBOX),
+        )
+        .await?;
         // What fits in the budget, as Gmail sizes the parts.
         let mut room = cache.budget.saturating_sub(used(&cache.dir));
         let wanted: Vec<(String, String, Option<String>)> = rows
             .into_iter()
-            .filter_map(|row| match row {
-                Value::Record(row) => match &row.fields[..] {
-                    [
-                        Value::String(message),
-                        Value::String(part),
-                        attachment,
-                        Value::I64(size),
-                    ] => Some((
-                        message.clone(),
-                        part.clone(),
-                        match attachment {
-                            Value::String(id) => Some(id.clone()),
-                            _ => None,
-                        },
-                        u64::try_from(*size).unwrap_or_default(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
+            .map(|(message, part, attachment, size)| {
+                (
+                    message,
+                    part,
+                    attachment,
+                    u64::try_from(size).unwrap_or_default(),
+                )
             })
             .filter(|(message, part, _, _)| {
                 cache.file(message, part).is_some_and(|path| !path.exists())
@@ -200,12 +200,18 @@ impl Store {
     }
 }
 
+/// Whether `path` is an in-flight `.partial` write rather than a cached part.
+fn is_partial(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("partial")
+}
+
 /// The bytes the cache's files take.
 fn used(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
+                .filter(|entry| !is_partial(&entry.path()))
                 .filter_map(|entry| entry.metadata().ok())
                 .filter(std::fs::Metadata::is_file)
                 .map(|metadata| metadata.len())
@@ -221,6 +227,7 @@ fn trim(cache: &PartsCache) {
     };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
+        .filter(|entry| !is_partial(&entry.path()))
         .filter_map(|entry| {
             let metadata = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
             Some((metadata.modified().ok()?, metadata.len(), entry.path()))
@@ -286,5 +293,48 @@ mod tests {
         );
         assert_eq!(cache.file("../x", "1"), None);
         assert_eq!(cache.file("19a2", ""), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_dotted_part_ids_never_collide_on_partial_files() {
+        let dir = std::env::temp_dir().join(format!("exo-parts-dotted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let parts_dir = dir.join("parts");
+        store.cache_parts(PartsCache::new(parts_dir.clone()));
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let s1 = &store;
+                let s2 = &store;
+                scope.spawn(move || s1.keep_part("19a2f0c4", "1.1", b"inline-one"));
+                scope.spawn(move || s2.keep_part("19a2f0c4", "1.2", b"inline-two"));
+            }
+        });
+
+        assert_eq!(
+            store.cached_part("19a2f0c4", "1.1").as_deref(),
+            Some(&b"inline-one"[..])
+        );
+        assert_eq!(
+            store.cached_part("19a2f0c4", "1.2").as_deref(),
+            Some(&b"inline-two"[..])
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&parts_dir)
+            .expect("reads")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["19a2f0c4_1.1", "19a2f0c4_1.2"]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

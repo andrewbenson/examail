@@ -289,7 +289,7 @@ impl Mail {
             now: self.now.clone(),
             reply: open.record.in_reply_to.is_some(),
             current: open.record.send_later.as_ref().map(|later| later.at),
-            unscheduled: open.unscheduled_by.is_some(),
+            unscheduled: open.delivery.unscheduled_by.is_some(),
             previous: self.account.settings().previous_schedule.clone(),
         };
         self.commands.open_sub_palette(picker.palette());
@@ -313,7 +313,7 @@ impl Mail {
             return;
         };
         // A time picked for a send a reply called off starts afresh.
-        open.unscheduled_by = None;
+        open.delivery.unscheduled_by = None;
         open.record.send_later = at.map(|at| SendLater {
             at,
             abort_on_reply,
@@ -337,7 +337,7 @@ impl Mail {
                 .is_some_and(|later| later.at <= now)
             {
                 open.record.send_later = None;
-                open.unscheduled_by = None;
+                open.delivery.unscheduled_by = None;
                 save_changes(open, &self.account, &aliases, &self.now);
                 passed = true;
             }
@@ -376,7 +376,7 @@ impl Mail {
             } else {
                 aborting(open, &detail).map(replier)
             };
-            open.unscheduled_by = by;
+            open.delivery.unscheduled_by = by;
         }
     }
 }

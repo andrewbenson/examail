@@ -4,11 +4,12 @@
 //!
 //! Metrics are at a 1280×800 window.
 
-use egui::{Color32, Context, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, Context, Rect, Ui, pos2, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::Settings as AccountSettings;
 use exo_ui::{
-    ActionKind, Alert, DIALOG_ACTION_HEIGHT, Dialog, DialogAction, DialogInput, DialogResponse,
-    Family, Font, KeycapColors, Keycaps, TextStyle,
+    ActionKind, Alert, DIALOG_ACTION_HEIGHT, Dialog, DialogAction, DialogFooter, DialogInput,
+    DialogResponse, Family, Font, TextStyle,
 };
 
 /// 12px/20px text, 3px down (`top: 3px`), with the input bold.
@@ -24,12 +25,8 @@ const FOOTER_TOP: f32 = 120.0;
 const ACTIONS_TOP: f32 = 172.0;
 /// The body ends after the buttons' 28px row and its 7px margin.
 const BODY_HEIGHT: f32 = 207.0;
-/// The subheader's `rgba(0, 0, 0, .85)`, and the footer's `.6`.
+/// The subheader's `rgba(0, 0, 0, .85)`.
 const INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 217);
-const FOOTER_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 153);
-/// The footer's keycaps are 19px caps 4px apart, 1px above the line, and the period after them has
-/// `padding-left: 1px`.
-const KEY_HEIGHT: f32 = 19.0;
 /// Their labels' baseline, 14px down the cap (the footer's 20px line, measured).
 const KEY_BASELINE: f32 = 14.0;
 const SUBHEADER: &str =
@@ -117,6 +114,33 @@ impl State {
         self.alert.is_some()
     }
 
+    /// Registers the dialog's keyboard bindings in `Region::Dialog` (and its alert's keys).
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::InstantIntro(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        commands.add(key("INSTANT_INTRO_TAB", Event::Tab(1), &["tab"]));
+        commands.add(key(
+            "INSTANT_INTRO_SHIFT_TAB",
+            Event::Tab(-1),
+            &["shift+tab"],
+        ));
+        commands.add(key("INSTANT_INTRO_ENTER", Event::Enter, &["enter"]));
+        crate::notice::register_alert_keys(
+            commands,
+            wrap(super::Action::InstantIntro(Event::AlertConfirm)),
+            wrap(super::Action::InstantIntro(Event::AlertDismiss)),
+            |step| wrap(super::Action::InstantIntro(Event::AlertCycle(step))),
+        );
+    }
+
     fn is_default(&self) -> bool {
         self.text == AccountSettings::INSTANT_INTRO
     }
@@ -199,8 +223,8 @@ impl State {
             }
             Event::AlertCycle(step) => {
                 if let Some((asking, selected)) = &mut self.alert {
-                    let last = if *asking == Asking::Reset { 1 } else { 0 };
-                    *selected = selected.saturating_add_signed(step).min(last);
+                    let count = if *asking == Asking::Reset { 2 } else { 1 };
+                    *selected = Alert::move_selection(*selected, count, step, true);
                 }
             }
             Event::AlertDismiss => {
@@ -278,25 +302,17 @@ pub fn dialog(
                 &["OK", "Cancel"],
             ),
         };
-        let alert = Alert {
+        let (clicked, backdrop) = (Alert {
             title,
             text,
             actions,
             selected: *selected,
-        };
-        let clicked = egui::Area::new(exo_ui::id(ctx, "instant-intro-alert"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(area.min)
-            .show(ctx, |ui| {
-                let backdrop = ui.allocate_rect(area, Sense::click());
-                ui.painter()
-                    .rect_filled(area, 0.0, Color32::from_black_alpha(128));
-                match alert.show(ui, area) {
-                    Some(index) => Some(Event::AlertAction(index)),
-                    None => backdrop.clicked().then_some(Event::AlertDismiss),
-                }
-            });
-        *event = clicked.inner.or(event.take());
+        })
+        .show_modal(ctx, "instant-intro-alert", area);
+        *event = clicked
+            .map(Event::AlertAction)
+            .or_else(|| backdrop.then_some(Event::AlertDismiss))
+            .or(event.take());
         response.close = false;
     }
     response
@@ -342,30 +358,10 @@ fn show(ui: &mut Ui, body: Rect, state: &mut State) -> Option<Event> {
 
     // `To use Instant Intro, open a message and hit ⌘ shift i.`
     let footer = body.top() + FOOTER_TOP + NUDGE;
-    // The caps' `margin-left: 4px` follows the text, whose trailing space takes no room.
-    let x = left
-        + TEXT.paint_line(
-            &painter,
-            pos2(left, footer),
-            FOOTER.trim_end(),
-            FOOTER_INK,
-            None,
-        );
-    let keys = Keycaps::new(
-        &ctx,
-        &["⌘", "shift", "i"],
-        KeycapColors::shortcuts_pane(exo_ui::app_theme(&ctx).palette()),
-    )
-    .height(KEY_HEIGHT)
-    .baseline(KEY_BASELINE);
-    keys.paint(&painter, x, footer - 1.0);
-    TEXT.paint_line(
-        &painter,
-        pos2(x + keys.width() + 1.0, footer),
-        ".",
-        FOOTER_INK,
-        None,
-    );
+    DialogFooter::new(&["⌘", "shift", "i"])
+        .gaps(exo_ui::KEYCAP_GAP, 1.0)
+        .baseline(KEY_BASELINE)
+        .paint(ui, left, footer - 1.0, FOOTER.trim_end(), ".");
 
     // Reset sits at the left (12px out), and Cancel and Save at the right (13px out), 8px apart.
     // Save is selected unless a button has the keyboard.
@@ -475,5 +471,23 @@ mod tests {
                 close: true
             }
         );
+    }
+
+    #[test]
+    fn reset_alert_wraps_tab_from_zero_and_moves_right_to_left() {
+        let mut state = State::open(&AccountSettings::default());
+        state.text = "Custom {first_name}".into();
+        state.handle(Event::Click(Focus::Reset));
+        assert!(state.alert_open());
+        // Tab (-1) wraps from OK (0) to Cancel (1), leaving custom text intact on Confirm.
+        state.handle(Event::AlertCycle(-1));
+        state.handle(Event::AlertConfirm);
+        assert_eq!(state.text, "Custom {first_name}");
+        // ArrowLeft (+1) then ArrowRight (-1) returns to OK (0), resetting the line.
+        state.handle(Event::Click(Focus::Reset));
+        state.handle(Event::AlertCycle(1));
+        state.handle(Event::AlertCycle(-1));
+        state.handle(Event::AlertConfirm);
+        assert_eq!(state.text, AccountSettings::INSTANT_INTRO);
     }
 }

@@ -138,7 +138,7 @@ fn at_inbox_zero_the_toasts_show_the_photo_through_unless_the_folder_drawer_is_o
     let behind = |app: &Fixture| exo_ui::Behind::for_toasts(&app.harness.ctx).is_some();
     assert!(!behind(&app), "a list's toasts are opaque");
     clear_inbox(&mut app);
-    assert!(app.mail().toast().is_some(), "Mark Done's toast");
+    assert!(app.mail().toast_text().is_some(), "Mark Done's toast");
     assert!(behind(&app));
     // The open drawer has the keyboard, and the toasts are opaque again until it closes.
     app.key(Key::ArrowLeft);

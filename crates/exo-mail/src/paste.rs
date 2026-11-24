@@ -13,6 +13,7 @@ use crate::{
 pub fn prepare_paste(html: &str) -> String {
     let document = dom::parse(html);
     let Some(body) = dom::body(&document) else {
+        dom::drop_tree(document);
         return String::new();
     };
     let root = dom::parent(&body).unwrap_or_else(|| body.clone());
@@ -28,7 +29,14 @@ pub fn prepare_paste(html: &str) -> String {
     if !files.is_empty() {
         // Word's saved images, its VML copies of them and its `OLE_LINK` bookmarks.
         dom::detach_all(&files);
-        dom::detach_all(&dom::select(&body, |node| dom::is(node, "v:imagedata")));
+        for file in files {
+            dom::drop_tree(file);
+        }
+        let vml = dom::select(&body, |node| dom::is(node, "v:imagedata"));
+        dom::detach_all(&vml);
+        for node in vml {
+            dom::drop_tree(node);
+        }
         dom::unwrap_all(&dom::select(&body, |node| {
             dom::is(node, "a")
                 && dom::attr(node, "name").is_some_and(|name| {
@@ -62,8 +70,10 @@ pub fn prepare_paste(html: &str) -> String {
     }) {
         let parent = dom::parent(&hidden);
         dom::detach(&hidden);
+        dom::drop_tree(hidden);
         if let Some(parent) = parent.filter(|parent| dom::children(parent).is_empty()) {
             dom::detach(&parent);
+            dom::drop_tree(parent);
         }
     }
     // An item that starts with a list gives its content to its list.
@@ -77,11 +87,14 @@ pub fn prepare_paste(html: &str) -> String {
             dom::insert_before(&item, &child);
         }
         dom::detach(&item);
+        dom::drop_tree(item);
     }
     for element in dom::select(&body, dom::is_element) {
         snap_colors(&element);
     }
-    dom::inner_html(&body)
+    let out = dom::inner_html(&body);
+    dom::drop_tree(document);
+    out
 }
 
 /// Colours: Slack's Lato text is black, an unreadable colour snaps to the theme's, and black (or
@@ -354,7 +367,10 @@ fn word_lists(body: &NodeRef) {
         let next = dom::following_siblings(item)
             .into_iter()
             .find(dom::is_element);
-        if next.map(|next| dom::key(&next)) == items.get(index + 1).map(dom::key) {
+        if next
+            .zip(items.get(index + 1))
+            .is_some_and(|(next, next_item)| dom::key(&next) == dom::key(next_item))
+        {
             list = Some((root, current, depth));
         } else {
             dom::insert_before(item, &root);
@@ -369,6 +385,10 @@ fn is_bullet(node: &NodeRef) -> bool {
     dom::attr(node, "style").is_some_and(|style| style.contains("Ignore"))
 }
 
+/// Word's list format only defines 9 levels (`level1`..`level9`); clamping keeps hostile
+/// `mso-list:l0 level99999999` styles from allocating millions of nested `<ul>` nodes.
+const MAX_WORD_LIST_DEPTH: usize = 32;
+
 /// A Word list paragraph's depth: its `mso-list:l0 level2 lfo1` level, from 0.
 fn level(item: &NodeRef) -> usize {
     let style = dom::attr(item, "style").unwrap_or_default();
@@ -378,7 +398,7 @@ fn level(item: &NodeRef) -> usize {
         .and_then(|value| value.split(';').next())
         .and_then(|value| value.split_whitespace().nth(1))
         .and_then(|level| level.strip_prefix("level")?.parse::<usize>().ok())
-        .map_or(0, |level| level.saturating_sub(1))
+        .map_or(0, |level| level.saturating_sub(1).min(MAX_WORD_LIST_DEPTH))
 }
 
 /// Blank lines between spaced paragraphs: an empty line after a paragraph (`div` or `p`, not
@@ -472,6 +492,16 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("<p>After</p>"), "{out}");
+    }
+
+    #[test]
+    fn caps_hostile_word_list_depth() {
+        let html = r#"<html xmlns:w="urn:schemas-microsoft-com:office:word"><body>
+<p style='mso-list:l0 level99999999 lfo1'><span style='mso-list:Ignore'>o</span>Deep</p>
+</body></html>"#;
+        let out = prepare_paste(html);
+        assert!(out.contains("<li>Deep</li>"), "{out}");
+        assert_eq!(out.matches("<ul>").count(), MAX_WORD_LIST_DEPTH + 1);
     }
 
     #[test]

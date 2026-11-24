@@ -3,50 +3,30 @@
 //! Images setting allows. Each editor asks for the images it shows. The loads run off the UI
 //! thread and come back here.
 
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::mpsc::{Receiver, Sender, channel},
-};
+use std::{collections::HashSet, path::PathBuf};
 
 use exo_editor::{ImageLoad, ImageSource, Picture};
 use exo_store::{AttachmentSource, DraftAttachment, RemoteContentBlocking};
 
 use super::draft::Open;
-use crate::account::Loader;
+use crate::account::{Loader, UiTasks};
 
 /// The longest side an image is drawn from. A bigger file is scaled down for its texture, which
 /// the editor never draws wider than the window anyway.
 const MAX_SIDE: u32 = 2048;
 /// Inches in a metre, to turn a PNG's pixels per metre into dpi.
 const INCHES_PER_METER: f32 = 39.370_08;
-
-/// An image loaded for a draft.
-struct Loaded {
-    draft: String,
-    key: String,
-    load: ImageLoad,
-}
+/// Maximum concurrent inline-image decode workers so replies to image-heavy newsletters never
+/// spawn unbounded OS threads.
+const DECODE_WORKERS: usize = 4;
 
 /// The loads in flight, the Images setting they were made under, and the drafts where Show Images
 /// shows remote images whatever the setting says, for the session.
+#[derive(Default)]
 pub(crate) struct Loads {
-    sender: Sender<Loaded>,
-    receiver: Receiver<Loaded>,
+    tasks: UiTasks<[Open]>,
     setting: Option<RemoteContentBlocking>,
     shown: HashSet<String>,
-}
-
-impl Default for Loads {
-    fn default() -> Self {
-        let (sender, receiver) = channel();
-        Self {
-            sender,
-            receiver,
-            setting: None,
-            shown: HashSet::new(),
-        }
-    }
 }
 
 /// What a load needs from the account.
@@ -80,11 +60,7 @@ impl Loads {
                 open.editor.reload_remote_images();
             }
         }
-        while let Ok(loaded) = self.receiver.try_recv() {
-            if let Some(open) = drafts.iter_mut().find(|open| open.id == loaded.draft) {
-                open.editor.set_image(&loaded.key, loaded.load);
-            }
-        }
+        self.tasks.drain(drafts);
         for index in 0..drafts.len() {
             for (source, element) in drafts[index].editor.image_requests() {
                 if let ImageSource::Cid(cid) = &source
@@ -105,10 +81,13 @@ impl Loads {
         sources: &Sources<'_>,
     ) {
         let key = source.key();
-        let (sender, ctx, draft) = (self.sender.clone(), sources.ctx.clone(), open.id.clone());
+        let (ui, draft) = (self.tasks.sender(sources.ctx), open.id.clone());
         let finish = move |load: ImageLoad| {
-            let _ = sender.send(Loaded { draft, key, load });
-            ctx.request_repaint();
+            ui.send(move |drafts| {
+                if let Some(open) = drafts.iter_mut().find(|open| open.id == draft) {
+                    open.editor.set_image(&key, load);
+                }
+            });
         };
         match source {
             ImageSource::Cid(cid) => match attachment(&open.record.attachments, &cid) {
@@ -206,7 +185,7 @@ fn load_attachment(
             });
         }
         _ => {
-            std::thread::spawn(move || {
+            spawn_decode(move || {
                 finish(
                     std::fs::read(&path)
                         .ok()
@@ -218,7 +197,50 @@ fn load_attachment(
 }
 
 fn decode_off_thread(bytes: Option<Vec<u8>>, finish: impl FnOnce(ImageLoad) + Send + 'static) {
-    std::thread::spawn(move || finish(bytes.map_or(ImageLoad::Broken, |bytes| decode(&bytes))));
+    spawn_decode(move || finish(bytes.map_or(ImageLoad::Broken, |bytes| decode(&bytes))));
+}
+
+type DecodeJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Runs `job` on a shared bounded worker pool of [`DECODE_WORKERS`] threads.
+fn spawn_decode(job: impl FnOnce() + Send + 'static) {
+    use std::sync::{Arc, LazyLock, Mutex, mpsc};
+
+    static POOL: LazyLock<Option<mpsc::Sender<DecodeJob>>> = LazyLock::new(|| {
+        let (tx, rx) = mpsc::channel::<DecodeJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut spawned = 0;
+        for index in 0..DECODE_WORKERS {
+            let rx = Arc::clone(&rx);
+            if std::thread::Builder::new()
+                .name(format!("exo-image-decode-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let guard =
+                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.recv()
+                        };
+                        let Ok(job) = job else { break };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        (spawned > 0).then_some(tx)
+    });
+
+    let job: DecodeJob = Box::new(job);
+    if let Some(tx) = POOL.as_ref() {
+        if let Err(mpsc::SendError(job)) = tx.send(job) {
+            job();
+        }
+    } else {
+        job();
+    }
 }
 
 /// An image file's pixels (the first frame of an animation), scaled down past [`MAX_SIDE`], and
@@ -477,5 +499,41 @@ mod tests {
         };
         assert_eq!((picture.natural, picture.retina), ([3, 2], 2));
         assert!(matches!(decode(b"not an image"), ImageLoad::Broken));
+    }
+
+    #[test]
+    fn decode_worker_pool_bounds_concurrency() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        const JOBS: usize = 20;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        for _ in 0..JOBS {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let tx = tx.clone();
+            spawn_decode(move || {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                active.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            });
+        }
+        drop(tx);
+
+        let completed = rx.iter().count();
+        assert_eq!(completed, JOBS);
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=DECODE_WORKERS).contains(&observed_peak),
+            "peak concurrency {observed_peak} exceeded worker limit {DECODE_WORKERS}"
+        );
     }
 }

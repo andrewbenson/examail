@@ -12,17 +12,23 @@ use crate::{
 
 /// A CSS `url()` or `@import` that loads from the network.
 static REMOTE_CSS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?i)(?:url\(|@import)\s*['"]?\s*(?:https?:|//)"#).expect("valid regex")
+    regex::Regex::new(r#"(?i)(?:url\(|@import)\s*['"]?\s*(?:(?:exo-)?https?:|//)"#)
+        .expect("valid regex")
 });
 
 /// Whether `url`, as a body names it, loads from the network: an absolute or protocol-relative
-/// http(s) URL. (Relative ones resolve against a domain that never resolves.)
+/// http(s) URL, or an already-rewritten `exo-http(s):` URL. (Relative ones resolve against a
+/// domain that never resolves.)
 pub(crate) fn is_remote(url: &str) -> bool {
     let url = url.trim_start().as_bytes();
     let starts = |prefix: &str| {
         url.len() >= prefix.len() && url[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     };
-    starts("http:") || starts("https:") || starts("//")
+    starts("http:")
+        || starts("https:")
+        || starts("exo-http:")
+        || starts("exo-https:")
+        || starts("//")
 }
 
 /// Whether a `srcset` names a remote image.
@@ -34,16 +40,21 @@ pub(crate) fn srcset_is_remote(srcset: &str) -> bool {
 /// background, or a CSS image, font or stylesheet. The CSS ones are blocked too, so Show Images
 /// is offered for them as well.
 pub(crate) fn has_remote_content(root: &NodeRef) -> bool {
-    !dom::select(root, |node| {
+    dom::select_first(root, |node| {
         let attribute = |name: &str| dom::attr(node, name).unwrap_or_default();
-        ["src", "background", "poster"]
-            .iter()
-            .any(|name| is_remote(&attribute(name)))
+        let svg_remote = dom::is_svg_image(node)
+            && ["href", "xlink:href"]
+                .iter()
+                .any(|name| is_remote(&attribute(name)));
+        svg_remote
+            || ["src", "background", "poster"]
+                .iter()
+                .any(|name| is_remote(&attribute(name)))
             || srcset_is_remote(&attribute("srcset"))
             || REMOTE_CSS.is_match(&attribute("style"))
             || (dom::is(node, "style") && REMOTE_CSS.is_match(&dom::text_content(node)))
     })
-    .is_empty()
+    .is_some()
 }
 
 /// Loads `render`'s read receipts, as `Show all images` does each time a message is shown
@@ -80,14 +91,30 @@ mod tests {
         assert!(
             is_remote("https://x.io/a.png")
                 && is_remote(" HTTP://x.io")
+                && is_remote("exo-https://x.io/a.png")
+                && is_remote("EXO-HTTP://x.io/a.png")
                 && is_remote("//x.io/a.png")
         );
+        assert!(remote("<img src=\"exo-https://x.io/a.png\">"));
+        assert!(remote(
+            "<div style=\"background:url('exo-https://x.io/bg.png')\">x</div>"
+        ));
+        assert!(remote("<style>@import \"exo-http://x.io/a.css\";</style>"));
         assert!(
             !is_remote("cid:a@b")
                 && !is_remote("data:image/gif;base64,R0lG")
                 && !is_remote("a.png")
         );
         assert!(remote("<img src=\"https://x.io/a.png\">"));
+        assert!(remote(
+            "<svg><image href=\"https://x.io/a.png\"></image></svg>"
+        ));
+        assert!(remote(
+            "<svg><feImage xlink:href=\"//x.io/a.png\"></feImage></svg>"
+        ));
+        assert!(!remote(
+            "<svg><image href=\"data:image/png;base64,AA\"></image></svg>"
+        ));
         assert!(remote(
             "<img src=\"cid:a\" srcset=\"cid:b 1x, https://x.io/b.png 2x\">"
         ));

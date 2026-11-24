@@ -8,6 +8,7 @@ Exo includes data or ported code from these projects, under their licenses.
 | DOMPurify's default tag and attribute allowlists | `crates/exo-mail/src/purify.rs` | Cure53, [github.com/cure53/DOMPurify](https://github.com/cure53/DOMPurify) | Apache-2.0 or MPL-2.0 |
 | `turndown` HTML-to-Markdown rules (ported to Rust) | `crates/exo/src/copy/turndown.rs` | Dom Christie, [github.com/mixmark-io/turndown](https://github.com/mixmark-io/turndown) | MIT |
 | Top-level domain list | `crates/exo-mail/src/tlds.txt` | IANA root zone database | Public data |
+| Microsoft Graph v1.0 metadata (trimmed CSDL), which mock-servers' Graph tests check its responses against | `crates/mock-servers/tests/graph/metadata.xml` | Microsoft Graph, [github.com/microsoftgraph/msgraph-metadata](https://github.com/microsoftgraph/msgraph-metadata) | MIT (in the file's header) |
 | Root certificates for brands' mark certificates | `assets/mark-roots` (`SOURCES.txt` names each) | DigiCert, GlobalSign and SSL.com, the issuers [bimigroup.org/vmc-issuers](https://bimigroup.org/vmc-issuers/) lists | Public data |
 | Exo Sans, Exo Sans Alt (modified Public Sans) | `assets/fonts/ExoSans*.ttf` | The Public Sans Project Authors, [github.com/uswds/public-sans](https://github.com/uswds/public-sans) | OFL-1.1 (`assets/fonts/OFL.txt`) |
 | Exo Mono (modified Fira Mono) | `assets/fonts/ExoMono-Regular.ttf` | The Mozilla Corporation and Telefonica S.A., [github.com/mozilla/Fira](https://github.com/mozilla/Fira) | OFL-1.1 (`assets/fonts/OFL.txt`) |

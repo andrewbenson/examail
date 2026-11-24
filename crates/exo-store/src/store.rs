@@ -1,7 +1,8 @@
 //! The store handle: opening an account, reads, and the shared plumbing the outbox and sync
 //! use (transactions, change notification, recomputing list membership).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -14,13 +15,14 @@ use tokio::sync::{Mutex, MutexGuard, watch};
 use crate::api::{Api, Failure};
 use crate::connection::{Connection, Debounce, Outage};
 use crate::db::{
-    self, AttachmentRow, BodyRow, EXO_DRAFTS, IDENTITY, LabelRow, ListCursor, ListEntry,
-    MessageRow, OutboxRow, ParticipantEntry, ReminderRow,
+    self, AttachmentRow, BodyRow, IDENTITY, LabelRow, ListCursor, ListEntry, MessageRow, OutboxRow,
+    ParticipantEntry, ReminderRow,
 };
 use crate::error::{Error, Result};
 use crate::ids::labels::{INBOX, UNREAD};
 use crate::ids::{Filter, ListId, ThreadId};
 use crate::model::{Cursor, Label, LabelKind, ListCount, RecentThread, ThreadDetail, ThreadPage};
+use crate::queue::FlushGate;
 use crate::quota::{Lane, Quota};
 use crate::settings::{self, Settings};
 use crate::split::Splits;
@@ -73,7 +75,14 @@ pub(crate) struct Inner {
     /// Labels and identity were refreshed since this store was opened (or rebuilt).
     pub bootstrapped: AtomicBool,
     /// One flush at a time, so no queue is sent twice at once.
-    pub flush: Mutex<()>,
+    pub flush: FlushGate,
+    /// Serializes draft pushes and history cleanup apart from the triage outbox so multi-MB
+    /// draft uploads never head-of-line block triage flushes.
+    pub draft_flush: FlushGate,
+    /// Per-store flush and in-flight create tracking for the calendar outbox.
+    pub calendar_outbox: crate::calendar::outbox::CalendarOutboxSync,
+    /// Serializes one-click unsubscribe flushes so concurrent flushes cannot race on `kv`.
+    pub unsubscribe_flush: FlushGate,
     /// Held across `drafts.send` and by undo send, so an undo either comes before the send or
     /// finds out it went.
     pub sending: Mutex<()>,
@@ -134,7 +143,7 @@ pub struct Options {
     /// outbox).
     pub backoff: Duration,
     /// The quota that Gmail calls are paced under. `None` sends them as they come, for a server
-    /// that enforces none (like gmail-mock unless asked to).
+    /// that enforces none (like mock-servers unless asked to).
     pub quota: Option<Quota>,
     /// The shortest time an outage lasts before [`Store::connection`] says it's over.
     pub debounce: Debounce,
@@ -159,7 +168,7 @@ impl Default for Options {
 
 impl Store {
     /// Opens `account`'s store, one SQLite file in `dir`, talking to Gmail at `endpoints`.
-    /// Calls to Google are paced under Gmail's quota. Calls anywhere else (gmail-mock) aren't,
+    /// Calls to Google are paced under Gmail's quota. Calls anywhere else (mock-servers) aren't,
     /// since the mock enforces no quota unless asked to and tests shouldn't wait one out.
     ///
     /// # Errors
@@ -215,7 +224,10 @@ impl Store {
                 write: Mutex::new(()),
                 sync: Mutex::new(()),
                 bootstrapped: AtomicBool::new(false),
-                flush: Mutex::new(()),
+                flush: FlushGate::default(),
+                draft_flush: FlushGate::default(),
+                calendar_outbox: crate::calendar::outbox::CalendarOutboxSync::default(),
+                unsubscribe_flush: FlushGate::default(),
                 sending: Mutex::new(()),
                 identity: RwLock::new(identity),
                 splits: RwLock::new(Arc::new(splits)),
@@ -268,7 +280,7 @@ impl Store {
             let file = dir.join(format!("{account}.sqlite3{suffix}"));
             gone(file.clone(), std::fs::remove_file(&file))?;
         }
-        // A store kept beside its files keeps its parts there too (gmail-mock's, the app's).
+        // A store kept beside its files keeps its parts there too (mock-servers', the app's).
         for folder in ["files", "parts"] {
             let folder = dir.join(format!("{account}.{folder}"));
             gone(folder.clone(), std::fs::remove_dir_all(&folder))?;
@@ -395,17 +407,7 @@ impl Store {
         let mut entries = match narrow {
             None => query.limit(limit + 1).exec(&mut db).await?,
             Some(narrow) => {
-                let passing: HashSet<String> = ListEntry::filter_by_list_id(narrow.key())
-                    .select(fields.thread_id())
-                    .exec(&mut db)
-                    .await?
-                    .into_iter()
-                    .chain(keep.iter().map(|id| id.as_str().to_owned()))
-                    .collect();
-                let mut entries = query.exec(&mut db).await?;
-                entries.retain(|entry| passing.contains(&entry.thread_id));
-                entries.truncate(limit + 1);
-                entries
+                filtered_entries(&mut db, list, narrow, keep, bound, after, limit).await?
             }
         };
         let router = self.inner.router();
@@ -425,17 +427,20 @@ impl Store {
         let held: Vec<&ThreadId> = held.iter().chain(&waiting).collect();
         if !held.is_empty() {
             let held: Vec<&str> = held.iter().map(|id| id.as_str()).collect();
-            let listed: HashSet<String> = ListEntry::filter(
-                fields
-                    .list_id()
-                    .in_list(list.members())
-                    .and(fields.thread_id().in_list(held.as_slice())),
-            )
-            .select(fields.thread_id())
-            .exec(&mut db)
-            .await?
-            .into_iter()
-            .collect();
+            let mut listed = HashSet::new();
+            for chunk in held.chunks(db::IN_LIST_CHUNK) {
+                listed.extend(
+                    ListEntry::filter(
+                        fields
+                            .list_id()
+                            .in_list(list.members())
+                            .and(fields.thread_id().in_list(chunk)),
+                    )
+                    .select(fields.thread_id())
+                    .exec(&mut db)
+                    .await?,
+                );
+            }
             let gone: Vec<String> = held
                 .iter()
                 .filter(|id| !listed.contains(**id))
@@ -472,23 +477,16 @@ impl Store {
             .map(|entry| entry.thread_id.clone())
             .collect();
         let mut views = load_views(&mut db, &ids).await?;
-        let messages: Vec<String> = views
-            .values()
-            .flat_map(|view| view.messages.iter().map(|m| m.row.id.clone()))
-            .collect();
-        let attachments = AttachmentRow::filter(
-            AttachmentRow::fields()
-                .message_id()
-                .in_list(messages.as_slice()),
-        )
-        .exec(&mut db)
-        .await?;
+        let attachments_by_thread = load_attachments_by_thread(&mut db, &views).await?;
         Ok(ThreadPage {
             threads: entries
                 .iter()
                 .filter_map(|entry| {
                     let view = views.get_mut(&entry.thread_id)?;
-                    Some(view.summary(list, entry.sort, &router, &attachments))
+                    let attachments = attachments_by_thread
+                        .get(&entry.thread_id)
+                        .map_or(&[][..], Vec::as_slice);
+                    Some(view.summary(list, entry.sort, &router, attachments))
                 })
                 .collect(),
             next,
@@ -502,20 +500,32 @@ impl Store {
     /// On database failures.
     pub async fn count(&self, list: &ListId) -> Result<ListCount> {
         let mut db = self.inner.db.clone();
-        let fields = ListEntry::fields();
-        let threads: Vec<String> = ListEntry::filter(fields.list_id().in_list(list.members()))
-            .select(fields.thread_id())
-            .exec(&mut db)
-            .await?;
-        let unread: HashSet<String> = ListEntry::filter_by_list_id(UNREAD)
-            .select(fields.thread_id())
-            .exec(&mut db)
+        let stmt = match list {
+            ListId::Inbox => toasty::sql::query(
+                "SELECT count(*), coalesce(sum(EXISTS (SELECT 1 FROM list_ids u WHERE u.list_id = ?3 AND u.thread_id = d.thread_id)), 0) FROM (SELECT DISTINCT thread_id FROM list_ids WHERE list_id IN (?1, ?2)) d",
+            )
+            .bind(crate::ids::labels::SH_IMPORTANT)
+            .bind(crate::ids::labels::SH_OTHER)
+            .bind(UNREAD),
+            other => toasty::sql::query(
+                "SELECT count(*), coalesce(sum(EXISTS (SELECT 1 FROM list_ids u WHERE u.list_id = ?2 AND u.thread_id = l.thread_id)), 0) FROM list_ids l WHERE l.list_id = ?1",
+            )
+            .bind(other.key())
+            .bind(UNREAD),
+        };
+        let (threads, unread) = db::query_rows::<(i64, i64)>(&mut db, stmt)
             .await?
             .into_iter()
-            .collect();
+            .next()
+            .map_or((0, 0), |(threads, unread)| {
+                (
+                    usize::try_from(threads).unwrap_or(0),
+                    usize::try_from(unread).unwrap_or(0),
+                )
+            });
         Ok(ListCount {
-            unread: threads.iter().filter(|id| unread.contains(*id)).count(),
-            threads: threads.len(),
+            threads,
+            unread,
             exact: db::coverage(&mut db, list).await? == Some(i64::MIN),
         })
     }
@@ -532,13 +542,20 @@ impl Store {
         };
         // Drafts written elsewhere are included too, because the thread shows them in compose.
         let ids: Vec<String> = view.all_messages().map(|m| m.row.id.clone()).collect();
-        let attachments =
-            AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(ids.as_slice()))
-                .exec(&mut db)
-                .await?;
-        let bodies = BodyRow::filter(BodyRow::fields().message_id().in_list(ids.as_slice()))
-            .exec(&mut db)
-            .await?;
+        let mut attachments = Vec::new();
+        let mut bodies = Vec::new();
+        for chunk in ids.chunks(db::IN_LIST_CHUNK) {
+            attachments.extend(
+                AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(chunk))
+                    .exec(&mut db)
+                    .await?,
+            );
+            bodies.extend(
+                BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
+                    .exec(&mut db)
+                    .await?,
+            );
+        }
         Ok(Some(view.detail(attachments, bodies, &self.inner.me())))
     }
 
@@ -553,17 +570,6 @@ impl Store {
             return Ok(None);
         };
         Ok(Some(view.detail(Vec::new(), Vec::new(), &self.inner.me())))
-    }
-
-    /// Records that Exo wrote the draft message `message`, so it routes and shows as Exo's own.
-    /// A new message sits in the Inbox, and a reply's row reads `Draft to …` with the draft's
-    /// text. Drafts written anywhere else only appear in Drafts. Gmail gives a draft a new
-    /// message id every time it's saved, so compose records each one.
-    ///
-    /// # Errors
-    /// On database failures.
-    pub async fn record_draft(&self, message: &str) -> Result<()> {
-        self.inner.record_draft(message).await
     }
 
     /// `email`'s latest conversations in local mail, newest first, at most `limit`. These are the
@@ -791,26 +797,6 @@ impl Store {
 }
 
 impl Inner {
-    /// [`Store::record_draft`].
-    pub async fn record_draft(&self, message: &str) -> Result<()> {
-        let router = self.router();
-        let mut db = self.db.clone();
-        let mut write = self.begin(&mut db).await?;
-        let mut drafts = exo_drafts(write.exec()).await?;
-        if !drafts.insert(message.to_owned()) {
-            return write.commit().await;
-        }
-        db::kv_set(write.exec(), EXO_DRAFTS, &drafts).await?;
-        let stored = MessageRow::filter_by_id(message)
-            .first()
-            .exec(write.exec())
-            .await?;
-        if let Some(stored) = stored {
-            reindex(write.exec(), &stored.thread_id, &router).await?;
-        }
-        write.publish().await
-    }
-
     pub fn me(&self) -> Identity {
         self.identity
             .read()
@@ -851,9 +837,7 @@ impl Inner {
             .exec(&mut db)
             .await?;
         let mut write = self.begin(&mut db).await?;
-        for thread in &threads {
-            reindex(write.exec(), thread, &router).await?;
-        }
+        reindex_many(write.exec(), &threads, &router).await?;
         // The Inbox, Important and Other searches subtract the splits, so a page token from the
         // old search can't continue the new one. Their passes start again from the top and keep
         // how far back they've covered.
@@ -933,30 +917,189 @@ pub(crate) async fn load_views(
     if threads.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut rows: HashMap<String, Vec<MessageRow>> = HashMap::new();
-    for row in MessageRow::filter(MessageRow::fields().thread_id().in_list(threads))
-        .exec(exec)
-        .await?
-    {
-        rows.entry(row.thread_id.clone()).or_default().push(row);
+    let marks = crate::drafts::marks(exec).await?;
+    load_views_with_marks(exec, threads, &marks).await
+}
+
+/// Executes a filtered list page query in SQL (`EXISTS` against `list_ids`), returning up to
+/// `limit + 1` matching entries newest first without loading either list into memory.
+async fn filtered_entries(
+    exec: &mut dyn Executor,
+    list: &ListId,
+    narrow: Filter,
+    keep: &[ThreadId],
+    bound: i64,
+    after: Option<&Cursor>,
+    limit: usize,
+) -> Result<Vec<ListEntry>> {
+    const INLINE_KEEP_MAX: usize = 400;
+    let members = list.members();
+    let inline_keep = keep.len() <= INLINE_KEEP_MAX;
+    let mut sql = String::from("SELECT l.list_id, l.thread_id, l.sort FROM list_ids l WHERE ");
+    let mut params: Vec<toasty::stmt::Value> = Vec::new();
+    if members.len() == 1 {
+        params.push(members[0].into());
+        sql.push_str("l.list_id = ?1");
+    } else {
+        let placeholders: Vec<String> = members
+            .iter()
+            .map(|member| {
+                params.push((*member).into());
+                format!("?{}", params.len())
+            })
+            .collect();
+        sql.push_str(&format!("l.list_id IN ({})", placeholders.join(", ")));
     }
-    let mut ops: HashMap<String, Vec<OutboxRow>> = HashMap::new();
-    for op in OutboxRow::filter(OutboxRow::fields().queue().in_list(threads))
-        .order_by(OutboxRow::fields().id().asc())
-        .exec(exec)
-        .await?
-    {
-        ops.entry(op.queue.clone()).or_default().push(op);
+    params.push(bound.into());
+    sql.push_str(&format!(" AND l.sort >= ?{}", params.len()));
+    if let Some(after) = after {
+        params.push(after.sort.into());
+        let sort_p = params.len();
+        params.push(after.thread.clone().into());
+        let thread_p = params.len();
+        sql.push_str(&format!(
+            " AND (l.sort < ?{sort_p} OR (l.sort = ?{sort_p} AND l.thread_id < ?{thread_p}))"
+        ));
     }
-    let mut reminders: HashMap<String, ReminderRow> =
-        ReminderRow::filter(ReminderRow::fields().thread_id().in_list(threads))
+    params.push(narrow.key().into());
+    let narrow_p = params.len();
+    if keep.is_empty() || !inline_keep {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM list_ids f WHERE f.list_id = ?{narrow_p} AND f.thread_id = l.thread_id)"
+        ));
+    } else {
+        let placeholders: Vec<String> = keep
+            .iter()
+            .map(|id| {
+                params.push(id.as_str().into());
+                format!("?{}", params.len())
+            })
+            .collect();
+        sql.push_str(&format!(
+            " AND (EXISTS (SELECT 1 FROM list_ids f WHERE f.list_id = ?{narrow_p} AND f.thread_id = l.thread_id) OR l.thread_id IN ({}))",
+            placeholders.join(", ")
+        ));
+    }
+    params.push(
+        i64::try_from(limit.saturating_add(1))
+            .unwrap_or(i64::MAX)
+            .into(),
+    );
+    sql.push_str(&format!(
+        " ORDER BY l.sort DESC, l.thread_id DESC LIMIT ?{}",
+        params.len()
+    ));
+    let mut stmt = toasty::sql::query(sql);
+    for param in params {
+        stmt = stmt.bind(param);
+    }
+    let mut entries: Vec<ListEntry> = db::query_rows::<(String, String, i64)>(exec, stmt)
+        .await?
+        .into_iter()
+        .map(|(list_id, thread_id, sort)| ListEntry {
+            list_id,
+            thread_id,
+            sort,
+        })
+        .collect();
+    if !inline_keep {
+        let mut seen: HashSet<(String, String)> = entries
+            .iter()
+            .map(|e| (e.list_id.clone(), e.thread_id.clone()))
+            .collect();
+        let fields = ListEntry::fields();
+        let keep_ids: Vec<&str> = keep.iter().map(ThreadId::as_str).collect();
+        for chunk in keep_ids.chunks(db::IN_LIST_CHUNK) {
+            let mut expr = fields
+                .list_id()
+                .in_list(members.as_slice())
+                .and(fields.thread_id().in_list(chunk))
+                .and(fields.sort().ge(bound));
+            if let Some(after) = after {
+                expr = expr.and(
+                    fields.sort().lt(after.sort).or(fields
+                        .sort()
+                        .eq(after.sort)
+                        .and(fields.thread_id().lt(&after.thread))),
+                );
+            }
+            for entry in ListEntry::filter(expr).exec(exec).await? {
+                if seen.insert((entry.list_id.clone(), entry.thread_id.clone())) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by(|a, b| (b.sort, &b.thread_id).cmp(&(a.sort, &a.thread_id)));
+        entries.truncate(limit + 1);
+    }
+    Ok(entries)
+}
+
+/// Loads attachment rows for every message in `views`, chunked to stay below SQLite's bind
+/// parameter limit and grouped by thread id so per-thread summaries only scan their own rows.
+pub(crate) async fn load_attachments_by_thread(
+    exec: &mut dyn Executor,
+    views: &HashMap<String, ThreadView>,
+) -> Result<HashMap<String, Vec<AttachmentRow>>> {
+    let mut msg_to_thread: HashMap<&str, &str> = HashMap::new();
+    for (thread_id, view) in views {
+        for message in view.all_messages() {
+            msg_to_thread.insert(message.row.id.as_str(), thread_id.as_str());
+        }
+    }
+    let messages: Vec<&str> = msg_to_thread.keys().copied().collect();
+    let mut by_thread: HashMap<String, Vec<AttachmentRow>> = HashMap::new();
+    for chunk in messages.chunks(db::IN_LIST_CHUNK) {
+        for row in AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(chunk))
             .exec(exec)
             .await?
-            .into_iter()
-            .map(|row| (row.thread_id.clone(), row))
-            .collect();
-    let exo_drafts = exo_drafts(exec).await?;
-    let marks = crate::drafts::marks(exec).await?;
+        {
+            if let Some(&thread_id) = msg_to_thread.get(row.message_id.as_str()) {
+                by_thread.entry(thread_id.to_owned()).or_default().push(row);
+            }
+        }
+    }
+    Ok(by_thread)
+}
+
+async fn load_views_with_marks(
+    exec: &mut dyn Executor,
+    threads: &[String],
+    marks: &crate::drafts::Marks,
+) -> Result<HashMap<String, ThreadView>> {
+    if threads.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut seen = HashSet::with_capacity(threads.len());
+    let unique: Vec<&str> = threads
+        .iter()
+        .map(String::as_str)
+        .filter(|id| seen.insert(*id))
+        .collect();
+    let mut rows: HashMap<String, Vec<MessageRow>> = HashMap::new();
+    let mut ops: HashMap<String, Vec<OutboxRow>> = HashMap::new();
+    let mut reminders: HashMap<String, ReminderRow> = HashMap::new();
+    for chunk in unique.chunks(db::IN_LIST_CHUNK) {
+        for row in MessageRow::filter(MessageRow::fields().thread_id().in_list(chunk))
+            .exec(exec)
+            .await?
+        {
+            rows.entry(row.thread_id.clone()).or_default().push(row);
+        }
+        for op in OutboxRow::filter(OutboxRow::fields().queue().in_list(chunk))
+            .order_by(OutboxRow::fields().id().asc())
+            .exec(exec)
+            .await?
+        {
+            ops.entry(op.queue.clone()).or_default().push(op);
+        }
+        for row in ReminderRow::filter(ReminderRow::fields().thread_id().in_list(chunk))
+            .exec(exec)
+            .await?
+        {
+            reminders.insert(row.thread_id.clone(), row);
+        }
+    }
     Ok(rows
         .into_iter()
         .filter_map(|(id, mut rows)| {
@@ -966,7 +1109,7 @@ pub(crate) async fn load_views(
                 return None;
             }
             let ops = ops.remove(&id).unwrap_or_default();
-            let mut view = ThreadView::new(id.clone(), rows, &ops, &exo_drafts);
+            let mut view = ThreadView::new(id.clone(), rows, &ops, &marks.exo_drafts);
             for message in &mut view.messages {
                 message.failed = marks.failed.get(&message.row.id).copied();
                 message.scheduled = marks.scheduled.get(&message.row.id).copied();
@@ -978,11 +1121,6 @@ pub(crate) async fn load_views(
             Some((id, view))
         })
         .collect())
-}
-
-/// The draft messages Exo wrote, which route and show as Exo's own.
-async fn exo_drafts(exec: &mut dyn Executor) -> Result<BTreeSet<String>> {
-    Ok(db::kv_get(exec, EXO_DRAFTS).await?.unwrap_or_default())
 }
 
 /// The account's splits as saved, with the labels they can name.
@@ -997,46 +1135,100 @@ async fn load_splits(exec: &mut dyn Executor) -> Result<Splits> {
     ))
 }
 
+const REINDEX_CHUNK: usize = 64;
+
 /// Recomputes a thread's list membership and participants from its messages and queued
 /// mutations.
 pub(crate) async fn reindex(exec: &mut dyn Executor, thread: &str, router: &Router) -> Result<()> {
-    ListEntry::filter_by_thread_id(thread)
-        .delete()
-        .exec(exec)
-        .await?;
-    ParticipantEntry::filter_by_thread_id(thread)
-        .delete()
-        .exec(exec)
-        .await?;
-    let Some(view) = load_view(exec, thread).await? else {
-        return crate::search::unindex(exec, thread).await;
-    };
-    let messages: Vec<&str> = view.messages.iter().map(|m| m.row.id.as_str()).collect();
-    let attachments = AttachmentRow::filter(
-        AttachmentRow::fields()
-            .message_id()
-            .in_list(messages.as_slice()),
-    )
-    .exec(exec)
-    .await?;
+    reindex_many(exec, &[thread.to_owned()], router).await
+}
+
+/// [`reindex`] for many threads at once, reading the draft table once for the batch and
+/// loading views and attachments in chunks.
+pub(crate) async fn reindex_many(
+    exec: &mut dyn Executor,
+    thread_ids: &[String],
+    router: &Router,
+) -> Result<()> {
+    let mut seen = HashSet::with_capacity(thread_ids.len());
+    let unique: Vec<String> = thread_ids
+        .iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+    let marks = crate::drafts::marks(exec).await?;
     let me = &router.me;
-    let lists = router.list_ids(&view, &attachments);
-    let mut entries = ListEntry::create_many();
-    for list in &lists {
-        let sort = view.sort_for(list, me);
-        entries = entries.with_item(|entry| entry.list_id(*list).thread_id(thread).sort(sort));
-    }
-    entries.exec(exec).await?;
-    let (emails, sort) = view.participants(me);
-    if !emails.is_empty() {
-        let mut participants = ParticipantEntry::create_many();
-        for email in &emails {
-            participants =
-                participants.with_item(|entry| entry.email(email).thread_id(thread).sort(sort));
+    for chunk in unique.chunks(REINDEX_CHUNK) {
+        ListEntry::filter(ListEntry::fields().thread_id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
+        ParticipantEntry::filter(ParticipantEntry::fields().thread_id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
+        let mut views = load_views_with_marks(exec, chunk, &marks).await?;
+        let mut by_message: HashMap<String, Vec<AttachmentRow>> = HashMap::new();
+        {
+            let messages: Vec<&str> = views
+                .values()
+                .flat_map(|view| view.messages.iter().map(|m| m.row.id.as_str()))
+                .collect();
+            for message_chunk in messages.chunks(db::IN_LIST_CHUNK) {
+                for row in AttachmentRow::filter(
+                    AttachmentRow::fields().message_id().in_list(message_chunk),
+                )
+                .exec(exec)
+                .await?
+                {
+                    by_message
+                        .entry(row.message_id.clone())
+                        .or_default()
+                        .push(row);
+                }
+            }
         }
-        participants.exec(exec).await?;
+        let mut entries = ListEntry::create_many();
+        let mut has_entries = false;
+        let mut participants = ParticipantEntry::create_many();
+        let mut has_participants = false;
+        for thread in chunk {
+            let Some(view) = views.remove(thread) else {
+                crate::search::unindex(exec, thread).await?;
+                continue;
+            };
+            let attachments: Vec<AttachmentRow> = view
+                .messages
+                .iter()
+                .filter_map(|m| by_message.remove(&m.row.id))
+                .flatten()
+                .collect();
+            let lists = router.list_ids(&view, &attachments);
+            for list in &lists {
+                let sort = view.sort_for(list, me);
+                entries = entries
+                    .with_item(|entry| entry.list_id(*list).thread_id(thread.as_str()).sort(sort));
+                has_entries = true;
+            }
+            let (emails, sort) = view.participants(me);
+            for email in &emails {
+                participants = participants
+                    .with_item(|entry| entry.email(email).thread_id(thread.as_str()).sort(sort));
+                has_participants = true;
+            }
+            crate::search::index(exec, &view, &lists, &attachments).await?;
+        }
+        if has_entries {
+            entries.exec(exec).await?;
+        }
+        if has_participants {
+            participants.exec(exec).await?;
+        }
     }
-    crate::search::index(exec, &view, &lists, &attachments).await
+    Ok(())
 }
 
 /// Refuses account names that would leave the store's folder (`../x`) or hide its files.
@@ -1118,5 +1310,126 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn filtered_list_runs_in_sql_and_load_views_chunks_past_in_list_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "exo-store-sql-filter-and-chunk-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        // Mark All Mail complete so `list_filtered` has full coverage.
+        ListCursor::create()
+            .id(crate::ids::labels::SH_ALL)
+            .page_token(None::<String>)
+            .min_sort(None::<i64>)
+            .complete(true)
+            .seen(0)
+            .exec(&mut db)
+            .await
+            .expect("cursor");
+
+        // Create 520 threads (exceeds `IN_LIST_CHUNK = 500`), every 10th unread, plus one read
+        // thread we'll pass in `keep`.
+        let mut ids = Vec::with_capacity(520);
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            for i in 0..520_i64 {
+                let tid = format!("t{i:04}");
+                let mid = format!("m{i:04}");
+                let mut labels = vec![
+                    INBOX.to_owned(),
+                    crate::ids::labels::CATEGORY_PERSONAL.to_owned(),
+                ];
+                if i % 10 == 0 {
+                    labels.push(UNREAD.to_owned());
+                }
+                let msg = gmail::Message {
+                    id: Some(mid),
+                    thread_id: Some(tid.clone()),
+                    internal_date: Some(1_794_900_000_000 + i * 1_000),
+                    label_ids: labels,
+                    payload: Some(gmail::MessagePart {
+                        headers: vec![
+                            gmail::MessagePartHeader {
+                                name: "Subject".into(),
+                                value: format!("Subject {i}"),
+                            },
+                            gmail::MessagePartHeader {
+                                name: "From".into(),
+                                value: "Priya <priya@brightmoor.co>".into(),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let parsed = crate::parse::parse(&msg, false).expect("parses");
+                crate::provider::save_message(write.exec(), parsed)
+                    .await
+                    .expect("saves");
+                ids.push(tid);
+            }
+            reindex_many(write.exec(), &ids, &store.inner.router())
+                .await
+                .expect("reindexes");
+            write.commit().await.expect("commits");
+        }
+
+        // Chunked `load_views` handles >500 threads (even with duplicate ids).
+        let mut dup_ids = ids.clone();
+        dup_ids.push("t0000".to_owned());
+        let loaded = load_views(&mut db, &dup_ids)
+            .await
+            .expect("loads >500 views");
+        assert_eq!(loaded.len(), 520);
+        assert_eq!(loaded["t0000"].messages.len(), 1, "no duplicate messages");
+
+        // SQL-filtered `list_filtered` with `Filter::Unread`, sticky `keep`, and pagination.
+        let kept = ThreadId::new("t0515");
+        let page1 = store
+            .list_filtered(
+                &ListId::Inbox,
+                Some(Filter::Unread),
+                std::slice::from_ref(&kept),
+                &[],
+                None,
+                5,
+            )
+            .await
+            .expect("page 1");
+        assert_eq!(page1.threads.len(), 5);
+        assert!(page1.next.is_some());
+        let page1_ids: Vec<&str> = page1.threads.iter().map(|t| t.id.as_str()).collect();
+        // Newest unread are t0510, t0500, t0490, t0480; kept sticky t0515 sorts ahead of t0510.
+        assert_eq!(page1_ids, ["t0515", "t0510", "t0500", "t0490", "t0480"]);
+
+        let page2 = store
+            .list_filtered(
+                &ListId::Inbox,
+                Some(Filter::Unread),
+                std::slice::from_ref(&kept),
+                &[],
+                page1.next.as_ref(),
+                5,
+            )
+            .await
+            .expect("page 2");
+        let page2_ids: Vec<&str> = page2.threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(page2_ids, ["t0470", "t0460", "t0450", "t0440", "t0430"]);
+
+        drop(db);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

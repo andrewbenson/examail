@@ -14,8 +14,12 @@
 //! `Gmail settings` and the row.
 
 use egui::{Color32, Context, CornerRadius, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::{Alias, Contact, MessageDetail};
-use exo_ui::{Dialog, DialogDropdown, DialogResponse, Family, Font, Menu, TextStyle, motion};
+use exo_ui::{
+    Dialog, DialogDropdown, DialogMenuKind, DialogResponse, DialogSelect, DialogSelectEvent,
+    Family, Font, TextStyle, motion,
+};
 
 use crate::{
     account::Loader,
@@ -30,8 +34,6 @@ const VALUE: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 16.0
 const VALUE_LEFT: f32 = 5.0;
 const VALUE_TOP: f32 = 29.0;
 const LABEL_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 179);
-/// The open list: 18px left of the value and 23px under it.
-const MENU_OFFSET: egui::Vec2 = vec2(-18.0, 23.0);
 /// The signature's block sits 60px down (`padding-top: 16px` under the 44px row) and is at least
 /// 48px tall (`min-height: 48px`). Its bar is 4px wide, with the signature 12px past it.
 const BLOCK_TOP: f32 = 60.0;
@@ -171,6 +173,53 @@ impl State {
     /// What has the keyboard.
     pub fn focus(&self) -> Option<Focus> {
         self.focus
+    }
+
+    /// Registers the dialog's keyboard bindings in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::Signatures(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        if self.menu_open() {
+            commands.add(key(
+                "SIGNATURES_MENU_DOWN",
+                Event::MenuMove(1),
+                &["down", "j", "n"],
+            ));
+            commands.add(key(
+                "SIGNATURES_MENU_UP",
+                Event::MenuMove(-1),
+                &["up", "k", "p"],
+            ));
+            commands.add(key(
+                "SIGNATURES_MENU_PICK",
+                Event::MenuPick,
+                &["enter", "tab"],
+            ));
+            commands.add(key("SIGNATURES_MENU_ESCAPE", Event::MenuClose, &["esc"]));
+        } else {
+            if self.focus() == Some(Focus::Dropdown) {
+                commands.add(key(
+                    "SIGNATURES_MENU_OPEN",
+                    Event::ToggleMenu,
+                    &["down", "j", "n", "up", "k", "p"],
+                ));
+            }
+            commands.add(key("SIGNATURES_TAB", Event::Tab(1), &["tab"]));
+            commands.add(key("SIGNATURES_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
+            commands.add(key(
+                "SIGNATURES_ACTIVATE",
+                Event::Activate,
+                &["enter", "space"],
+            ));
+        }
     }
 
     /// Applies `event` and returns what's left for the app, which is toggling the setting or
@@ -357,30 +406,19 @@ fn draw(
             caret: Color32::BLACK.gamma_multiply(0.5 * lit),
             gap: 10.0,
         };
-        let button = exo_ui::paint_dialog_dropdown_with(ui, value, email, style);
-        let response = ui
-            .interact(button, id, Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if response.clicked() {
-            event = Some(Event::ToggleMenu);
-        }
-        if let Some(highlighted) = state.menu {
-            let items: Vec<&str> = listed.iter().map(|alias| alias.email.as_str()).collect();
-            let list = Menu {
-                items: &items,
-                highlighted,
-            }
-            .show_addresses_in_dialog(ui, id.with("list"), value + MENU_OFFSET);
-            if let Some(clicked) = list.clicked {
-                event = Some(Event::Choose(items[clicked].to_owned()));
-            } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-                event = Some(Event::Highlight(hovered));
-            } else if ui.input(|input| input.pointer.any_released())
-                && !response.hovered()
-                && !ui.rect_contains_pointer(list.rect)
-            {
-                event = Some(Event::MenuClose);
-            }
+        let items: Vec<&str> = listed.iter().map(|alias| alias.email.as_str()).collect();
+        if let Some(select_event) = DialogSelect::new(id, value, email, &items, state.menu)
+            .kind(DialogMenuKind::Addresses)
+            .style(style)
+            .focused(state.focus == Some(Focus::Dropdown))
+            .show(ui)
+        {
+            event = Some(match select_event {
+                DialogSelectEvent::Toggle => Event::ToggleMenu,
+                DialogSelectEvent::Highlight(row) => Event::Highlight(row),
+                DialogSelectEvent::Pick(row) => Event::Choose(items[row].to_owned()),
+                DialogSelectEvent::Close => Event::MenuClose,
+            });
         }
     } else {
         VALUE.paint_line(&painter, value, email, LABEL_INK, None);

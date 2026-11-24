@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Exo's offline-first data layer: one SQLite file per account caching Gmail, the sync engine
 //! that keeps it current, and the outbox that sends the user's triage actions.
 //!
@@ -52,6 +46,7 @@ mod parse;
 mod parts;
 mod provider;
 mod query;
+mod queue;
 mod quota;
 mod reminders;
 mod search;
@@ -82,7 +77,7 @@ pub use drafts::{
 pub use error::{Error, Failing, Result, Unusable};
 pub use evict::{Evicted, Eviction};
 pub use google_contacts::{GoogleContact, GoogleContacts, GoogleList};
-pub use ids::{Filter, ListId, ThreadId};
+pub use ids::{Filter, ListId, ThreadId, labels};
 pub use model::{
     Alias, Attachment, Attachments, Body, Contact, Cursor, Header, Label, LabelKind, ListCount,
     MessageDetail, RecentThread, ReminderStatus, ThreadDetail, ThreadPage, ThreadSummary,

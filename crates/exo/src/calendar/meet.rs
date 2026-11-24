@@ -5,7 +5,11 @@ use std::collections::BTreeMap;
 
 use egui::{Color32, CornerRadius, Id, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use exo_store::Address;
-use exo_ui::{CalendarColor, Family, Font, KeyTooltip, Menu, TextStyle};
+use exo_ui::{
+    AnchoredCard, AnchoredHover, CalendarColor, ContactAcceptKeys, ContactRow, ContactSearchInput,
+    ContactSearchOutcome, Family, Font, KeyTooltip, Menu, StackedContactStyle, TextStyle,
+    show_stacked_contact_popup,
+};
 use jiff::{SignedDuration, Timestamp, ToSpan, Zoned, civil::Date};
 
 use crate::compose::{contacts::Index, recipients};
@@ -184,46 +188,23 @@ impl Meet {
             pos2(input.left() + 10.0, input.top() + 9.0),
             vec2(input.width() - 20.0, TEXT.line_height),
         );
-        if self.input.is_empty() {
-            // The placeholder: `rgba(0,0,0,.55)`.
-            TEXT.paint_line(
-                ui.painter(),
-                line.min,
-                "Enter name or email",
-                palette.ink(0.55, 0.55),
-                None,
-            );
-        }
-        if std::mem::take(&mut self.focus) {
-            ui.memory_mut(|memory| memory.request_focus(id));
-        }
-        let (up, down, enter) = ui.input(|input| {
-            (
-                input.key_pressed(egui::Key::ArrowUp),
-                input.key_pressed(egui::Key::ArrowDown),
-                input.key_pressed(egui::Key::Enter),
-            )
-        });
-        // A single-line field lets go of the keyboard on Enter, before it's seen here.
-        let had_focus = ui.memory(|memory| memory.has_focus(id));
-        let response = exo_ui::text_field(
-            ui,
+        let input_out = ContactSearchInput::new(
             id,
-            &mut self.input,
             line,
             &TEXT,
             palette.text_base_default,
             palette.text_selection_default,
-        );
-        if std::mem::take(&mut self.blur) {
-            response.surrender_focus();
-        }
-        self.typing = response.has_focus();
+        )
+        .placeholder("Enter name or email", palette.ink(0.55, 0.55))
+        .request_focus(std::mem::take(&mut self.focus))
+        .surrender_focus(std::mem::take(&mut self.blur))
+        .show_input(ui, &mut self.input, &mut self.suggestion);
+        self.typing = input_out.response.has_focus();
         KeyTooltip {
             text: "Meet",
             keys: &["M"],
         }
-        .show_below(ui, &response, 8.0);
+        .show_below(ui, &input_out.response, 8.0);
         let suggestions: Vec<Address> = match contacts {
             Some(book) if !self.input.trim().is_empty() => book
                 .top(self.input.trim(), 3 + self.guests.len())
@@ -240,92 +221,67 @@ impl Meet {
                 .collect(),
             _ => Vec::new(),
         };
-        if response.changed() {
-            self.suggestion = 0;
-        }
-        if had_focus {
-            if up {
-                self.suggestion = self.suggestion.saturating_sub(1);
-            } else if down {
-                self.suggestion = (self.suggestion + 1).min(suggestions.len().saturating_sub(1));
-            }
-        }
+        let contact_rows: Vec<ContactRow<'_>> = suggestions
+            .iter()
+            .map(|contact| ContactRow {
+                name: contact.name.as_deref().unwrap_or(&contact.email),
+                email: &contact.email,
+                disabled: false,
+                avatar: None,
+            })
+            .collect();
+        let stacked_style = StackedContactStyle {
+            card: AnchoredCard::bordered(
+                palette.background_base_default,
+                palette.border_base_default,
+                palette.fill_hover_default,
+            ),
+            row: SUGGESTION,
+            pad_top: 1.0,
+            pad_bottom: 1.0,
+            pad_x: 10.0,
+            inset_x: 1.0,
+            name_style: TEXT,
+            name_top: 6.0,
+            name_inks: (palette.text_base_default, palette.text_base_default),
+            email_style: TEXT,
+            email_top: 22.0,
+            email_inks: (palette.text_base_subdued, palette.text_base_subdued),
+            match_query: false,
+            hover_mode: AnchoredHover::Always,
+        };
         let mut add = None;
-        if had_focus && enter {
-            if let Some(pick) = suggestions.get(self.suggestion) {
-                add = Some((pick.email.clone(), pick.name.clone()));
-            } else if self.input.trim().is_empty() && !self.guests.is_empty() {
-                actions.push(MeetAction::Find);
-            } else {
-                let typed = recipients::parse(self.input.trim());
-                if recipients::is_valid(&typed.email) {
-                    add = Some((typed.email, typed.name));
+        if let Some(outcome) = show_stacked_contact_popup(
+            &ctx,
+            exo_ui::id(&ctx, "calendar-meet-suggestions"),
+            input_out.response.has_focus(),
+            input_out.keys,
+            &self.input,
+            &contact_rows,
+            &mut self.suggestion,
+            ContactAcceptKeys::EnterOnly,
+            true,
+            pos2(input.left(), input.bottom() + 4.0),
+            input.width(),
+            stacked_style,
+        ) {
+            match outcome {
+                ContactSearchOutcome::Picked(index) => {
+                    let pick = &suggestions[index];
+                    add = Some((pick.email.clone(), pick.name.clone()));
+                }
+                ContactSearchOutcome::SubmittedEmpty { .. } => {
+                    if !self.guests.is_empty() {
+                        actions.push(MeetAction::Find);
+                    }
+                }
+                ContactSearchOutcome::SubmittedTyped { .. } => {
+                    let typed = recipients::parse(self.input.trim());
+                    if recipients::is_valid(&typed.email) {
+                        add = Some((typed.email, typed.name));
+                    }
                 }
             }
-        }
-        // The suggestions under the input.
-        if response.has_focus() && !suggestions.is_empty() {
-            let list = Rect::from_min_size(
-                pos2(input.left(), input.bottom() + 4.0),
-                vec2(input.width(), suggestions.len() as f32 * SUGGESTION + 2.0),
-            );
-            egui::Area::new(exo_ui::id(&ctx, "calendar-meet-suggestions"))
-                .order(egui::Order::Tooltip)
-                .fixed_pos(list.min)
-                .constrain(false)
-                .show(&ctx, |area| {
-                    let painter = area.painter().clone();
-                    painter.rect(
-                        exo_ui::pixel_snap(list),
-                        CornerRadius::same(4),
-                        palette.background_base_default,
-                        Stroke::new(1.0, palette.border_base_default),
-                        egui::StrokeKind::Inside,
-                    );
-                    for (index, contact) in suggestions.iter().enumerate() {
-                        let row = Rect::from_min_size(
-                            pos2(
-                                list.left() + 1.0,
-                                list.top() + 1.0 + index as f32 * SUGGESTION,
-                            ),
-                            vec2(list.width() - 2.0, SUGGESTION),
-                        );
-                        let hit = area
-                            .interact(
-                                row,
-                                exo_ui::id(area.ctx(), ("calendar-meet-suggestion", index)),
-                                Sense::click(),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if hit.hovered() {
-                            self.suggestion = index;
-                        }
-                        if index == self.suggestion {
-                            painter.rect_filled(row, 0.0, palette.fill_hover_default);
-                        }
-                        let name = contact
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| contact.email.clone());
-                        TEXT.paint_line(
-                            &painter,
-                            pos2(row.left() + 10.0, row.top() + 6.0),
-                            &name,
-                            palette.text_base_default,
-                            Some(row.width() - 20.0),
-                        );
-                        TEXT.paint_line(
-                            &painter,
-                            pos2(row.left() + 10.0, row.top() + 22.0),
-                            &contact.email,
-                            palette.text_base_subdued,
-                            Some(row.width() - 20.0),
-                        );
-                        if hit.clicked() {
-                            add = Some((contact.email.clone(), contact.name.clone()));
-                        }
-                    }
-                });
         }
         if let Some((email, name)) = add
             && self.guests.len() < MAX_GUESTS
@@ -562,10 +518,7 @@ impl Meet {
             if let Some(picked) = menu.clicked {
                 self.duration = DURATIONS[picked];
                 self.durations = None;
-            } else if ui.input(|input| input.pointer.any_released())
-                && !ui.rect_contains_pointer(menu.rect)
-                && !opened.hovered()
-            {
+            } else if menu.outside_released(ui, opened.hovered()) {
                 self.durations = None;
             }
         }

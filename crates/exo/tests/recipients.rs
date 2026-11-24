@@ -1,4 +1,4 @@
-//! Recipient fields end to end on gmail-mock: how suggestions rank, removing a suggestion,
+//! Recipient fields end to end on mock-servers: how suggestions rank, removing a suggestion,
 //! dragging chips, the remove commands and Exclude from Auto Bcc.
 
 mod support;

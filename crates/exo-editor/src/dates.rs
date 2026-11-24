@@ -26,14 +26,14 @@ pub struct ActiveDate {
 }
 
 /// The dates in `block`, as character ranges. The search runs over the block's text nodes (runs of
-/// text) joined with spaces, and a date counts only if it lies within one text node whose element
-/// isn't a link.
+/// text) joined with spaces, and a date counts only if it lies within one text node outside any
+/// link.
 pub(crate) fn detect(block: &Block) -> Vec<Range<usize>> {
     let Content::Inline(runs) = &block.content else {
         return Vec::new();
     };
     // Each text node: its first position in the block, where it starts in `joined`, its text,
-    // and whether its element is a link.
+    // and whether it sits inside a link.
     let mut nodes = Vec::new();
     let mut joined = String::new();
     let mut position = 0;
@@ -46,7 +46,7 @@ pub(crate) fn detect(block: &Block) -> Vec<Range<usize>> {
                 position,
                 joined.len(),
                 text.as_str(),
-                run.marks.last().is_some_and(|mark| mark.is("a")),
+                run.marks.iter().any(|mark| mark.is("a")),
             ));
             joined.push_str(text);
         }

@@ -53,7 +53,7 @@ struct Installed {
 }
 
 impl ClientConfig {
-    /// A client for `endpoints`, e.g. a gmail-mock's.
+    /// A client for `endpoints`, e.g. the mock servers'.
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,

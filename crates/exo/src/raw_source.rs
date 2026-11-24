@@ -5,10 +5,7 @@
 //! The text area: `12px monospace` (Courier), black or white at 90% on `#fff` or `#18191a`, no
 //! padding, soft-wrapped (`pre-wrap`, `break-word`), under the page's selection color.
 
-use std::{
-    collections::HashMap,
-    sync::mpsc::{Receiver, Sender, channel},
-};
+use std::collections::HashMap;
 
 use egui::{Area, Color32, Context, Order, Pos2, Rect, Sense, Vec2};
 use exo_commands::{Command, Commands, Region};
@@ -54,22 +51,10 @@ pub enum Move {
     Bottom,
 }
 
-/// A conversation's source as it arrived: its id, then the text.
-type Arrived = (String, String);
-
 /// The viewer's state between frames.
+#[derive(Default)]
 pub(crate) struct RawSource {
     open: Option<Viewer>,
-    arrived: (Sender<Arrived>, Receiver<Arrived>),
-}
-
-impl Default for RawSource {
-    fn default() -> Self {
-        Self {
-            open: None,
-            arrived: channel(),
-        }
-    }
 }
 
 /// The open viewer.
@@ -255,14 +240,23 @@ impl Mail {
             scroll: 0.0,
             selected: false,
         });
-        let (sender, ctx) = (self.raw_source.arrived.0.clone(), self.ctx.clone());
+        let ui = self.ui_sender();
         self.account.loader().run(
             move |store| async move { (store.thread_source(&thread).await, thread) },
             move |(source, thread)| match source {
-                Ok(source) => {
-                    let _ = sender.send((thread, source));
-                    ctx.request_repaint();
-                }
+                Ok(source) => ui.send(move |mail| {
+                    if let Some(viewer) = mail
+                        .raw_source
+                        .open
+                        .as_mut()
+                        .filter(|viewer| viewer.thread == thread)
+                    {
+                        viewer.text = source;
+                        viewer.width = -1.0;
+                        // Once the text is in, the text area selects it.
+                        viewer.selected = true;
+                    }
+                }),
                 Err(error) => log::info!("reading the source of {thread}: {error}"),
             },
         );
@@ -296,19 +290,6 @@ impl Mail {
 
     /// Draws the viewer over `page`, if it's open, and handles its pointer.
     pub(crate) fn show_raw_source(&mut self, ctx: &Context, page: Rect) {
-        while let Ok((thread, source)) = self.raw_source.arrived.1.try_recv() {
-            if let Some(viewer) = self
-                .raw_source
-                .open
-                .as_mut()
-                .filter(|viewer| viewer.thread == thread)
-            {
-                viewer.text = source;
-                viewer.width = -1.0;
-                // Once the text is in, the text area selects it.
-                viewer.selected = true;
-            }
-        }
         let Some(viewer) = self.raw_source.open.as_mut() else {
             return;
         };

@@ -24,7 +24,10 @@ pub(crate) fn apply(
         (&mut open.record.bcc, &snippet.bcc),
     ] {
         for address in from {
-            if !list.iter().any(|kept| kept.email == address.email) {
+            if !list
+                .iter()
+                .any(|kept| kept.email.eq_ignore_ascii_case(&address.email))
+            {
                 list.push(address.clone());
             }
         }
@@ -66,7 +69,7 @@ pub(crate) fn apply(
             open.record.attachments.push(attachment.clone());
         }
     }
-    open.applied_snippets.push(snippet.id.clone());
+    open.delivery.applied_snippets.push(snippet.id.clone());
     open.touch(now);
 }
 
@@ -96,8 +99,10 @@ fn values(
         // Their name, or the address book's.
         let known = person
             .name
-            .clone()
+            .as_deref()
+            .map(str::trim)
             .filter(|name| !name.is_empty())
+            .map(str::to_owned)
             .or_else(|| book.and_then(|book| book.name_for(&person.email)))
             .unwrap_or_default();
         let first = if person.email.is_empty() {
@@ -106,14 +111,7 @@ fn values(
             names::first_name(&known, "")
         };
         // The last name is what follows the first name, or else the whole name.
-        let full = names::reverse_by_comma(
-            person
-                .name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&person.email.to_lowercase())
-                .trim(),
-        );
+        let full = names::reverse_by_comma(known.trim());
         let shown_first = names::first_name(&full, &person.email);
         let last = full
             .split_once(shown_first.as_str())
@@ -121,13 +119,13 @@ fn values(
             .filter(|rest| !rest.is_empty())
             .unwrap_or(&full)
             .to_owned();
-        let whole = person.name.clone().unwrap_or_default();
+        let whole = known;
         for (name, value) in [
             ("first_name", first),
             ("last_name", last),
             ("full_name", whole),
         ] {
-            if !value.is_empty() && value != person.email {
+            if !value.is_empty() && !value.eq_ignore_ascii_case(&person.email) {
                 values.push((variable(prefix, name), value));
             }
         }
@@ -161,15 +159,7 @@ fn replace_in_text(text: &str, values: &[(&str, String)]) -> String {
 fn replace_in_html(html: &str, values: &[(&str, String)]) -> String {
     let escaped: Vec<(&str, String)> = values
         .iter()
-        .map(|(variable, value)| {
-            (
-                *variable,
-                value
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;"),
-            )
-        })
+        .map(|(variable, value)| (*variable, exo_mail::escape_html_text(value)))
         .collect();
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
@@ -186,20 +176,13 @@ fn replace_in_html(html: &str, values: &[(&str, String)]) -> String {
 
 /// `text` with every `from` replaced by `to`, ignoring case.
 fn replace_all(text: &str, from: &str, to: &str) -> String {
-    let lower = text.to_lowercase();
-    if lower.len() != text.len() {
-        // Lowercasing moved byte offsets (rare scripts), so match exactly instead.
-        return text.replace(from, to);
+    match regex::RegexBuilder::new(&regex::escape(from))
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(pattern) => pattern.replace_all(text, regex::NoExpand(to)).into_owned(),
+        Err(_) => text.replace(from, to),
     }
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    while let Some(found) = lower[at..].find(from) {
-        out.push_str(&text[at..at + found]);
-        out.push_str(to);
-        at += found + from.len();
-    }
-    out.push_str(&text[at..]);
-    out
 }
 
 /// What a snippet's body inserts. A body that's one `<div>` of inline text joins the line at the
@@ -363,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn replaces_variables_around_utf8_case_folding_length_changes() {
+        let snippet = Snippet {
+            id: "s".into(),
+            subject: "İẞ {first_name} / İ {First_Name}ẞ".into(),
+            body: "<div>İẞ {First_Name} — İ {first_name}ẞ</div>".into(),
+            ..Snippet::default()
+        };
+        let mut open = draft(vec![address("Ada Lovelace", "ada@example.com")], "");
+        apply(&mut open, &snippet, &[], None, false, 0.0);
+        assert_eq!(open.record.subject, "İẞ Ada / İ Adaẞ");
+        let html = open.editor.html();
+        assert!(html.contains("İẞ Ada — İ Adaẞ"), "{html}");
+    }
+
+    #[test]
     fn a_one_line_body_joins_the_caret_line() {
         assert_eq!(
             body_to_insert("<div>See <b>you</b><br></div>"),
@@ -406,6 +404,61 @@ mod tests {
             names(rank(&snippets, &used, "in")),
             ["invoice", "intro"],
             "a tie, the later name first"
+        );
+    }
+
+    #[test]
+    fn deduplicates_recipients_case_insensitively_and_resolves_book_names_without_leaking_email() {
+        let book = contacts::Index::book(&[exo_store::ScoredContact {
+            email: "priya@brightmoor.co".into(),
+            name: Some("Priya Raman".into()),
+            score: 1.0,
+        }]);
+        let snippet = Snippet {
+            id: "s".into(),
+            to: vec![address("Priya", "PRIYA@BRIGHTMOOR.CO")],
+            body: "<div>Hi {first_name} {last_name} ({full_name})</div>".into(),
+            ..Snippet::default()
+        };
+        let mut open = draft(vec![address("", "priya@brightmoor.co")], "Hi");
+        apply(&mut open, &snippet, &[], Some(&book), false, 0.0);
+        assert_eq!(
+            open.record.to.len(),
+            1,
+            "case-insensitive dedup keeps existing recipient"
+        );
+        let html = open.editor.html();
+        assert!(
+            html.contains("Hi Priya Raman (Priya Raman)"),
+            "book name resolves first, last, and full name: {html}"
+        );
+
+        // Mixed-case email without a known name must never leak into {last_name}.
+        let mut mixed = draft(vec![address("", "Ops@Example.COM")], "Hi");
+        let snippet = Snippet {
+            id: "s2".into(),
+            body: "<div>{first_name}|{last_name}|{full_name}</div>".into(),
+            ..Snippet::default()
+        };
+        apply(&mut mixed, &snippet, &[], None, false, 0.0);
+        let html = mixed.editor.html();
+        assert!(
+            html.contains("{first_name}|{last_name}|{full_name}"),
+            "mixed-case address must not leak into variables: {html}"
+        );
+
+        // Special HTML characters in resolved names are escaped.
+        let mut special = draft(vec![address("A&B <Team>", "ab@example.com")], "Hi");
+        let snippet = Snippet {
+            id: "s3".into(),
+            body: "<div>Hi {full_name}</div>".into(),
+            ..Snippet::default()
+        };
+        apply(&mut special, &snippet, &[], None, false, 0.0);
+        assert!(
+            special.editor.html().contains("Hi A&amp;B &lt;Team&gt;"),
+            "{}",
+            special.editor.html()
         );
     }
 }

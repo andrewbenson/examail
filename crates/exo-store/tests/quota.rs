@@ -7,7 +7,7 @@ mod support;
 use std::time::Duration;
 
 use exo_store::{ListId, Mutation, Options, Quota};
-use gmail_mock::Config;
+use mock_servers::Config;
 use serde_json::Value;
 use support::Harness;
 use tokio::time::Instant;

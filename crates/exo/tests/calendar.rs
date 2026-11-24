@@ -1196,7 +1196,7 @@ fn a_new_event_on_a_hidden_weekend_day_opens_its_form() {
         settings.out_of_office_event_detection.opted_out_at = Some("2026-11-01T00:00:00Z".into());
     });
     // Saturday, which the week leaves out.
-    let saturday = gmail_mock::Config::default()
+    let saturday = mock_servers::Config::default()
         .now
         .checked_add(jiff::SignedDuration::from_hours(4 * 24))
         .expect("in range");
@@ -1215,7 +1215,7 @@ fn a_new_event_on_a_hidden_weekend_day_opens_its_form() {
 #[test]
 fn today_is_the_clocks_day_not_the_day_exo_opened() {
     let mut app = start("calendar-today-button");
-    let later = gmail_mock::Config::default()
+    let later = mock_servers::Config::default()
         .now
         .checked_add(jiff::SignedDuration::from_hours(2 * 24))
         .expect("in range");
@@ -1398,7 +1398,7 @@ fn tab_goes_through_share_availabilitys_sidebar() {
 
 #[test]
 fn the_day_view_s_today_and_plus_and_t() {
-    let mut app = start("calendar-today-button");
+    let mut app = start("calendar-day-view-today");
     app.key(Key::Num0);
     app.key(Key::Equals);
     assert_eq!(app.mail().calendar_day(), Some(date(2026, 11, 18)));

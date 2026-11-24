@@ -315,11 +315,103 @@ impl crate::Mail {
             } => {
                 self.calendar_open_event(key, day, end_hour);
                 if let Some(url) = url {
-                    self.open_url(&url);
+                    if let Some(meeting) = meeting_uri(&url) {
+                        self.ctx.open_url(egui::OpenUrl::new_tab(meeting));
+                    } else {
+                        self.open_url(&url);
+                    }
                 }
             }
         }
     }
+}
+
+/// Validates and normalizes a `tel:` or `sip:` conference URI from a calendar notification's
+/// `Join meeting` action. Web links return `None` so they go through [`crate::format::urls::web`].
+pub(crate) fn meeting_uri(url: &str) -> Option<String> {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    if let Some(rest) = exo_mail::strip_ascii_prefix(url, "tel:") {
+        let dial = rest.strip_prefix('+').unwrap_or(rest);
+        let has_digit = dial.bytes().any(|b| b.is_ascii_digit());
+        let safe_dial = dial.bytes().all(|b| {
+            b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'(' | b')' | b',' | b';' | b'*' | b'#')
+        });
+        return (has_digit && safe_dial).then(|| format!("tel:{rest}"));
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "sip"
+        || !parsed.cannot_be_a_base()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let (addr, params) = match parsed.path().split_once(';') {
+        Some((addr, params)) => (addr, Some(params)),
+        None => (parsed.path(), None),
+    };
+    if let Some(params) = params
+        && (params.is_empty()
+            || !params.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'-' | b'.' | b'_' | b'=' | b';' | b':' | b'%' | b'+' | b'~'
+                    )
+            }))
+    {
+        return None;
+    }
+    let hostport = match addr.split_once('@') {
+        Some((user, hostport)) => {
+            if user.is_empty()
+                || !user.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(
+                            b,
+                            b'-' | b'_'
+                                | b'.'
+                                | b'!'
+                                | b'~'
+                                | b'*'
+                                | b'\''
+                                | b'('
+                                | b')'
+                                | b'+'
+                                | b'='
+                                | b','
+                                | b'&'
+                                | b'$'
+                                | b'%'
+                        )
+                })
+            {
+                return None;
+            }
+            hostport
+        }
+        None => addr,
+    };
+    if hostport.is_empty()
+        || hostport
+            .bytes()
+            .any(|b| matches!(b, b'/' | b'\\' | b'@' | b'?' | b'#'))
+    {
+        return None;
+    }
+    let authority = url::Url::parse(&format!("https://{hostport}")).ok()?;
+    if authority.host().is_none()
+        || authority.path() != "/"
+        || !authority.username().is_empty()
+        || authority.password().is_some()
+        || authority.query().is_some()
+        || authority.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed.into())
 }
 
 /// The notification for the update to `version`, ready to install. It says what the dialog asking
@@ -398,6 +490,58 @@ mod tests {
             r#""later", "Not now""#,
         ] {
             assert!(shown.contains(part), "{part} in {shown}");
+        }
+    }
+
+    #[test]
+    fn validates_safe_tel_and_sip_meeting_uris() {
+        for (raw, expected) in [
+            ("tel:+1-555-0100", "tel:+1-555-0100"),
+            ("TEL:+44.20.7946.0958", "tel:+44.20.7946.0958"),
+            ("tel:5550100", "tel:5550100"),
+            (
+                "tel:+12345678900,,,123456789;1234#",
+                "tel:+12345678900,,,123456789;1234#",
+            ),
+            ("tel:(555)010-1234*9", "tel:(555)010-1234*9"),
+            ("sip:12345678@myprovider.com", "sip:12345678@myprovider.com"),
+            (
+                "SIP:room.1@zoomcrc.com:5061;transport=tls",
+                "sip:room.1@zoomcrc.com:5061;transport=tls",
+            ),
+            ("sip:meet.example.com", "sip:meet.example.com"),
+            ("sip:1234@[2001:db8::1]:5060", "sip:1234@[2001:db8::1]:5060"),
+        ] {
+            assert_eq!(meeting_uri(raw).as_deref(), Some(expected), "{raw}");
+        }
+
+        for rejected in [
+            "tel:",
+            "tel:+",
+            "tel:---",
+            "tel:abc",
+            "tel:+1 555 0100",
+            "tel:+1-555-0100\n",
+            "tel:+1-555-0100\x00",
+            "tel:+1-555-0100;ext=123",
+            "tel:++15550100",
+            "sip:",
+            "sip:@myprovider.com",
+            "sip:user@",
+            "sip:user@host.com/path",
+            "sip:user@host.com?Subject=hi",
+            "sip:user@host.com#frag",
+            "sip:user name@host.com",
+            "sip:user@host.com\r\n",
+            "sip://user@host.com",
+            "sip:user:pass@host.com",
+            "sip:user@host.com;",
+            "https://meet.google.com/abc-defg-hij",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "mailto:maya@brightmoor.co",
+        ] {
+            assert_eq!(meeting_uri(rejected), None, "{rejected}");
         }
     }
 }

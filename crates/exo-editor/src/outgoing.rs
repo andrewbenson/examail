@@ -1,5 +1,6 @@
 //! The HTML a message is sent with, and the quoted parts built around the body.
 
+use exo_mail::escape_html as escape;
 use jiff::Zoned;
 
 use crate::{
@@ -178,13 +179,6 @@ fn body_attrs(style: &str, id: &str) -> String {
     out
 }
 
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 /// Drops the read-status pixel placeholders an earlier send left in `html`.
 fn remove_pixels(html: &str) -> String {
     let mut out = html.to_owned();
@@ -240,14 +234,17 @@ fn clean_element(element: &mut Element) {
     }
 }
 
+/// Content-ID attributes Exo keeps on inline media, paired with the URL attribute each populates.
+pub(crate) const CID_ATTRS: [(&str, &str); 3] = [
+    ("src-cid", "src"),
+    ("poster-cid", "poster"),
+    ("background-cid", "background"),
+];
+
 /// An image shown by Content-ID gets the Content-ID as its URL, in the `src` it has (an image
 /// without a `src` gets one), and loses Exo's class. Its `src-cid` stays.
-fn clean_image(image: &mut Element) {
-    for (attr, target) in [
-        ("src-cid", "src"),
-        ("poster-cid", "poster"),
-        ("background-cid", "background"),
-    ] {
+pub(crate) fn clean_image(image: &mut Element) {
+    for (attr, target) in CID_ATTRS {
         if let Some(cid) = image
             .attr(attr)
             .filter(|cid| !cid.is_empty())

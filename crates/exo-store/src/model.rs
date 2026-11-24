@@ -8,7 +8,7 @@ use crate::ids::ThreadId;
 use crate::mutation::Mutation;
 
 /// A person on a message: `From`, `To`, `Cc`, `Bcc` or `Reply-To`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
     /// Display name, when the header has one.
     pub name: Option<String>,
@@ -16,6 +16,24 @@ pub struct Contact {
     pub email: String,
     /// One of the account's own addresses (the primary or a send-as alias Gmail treats as one).
     pub is_me: bool,
+}
+
+impl From<Contact> for gmail::mime::Mailbox {
+    fn from(contact: Contact) -> Self {
+        Self {
+            name: contact.name,
+            email: contact.email,
+        }
+    }
+}
+
+impl From<&Contact> for gmail::mime::Mailbox {
+    fn from(contact: &Contact) -> Self {
+        Self {
+            name: contact.name.clone(),
+            email: contact.email.clone(),
+        }
+    }
 }
 
 /// A send-as address (from Gmail's `sendAs`), with its signature.

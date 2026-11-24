@@ -16,6 +16,7 @@ use crate::{
     commands,
     mailbox::{ThreadSummary, compare_label_names},
     senders::SenderJob,
+    triage_copy::{label_name, list_label, move_toast, removable_label},
 };
 
 /// Names the Move and Label pickers never offer to create.
@@ -397,69 +398,16 @@ impl Pickers {
 
     /// Registers the alert's keys, while one shows (`Alert`'s Enter, Escape and arrows).
     pub fn register(&self, commands: &mut Commands<commands::Action>) {
-        const ALERT: &[Region] = &[Region::Alert];
         let Some(alert) = &self.alert else { return };
         let act = |action: Action| commands::Action::Pick(action);
-        commands.add(
-            Command::shortcut("ALERT_ENTER", act(Action::Alert(alert.selected)))
-                .key("enter")
-                .regions(ALERT),
-        );
         // Escape only closes it, through an index past the actions. The last action of most
         // alerts is Cancel, but two of `RsvpFailed`'s act.
-        commands.add(
-            Command::shortcut("ALERT_ESC", act(Action::Alert(alert.actions.len())))
-                .key("esc")
-                .regions(ALERT),
+        crate::notice::register_alert_keys(
+            commands,
+            act(Action::Alert(alert.selected)),
+            act(Action::Alert(alert.actions.len())),
+            |step| act(Action::AlertSelect(step)),
         );
-        commands.add(
-            Command::shortcut("ALERT_LEFT", act(Action::AlertSelect(1)))
-                .keys(["left", "shift+tab"])
-                .regions(ALERT),
-        );
-        commands.add(
-            Command::shortcut("ALERT_RIGHT", act(Action::AlertSelect(-1)))
-                .keys(["right", "tab"])
-                .regions(ALERT),
-        );
-    }
-}
-
-/// The name of a label or folder id, which is a built-in one's own name or else the user's
-/// label's.
-pub(crate) fn label_name<'a>(id: &str, labels: &'a [Label]) -> &'a str {
-    match id {
-        "INBOX" => "Inbox",
-        "SH_IMPORTANT" => "Important",
-        "SH_OTHER" => "Other",
-        "SH_ARCHIVED" => "Done",
-        "STARRED" => "Starred",
-        "SPAM" => "Spam",
-        "TRASH" => "Trash",
-        id => labels
-            .iter()
-            .find(|label| label.id == id)
-            .map_or("", |label| label.name.as_str()),
-    }
-}
-
-/// A list's label as Move and `Y` see it.
-fn list_label(list: &ListId) -> String {
-    match list {
-        ListId::Inbox => "INBOX".into(),
-        ListId::Important => "SH_IMPORTANT".into(),
-        ListId::Other => "SH_OTHER".into(),
-        ListId::Done => "SH_ARCHIVED".into(),
-        ListId::Starred => "STARRED".into(),
-        ListId::Sent => "SENT".into(),
-        ListId::Drafts => "DRAFT".into(),
-        ListId::Spam => "SPAM".into(),
-        ListId::Trash => "TRASH".into(),
-        ListId::Muted => "SH_MUTED".into(),
-        ListId::Scheduled => "SH_SCHEDULED".into(),
-        ListId::Reminders => "SH_SNOOZED".into(),
-        ListId::All => "SH_ALL".into(),
-        ListId::Label(id) | ListId::Split(id) => id.clone(),
     }
 }
 
@@ -711,54 +659,6 @@ fn create_row(
     )
 }
 
-/// What `Y` takes off threads in `list`, which is the list's own label, or for Exo's own views and
-/// Sent, the inbox (nothing for threads already done). Nothing in Drafts or Reminders.
-pub(crate) fn removable_label(list: &ListId) -> Option<String> {
-    match list {
-        ListId::Drafts | ListId::Reminders => None,
-        ListId::Starred | ListId::Spam | ListId::Trash | ListId::Label(_) => Some(list_label(list)),
-        ListId::Inbox
-        | ListId::Important
-        | ListId::Other
-        | ListId::Done
-        | ListId::Sent
-        | ListId::Muted
-        | ListId::Scheduled
-        | ListId::All
-        | ListId::Split(_) => Some("INBOX".into()),
-    }
-}
-
-/// The toast after a move.
-pub fn move_toast(from: Option<&str>, to: &str, labels: &[Label]) -> String {
-    move_text(from, to, labels, false)
-}
-
-/// [`move_toast`], or in the present tense for a bulk move (`present`).
-pub(crate) fn move_text(from: Option<&str>, to: &str, labels: &[Label], present: bool) -> String {
-    // The inbox, its views and its splits.
-    let inbox_like = |id: &str| {
-        matches!(id, "INBOX" | "SH_INBOX" | "SH_IMPORTANT" | "SH_OTHER")
-            || id.starts_with(exo_store::SPLIT_ID_PREFIX)
-    };
-    let marking_done = from.is_some_and(|from| inbox_like(from) || to == "SH_ARCHIVED");
-    let moving_to_inbox = from.is_some_and(|from| inbox_like(to) || from == "SH_ARCHIVED");
-    // Out of Reminders the reminder goes too.
-    let (moved, moving) = if from == Some("SH_SNOOZED") {
-        ("Reminder removed and moved", "Reminder removed and moving")
-    } else {
-        ("Moved", "Moving")
-    };
-    match (to == "SPAM", marking_done && !moving_to_inbox, present) {
-        (true, _, false) => "Marked as Spam.".into(),
-        (true, _, true) => "Marking as Spam.".into(),
-        (false, true, false) => "Moved and Marked Done.".into(),
-        (false, true, true) => "Moving and Marking Done.".into(),
-        (false, false, false) => format!("{moved} to {}.", label_name(to, labels)),
-        (false, false, true) => format!("{moving} to {}.", label_name(to, labels)),
-    }
-}
-
 impl Mail {
     /// Carries out a picker's `action`.
     pub(crate) fn pick(&mut self, action: Action, now: f64) {
@@ -851,21 +751,14 @@ impl Mail {
             }
             Action::AddLabel(id) => {
                 self.remember_label(&id);
-                let text = format!("Added to label {}.", label_name(&id, &self.snapshot.labels));
                 let ids = self.actionable_ids();
-                self.triage_threads(&ids, Mutation::AddLabel(id), Some(text), 0, now);
+                self.triage_threads(&ids, Mutation::AddLabel(id), None, 0, now);
             }
             Action::RemoveLabel(id) => {
-                let text = if id == "INBOX" {
-                    "Marked as Done.".into()
-                } else {
-                    format!(
-                        "Removed from label {}.",
-                        label_name(&id, &self.snapshot.labels)
-                    )
-                };
+                let text =
+                    (id == "INBOX").then(|| crate::triage_copy::toast(&Mutation::MarkDone, &[]));
                 let ids = self.actionable_ids();
-                self.triage_threads(&ids, Mutation::RemoveLabel(id), Some(text), 0, now);
+                self.triage_threads(&ids, Mutation::RemoveLabel(id), text, 0, now);
             }
             Action::Create {
                 name,
@@ -1005,10 +898,12 @@ impl Mail {
             }
             Action::AlertSelect(delta) => {
                 if let Some(alert) = &mut self.pickers.alert {
-                    alert.selected = alert
-                        .selected
-                        .saturating_add_signed(delta)
-                        .min(alert.actions.len() - 1);
+                    alert.selected = exo_ui::Alert::move_selection(
+                        alert.selected,
+                        alert.actions.len(),
+                        delta,
+                        true,
+                    );
                 }
             }
         }
@@ -1155,8 +1050,20 @@ impl Mail {
     /// Moves `threads` from the list on screen to `to`. From a split inbox to the Inbox, Important
     /// or Other, the move happens but a hint says it can't take the thread out of the split.
     fn move_threads(&mut self, threads: &[String], to: String, now: f64) {
-        self.remember_label(&to);
         let from = self.current_label();
+        self.move_threads_from(threads, from, to, now);
+    }
+
+    /// Moves `threads` from `from` to `to`. From a split inbox to the Inbox, Important or Other,
+    /// the move happens but a hint says it can't take the thread out of the split.
+    fn move_threads_from(
+        &mut self,
+        threads: &[String],
+        from: Option<String>,
+        to: String,
+        now: f64,
+    ) {
+        self.remember_label(&to);
         let text = move_toast(from.as_deref(), &to, &self.snapshot.labels);
         let blocked = match to.as_str() {
             "INBOX" => Some("Inbox"),
@@ -1269,7 +1176,7 @@ impl Mail {
         };
         match event {
             Event::LabelCreated(label) => match creation.moving {
-                Some(_) => self.move_threads(&creation.threads, label.id, now),
+                Some(from) => self.move_threads_from(&creation.threads, from, label.id, now),
                 None => {
                     self.remember_label(&label.id);
                     let text = format!("Added to label {}.", label.name);
@@ -1313,34 +1220,27 @@ impl Mail {
             return;
         };
         // Over any dialog it was asked from (Bulk Actions' `Undo action`).
-        let clicked = egui::Area::new(ui.id().with("picker-alert"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(page.min)
-            .show(ui.ctx(), |ui| {
-                // The overlay: the page dimmed to half, nothing behind it clickable.
-                ui.painter()
-                    .rect_filled(page, 0.0, egui::Color32::from_black_alpha(128));
-                let _ = ui.allocate_rect(page, egui::Sense::click());
-                let shown = exo_ui::Alert {
-                    title: &alert.title,
-                    text: &alert.text,
-                    actions: &alert.actions,
-                    selected: alert.selected,
-                };
-                let runs = match &alert.then {
-                    Some(Then::RsvpFasterNextTime(_)) => Some(RSVP_FASTER),
-                    Some(Then::MarkSenderKnown { .. }) => Some(UNKNOWN_SENDER),
-                    _ => None,
-                };
-                match (&alert.keys, runs) {
-                    (Some(keys), _) => shown
-                        .show_with_keys(ui, page, &alert.text, keys.caps, keys.after)
-                        .map(AlertClick::Action),
-                    (None, Some(runs)) => shown.show_runs(ui, page, runs),
-                    (None, None) => shown.show(ui, page).map(AlertClick::Action),
-                }
-            });
-        match clicked.inner {
+        let (clicked, _) = exo_ui::Alert::modal(ui.ctx(), "picker-alert", page, |ui| {
+            let shown = exo_ui::Alert {
+                title: &alert.title,
+                text: &alert.text,
+                actions: &alert.actions,
+                selected: alert.selected,
+            };
+            let runs = match &alert.then {
+                Some(Then::RsvpFasterNextTime(_)) => Some(RSVP_FASTER),
+                Some(Then::MarkSenderKnown { .. }) => Some(UNKNOWN_SENDER),
+                _ => None,
+            };
+            match (&alert.keys, runs) {
+                (Some(keys), _) => shown
+                    .show_with_keys(ui, page, &alert.text, keys.caps, keys.after)
+                    .map(AlertClick::Action),
+                (None, Some(runs)) => shown.show_runs(ui, page, runs),
+                (None, None) => shown.show(ui, page).map(AlertClick::Action),
+            }
+        });
+        match clicked {
             Some(AlertClick::Action(index)) => {
                 let now = ui.input(|input| input.time);
                 self.pick(Action::Alert(index), now);
@@ -1496,7 +1396,7 @@ mod tests {
             "Reminder removed and moved to Inbox."
         );
         assert_eq!(
-            move_text(Some("SH_SNOOZED"), "Label_1", &labels, true),
+            crate::triage_copy::move_text(Some("SH_SNOOZED"), "Label_1", &labels, true),
             "Reminder removed and moving to Projects."
         );
         assert_eq!(
@@ -1508,5 +1408,142 @@ mod tests {
             move_toast(Some("Label_2"), "SPAM", &labels),
             "Marked as Spam."
         );
+    }
+
+    #[test]
+    fn picker_alert_moves_right_to_left_and_wraps_tab_from_zero() {
+        let mut pickers = Pickers::default();
+        pickers.rsvp_failed("thread-1".into());
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("system fonts load");
+        let page = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let step_key = |pickers: &mut Pickers, key: egui::Key, modifiers: egui::Modifiers| {
+            let mut commands = Commands::new();
+            commands.set_region(Region::Alert);
+            pickers.register(&mut commands);
+            let mut primed = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = commands.show(ui.ctx(), page);
+            });
+            primed.textures_delta.clear();
+            let mut raw = egui::RawInput::default();
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(raw, |ui| {
+                actions = commands.dispatch(ui.ctx());
+            });
+            out.textures_delta.clear();
+            for action in actions {
+                if let commands::Action::Pick(Action::AlertSelect(delta)) = action
+                    && let Some(alert) = &mut pickers.alert
+                {
+                    alert.selected = exo_ui::Alert::move_selection(
+                        alert.selected,
+                        alert.actions.len(),
+                        delta,
+                        true,
+                    );
+                }
+            }
+            pickers.alert.as_ref().expect("alert open").selected
+        };
+        assert_eq!(
+            step_key(&mut pickers, egui::Key::Tab, egui::Modifiers::NONE),
+            1,
+            "Tab wraps from 0 to Cancel/See Message"
+        );
+        assert_eq!(
+            step_key(&mut pickers, egui::Key::ArrowRight, egui::Modifiers::NONE),
+            0,
+            "ArrowRight moves visually right back to 0"
+        );
+        assert_eq!(
+            step_key(&mut pickers, egui::Key::ArrowLeft, egui::Modifiers::NONE),
+            1,
+            "ArrowLeft moves visually left to 1"
+        );
+    }
+
+    #[test]
+    fn label_created_for_move_uses_captured_source_list_even_after_navigation() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!(
+            "exo-pickers-move-from-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = crate::account::Account::open(
+            &dir,
+            crate::account::Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: std::sync::Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let mut mail = Mail::new(&ctx, &crate::assets_dir(), account, crate::Clock::system());
+        let created = label("Label_new", "Travel");
+        std::sync::Arc::make_mut(&mut mail.snapshot).labels =
+            vec![label("Label_old", "Projects"), created.clone()];
+        mail.inbox.set_threads(vec![ThreadSummary {
+            id: "t1".into(),
+            participants: Vec::new(),
+            recipients: false,
+            drafts: 0,
+            draft_only: false,
+            subject: "Trip".into(),
+            snippet: String::new(),
+            labels: vec!["Projects".into()],
+            label_ids: vec!["INBOX".into(), "Label_old".into()],
+            received: Timestamp::UNIX_EPOCH,
+            unread: false,
+            starred: false,
+            done: false,
+            muted: false,
+            attachment: crate::mailbox::Attachments::None,
+            contact: None,
+            removed_by: vec![Mutation::Move {
+                from: Some("Label_old".into()),
+                to: "Label_new".into(),
+            }],
+            messages: 1,
+            search: None,
+            failure: None,
+            sending: false,
+            scheduled: None,
+            reminder: None,
+            files: Vec::new(),
+        }]);
+
+        // Move creation was initiated from `Label_old`, then the user navigated to `Inbox`
+        // before Gmail answered with `Event::LabelCreated`.
+        mail.pickers.creating = Some(Creation {
+            name: "Travel".into(),
+            threads: vec!["t1".into()],
+            moving: Some(Some("Label_old".into())),
+        });
+        mail.list = ListId::Inbox;
+        mail.label_event(Event::LabelCreated(created), 1.0);
+
+        assert_eq!(
+            mail.toast_text(),
+            Some("Moved to Travel."),
+            "captured source `Label_old` determines the move toast, not the current Inbox list"
+        );
+        assert!(
+            mail.departing.is_empty(),
+            "mutation used captured `from: Some(\"Label_old\")`, matching `removed_by`"
+        );
+        drop(mail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

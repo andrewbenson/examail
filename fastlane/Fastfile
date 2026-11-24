@@ -21,6 +21,10 @@ end
 
 desc "Build Exo.app and its disk image, sign both with the Developer ID certificate, and notarize them"
 lane :release do
+  Dir.chdir(ROOT) do
+    sh("cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings")
+    sh("cargo", "test", "--workspace")
+  end
   app, version = bundle_exo
   tag = ENV["RELEASE_TAG"].to_s
   UI.user_error!("The release is tagged #{tag}, but exo is #{version}.") unless tag.empty? || tag == "v#{version}"

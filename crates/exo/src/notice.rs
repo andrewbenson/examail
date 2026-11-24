@@ -6,7 +6,7 @@
 
 use egui::{Color32, Rect, pos2};
 use exo_commands::{Command, Commands, Hint, Region};
-use exo_ui::{ALERT_TEXT, ALERT_TEXT_INK, Family, Font, TextStyle};
+use exo_ui::{ALERT_TEXT, AlertRun};
 
 use crate::commands;
 use crate::update::{self, Mode};
@@ -16,26 +16,58 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The copy hint under the text: `rgba(0, 0, 0, .5)` in both themes, on the action row's line.
 const SUBTEXT_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 128);
 const SUBTEXT_BELOW_TEXT: f32 = 16.0;
-/// `Update Required`'s `<strong>`s.
-const STRONG: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 14.0, 20.0);
-/// The text of `Update Required`, with its `<strong>`s marked, a line each as Chromium breaks
-/// them at the alert's 300px.
-const UPDATE_REQUIRED: [&[(&str, bool)]; 3] = [
-    &[
-        ("To see this feature, hit ", false),
-        ("Cmd+K", true),
-        (" (Mac) or ", false),
-        ("Ctrl+K", true),
-    ],
-    &[
-        ("(Windows) → ", false),
-        ("Check for Updates", true),
-        (" to get on the", false),
-    ],
-    &[("latest version of Exo.", false)],
+/// The text of `Update Required`, with its `<strong>`s marked.
+const UPDATE_REQUIRED: &[AlertRun<'static>] = &[
+    AlertRun::Text("To see this feature, hit "),
+    AlertRun::Strong("Cmd+K"),
+    AlertRun::Text(" (Mac) or "),
+    AlertRun::Strong("Ctrl+K"),
+    AlertRun::Text(" (Windows) → "),
+    AlertRun::Strong("Check for Updates"),
+    AlertRun::Text(" to get on the latest version of Exo."),
 ];
 /// Where an alert's keys work.
 const ALERT: &[Region] = &[Region::Alert];
+
+/// Registers the standard shortcuts for a selectable [`Region::Alert`]: `Enter`, `⌘Enter` and
+/// `Space` confirm the selected button, `Escape` runs `escape`, `→` and `Tab` step right (`-1`),
+/// and `←` and `⇧Tab` step left (`+1`).
+pub(crate) fn register_alert_keys<A: Clone + 'static>(
+    commands: &mut Commands<A>,
+    confirm: A,
+    escape: A,
+    select: impl Fn(isize) -> A,
+) {
+    commands.add(
+        Command::shortcut("ALERT_CONFIRM", confirm)
+            .keys(["enter", "mod+enter", "space"])
+            .regions(ALERT),
+    );
+    commands.add(
+        Command::shortcut("ALERT_ESCAPE", escape)
+            .key("esc")
+            .regions(ALERT),
+    );
+    commands.add(
+        Command::shortcut("ALERT_NEXT", select(-1))
+            .keys(["right", "tab"])
+            .regions(ALERT),
+    );
+    commands.add(
+        Command::shortcut("ALERT_PREVIOUS", select(1))
+            .keys(["left", "shift+tab"])
+            .regions(ALERT),
+    );
+}
+
+/// Registers `Enter`, `⌘Enter`, `Space` and `Escape` for a single-action [`Region::Alert`].
+pub(crate) fn register_alert_dismiss<A: Clone + 'static>(commands: &mut Commands<A>, dismiss: A) {
+    commands.add(
+        Command::shortcut("ALERT_OK", dismiss)
+            .keys(["enter", "mod+enter", "space", "esc"])
+            .regions(ALERT),
+    );
+}
 
 /// An alert on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,7 +117,7 @@ impl Notice {
         match self {
             // The version alone.
             Self::VersionInfo => format!("- Version: {VERSION}"),
-            Self::UpdateRequired => "To see this feature, hit Cmd+K (Mac) or Ctrl+K (Windows) → Check for Updates to get on the latest version of Exo.".to_owned(),
+            Self::UpdateRequired => UPDATE_REQUIRED.iter().map(AlertRun::text).collect(),
             Self::Update(alert) => alert.text(),
         }
     }
@@ -123,11 +155,7 @@ pub(crate) fn register(
         );
     }
     if let Some(open) = open {
-        commands.add(
-            Command::shortcut("ALERT_OK", act(Action::Dismiss))
-                .keys(["enter", "mod+enter", "space", "esc"])
-                .regions(ALERT),
-        );
+        register_alert_dismiss(commands, act(Action::Dismiss));
         if open == Notice::VersionInfo {
             commands.add(
                 Command::shortcut("ALERT_COPY", act(Action::Copy))
@@ -141,19 +169,14 @@ pub(crate) fn register(
 /// Where Exo's third-party notices are, which is in `Exo.app`'s resources (`fastlane build`), or
 /// else in the checkout.
 fn notices() -> std::path::PathBuf {
-    let bundled = std::env::current_exe().ok().and_then(|exe| {
-        Some(
-            exe.parent()?
-                .parent()?
-                .join("Resources/THIRD_PARTY_NOTICES.md"),
-        )
-    });
-    bundled.filter(|file| file.is_file()).unwrap_or_else(|| {
-        std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../THIRD_PARTY_NOTICES.md"
-        ))
-    })
+    crate::bundled_resource("THIRD_PARTY_NOTICES.md")
+        .filter(|file| file.is_file())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../THIRD_PARTY_NOTICES.md"
+            ))
+        })
 }
 
 impl crate::Mail {
@@ -209,10 +232,7 @@ impl crate::Mail {
     /// Draws the alert, if one is up, over `page` dimmed.
     pub(crate) fn show_notice(&mut self, ui: &mut egui::Ui, page: Rect) {
         let Some(notice) = self.notice() else { return };
-        // The page dimmed to half, nothing behind it clickable.
-        ui.painter()
-            .rect_filled(page, 0.0, Color32::from_black_alpha(128));
-        let _ = ui.interact(page, ui.id().with("notice-overlay"), egui::Sense::click());
+        let ctx = ui.ctx().clone();
         let text = notice.text();
         let alert = exo_ui::Alert {
             title: notice.title(),
@@ -223,60 +243,36 @@ impl crate::Mail {
         let clicked = match notice {
             // The copy hint, on the action row's line at the text's left.
             Notice::VersionInfo => {
-                let lines: Vec<&str> = text.split('\n').collect();
-                let ctx = ui.ctx().clone();
-                alert.show_body(
-                    ui,
+                let runs = [AlertRun::Text(&text)];
+                let (clicked, _) = alert.show_runs_modal_with(
+                    &ctx,
+                    "notice-alert",
                     page,
-                    lines.len() as f32 * ALERT_TEXT.line_height,
-                    |ui, body| {
-                        for (index, line) in lines.iter().enumerate() {
-                            ALERT_TEXT.paint_line(
-                                ui.painter(),
-                                pos2(
-                                    body.left(),
-                                    body.top() + index as f32 * ALERT_TEXT.line_height,
-                                ),
-                                line,
-                                ALERT_TEXT_INK,
-                                None,
-                            );
-                        }
-                        let subtext =
-                            format!("Press {} C to copy", exo_ui::keycap_label("mod", ctx.os()));
+                    &runs,
+                    0.0,
+                    |ui, extra| {
+                        let subtext = format!(
+                            "Press {} C to copy",
+                            exo_ui::keycap_label("mod", ui.ctx().os())
+                        );
                         ALERT_TEXT.paint_line(
                             ui.painter(),
-                            pos2(body.left(), body.bottom() + SUBTEXT_BELOW_TEXT),
+                            pos2(extra.left(), extra.top() + SUBTEXT_BELOW_TEXT),
                             &subtext,
                             SUBTEXT_INK,
                             None,
                         );
                     },
-                )
+                );
+                clicked.is_some()
             }
-            Notice::UpdateRequired => alert.show_body(
-                ui,
-                page,
-                UPDATE_REQUIRED.len() as f32 * ALERT_TEXT.line_height,
-                |ui, body| {
-                    for (index, runs) in UPDATE_REQUIRED.iter().enumerate() {
-                        let mut x = body.left();
-                        for (run, strong) in *runs {
-                            let style = if *strong { STRONG } else { ALERT_TEXT };
-                            x += style.paint_line(
-                                ui.painter(),
-                                pos2(x, body.top() + index as f32 * ALERT_TEXT.line_height),
-                                run,
-                                ALERT_TEXT_INK,
-                                None,
-                            );
-                        }
-                    }
-                },
-            ),
-            Notice::Update(_) => alert.show(ui, page),
+            Notice::UpdateRequired => alert
+                .show_runs_modal(&ctx, "notice-alert", page, UPDATE_REQUIRED)
+                .0
+                .is_some(),
+            Notice::Update(_) => alert.show_modal(&ctx, "notice-alert", page).0.is_some(),
         };
-        if clicked.is_some() {
+        if clicked {
             self.notice_run(Action::Dismiss);
         }
     }

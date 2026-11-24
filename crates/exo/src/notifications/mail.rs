@@ -54,12 +54,9 @@ pub fn notifying<'a>(
 /// The notification for `arrival` in `account`, without the sender's photo, which only the account
 /// can find.
 pub fn notice(arrival: &Arrival, account: &str) -> Notice {
-    let from = arrival.from.as_ref();
-    let title = from
-        .and_then(|from| from.name.clone())
-        .filter(|name| !name.is_empty())
-        .or_else(|| from.map(|from| from.email.clone()))
-        .unwrap_or_default();
+    let title = arrival.from.as_ref().map_or_else(String::new, |from| {
+        crate::thread::contact_title(from).to_owned()
+    });
     Notice {
         key: format!("EMAIL-{}", arrival.message),
         title,

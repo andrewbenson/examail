@@ -129,7 +129,7 @@ impl crate::Mail {
     /// A draft just made (a new message, reply or forward) takes the Auto Bcc addresses. A
     /// snippet doesn't.
     pub(super) fn with_auto_bcc(&self, open: &mut Open) {
-        if !open.is_snippet() {
+        if open.persists_to_gmail() {
             add(&mut open.record.bcc, &self.account.settings().auto_bcc);
         }
     }
@@ -145,7 +145,7 @@ impl crate::Mail {
         let focus = self.compose.focus.clone();
         let mut toast = None;
         for open in &mut self.compose.drafts {
-            open.auto_bcc.emails = emails(&auto_bcc);
+            open.delivery.auto_bcc.emails = emails(&auto_bcc);
             if let Some(text) = update(open, &auto_bcc, &exclusions) {
                 open.touch(self.ctx.input(|input| input.time));
                 if focus.as_deref() == Some(open.id.as_str()) {
@@ -173,7 +173,7 @@ fn difference(
     let auto = emails(auto_bcc);
     let everyone: Vec<String> = open
         .recipients()
-        .map(|address| address.email.clone())
+        .map(|address| address.email.to_lowercase())
         .filter(|email| !email.is_empty())
         .collect();
     let exclusions: Vec<String> = exclusions.iter().map(|entry| normalize(entry)).collect();
@@ -230,7 +230,7 @@ pub(crate) fn update(
     auto_bcc: &[String],
     exclusions: &[String],
 ) -> Option<&'static str> {
-    if let Some(seen) = open.auto_bcc.seen.take() {
+    if let Some(seen) = open.delivery.auto_bcc.seen.take() {
         let lower = |list: &[Address]| {
             list.iter()
                 .map(|address| address.email.to_lowercase())
@@ -241,24 +241,25 @@ pub(crate) fn update(
             .iter()
             .filter(|email| !before.contains(email))
             .chain(before.iter().filter(|email| !after.contains(email)));
-        open.auto_bcc.managed.extend(changed.cloned());
+        open.delivery.auto_bcc.managed.extend(changed.cloned());
     }
     let toast = changes(open, auto_bcc, exclusions);
-    open.auto_bcc.seen = Some(open.record.bcc.clone());
+    open.delivery.auto_bcc.seen = Some(open.record.bcc.clone());
     toast
 }
 
 /// Takes `open`'s Bcc as it is now as Auto Bcc's own doing, not the user's, as after Instant
 /// Intro changes it.
 pub(crate) fn settle(open: &mut Open) {
-    open.auto_bcc.seen = Some(open.record.bcc.clone());
+    open.delivery.auto_bcc.seen = Some(open.record.bcc.clone());
 }
 
 fn changes(open: &mut Open, auto_bcc: &[String], exclusions: &[String]) -> Option<&'static str> {
-    if open.is_snippet() || auto_bcc.is_empty() {
+    if !open.persists_to_gmail() || auto_bcc.is_empty() {
         return None;
     }
-    let (insertions, removals) = difference(open, auto_bcc, exclusions, &open.auto_bcc.managed);
+    let (insertions, removals) =
+        difference(open, auto_bcc, exclusions, &open.delivery.auto_bcc.managed);
     if insertions.is_empty() && removals.is_empty() {
         return None;
     }
@@ -430,5 +431,16 @@ mod tests {
             None,
             "no Auto Bcc, no changes"
         );
+    }
+
+    #[test]
+    fn skips_auto_bcc_when_address_already_in_to_with_different_case() {
+        let mut draft = open(&["123@BCC.HUBSPOT.COM"], &[]);
+        assert_eq!(
+            update(&mut draft, &settings(CRM), &[]),
+            None,
+            "uppercase To matches lowercase Auto Bcc"
+        );
+        assert!(bcc(&draft).is_empty());
     }
 }

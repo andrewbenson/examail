@@ -8,19 +8,20 @@
 use std::{borrow::Cow, sync::Arc};
 
 use egui::{
-    Area, Color32, Context, CornerRadius, Event, Galley, Id, Key, Modifiers, Order, Painter, Pos2,
+    Area, Color32, Context, CornerRadius, Event, Galley, Key, Modifiers, Order, Painter, Pos2,
     Rect, Sense, Ui, Vec2,
     os::OperatingSystem,
     text::{CCursor, CCursorRange, LayoutJob, TextWrapping},
 };
 use exo_ui::{
-    BoxShadow, Family, Font, KeycapColors, Keycaps, TextStyle, focus_field, paint_icon, paint_text,
-    palette, text_field,
+    BoxShadow, Family, Font, KeycapColors, Keycaps, TextStyle, focus_field, layout as layout_job,
+    paint_icon, paint_text, palette, text_field,
 };
 
 use crate::{
     Act, Hint,
     command::Command,
+    dropdown::{Dropdown, DropdownState},
     keys::Chord,
     rank::{Ranked, rank_main, rank_rows},
 };
@@ -98,39 +99,6 @@ enum Rows<A> {
     /// Rows the sub-palette matches and orders itself, for the query as typed and the
     /// dropdown's choice.
     Ordered(RowsFor<A>),
-}
-
-/// A choice beside a sub-palette's input, such as Send later's `if no reply` / `regardless`. The
-/// rows are made for what it says. A key cycles it (`cycle`, as Send later's ⌘⇧L does), and Tab,
-/// or → at the end of the input, opens its menu.
-#[derive(Clone, Debug)]
-#[must_use]
-pub struct Dropdown {
-    options: Vec<&'static str>,
-    selected: usize,
-    cycle: &'static str,
-    /// An option, and the hint it shows when it's picked from the open menu.
-    hint: Option<(usize, Hint)>,
-}
-
-impl Dropdown {
-    /// A dropdown with `options` in the menu's order, starting on `selected` and cycled by `cycle`
-    /// (a binding as [`Command::key`] takes it).
-    pub fn new(options: Vec<&'static str>, selected: usize, cycle: &'static str) -> Self {
-        Self {
-            options,
-            selected,
-            cycle,
-            hint: None,
-        }
-    }
-
-    /// Shows `hint` when `option` is picked from the open menu, by a click or Enter, but not
-    /// when the cycle key gets to it.
-    pub fn hint_on(mut self, option: usize, hint: Hint) -> Self {
-        self.hint = Some((option, hint));
-        self
-    }
 }
 
 impl<A: 'static> SubPalette<A> {
@@ -236,10 +204,7 @@ impl<A: 'static> SubPalette<A> {
     /// The titles of the rows listed for `query`, in order, then the footer's (for tests).
     pub fn titles(&self, query: &str) -> Vec<String> {
         let title = |row: &Command<A>| row.title.as_deref().unwrap_or_default().to_owned();
-        let choice = self
-            .dropdown
-            .as_ref()
-            .map_or(0, |dropdown| dropdown.selected);
+        let choice = self.dropdown.as_ref().map_or(0, Dropdown::selected);
         let mut titles: Vec<String> = match &self.rows {
             Rows::Ranked(rows) => rank_rows(rows, query)
                 .into_iter()
@@ -356,13 +321,8 @@ struct State {
     reveal: bool,
     /// Focus the input (and select or place the caret) on the next frame.
     focus: Option<Selection>,
-    /// The dropdown's choice, and its menu's highlight while it's open.
-    choice: usize,
-    menu: Option<usize>,
-    /// When a key last cycled the dropdown, which flashes it for 50 ms.
-    flashed: f64,
-    /// The option the menu picked this frame.
-    picked: Option<usize>,
+    /// The dropdown's choice, menu highlight, and flash state.
+    dropdown: DropdownState,
     /// The main palette's nudge this frame ([`Palette::set_nudge`]).
     nudge: Option<Cow<'static, str>>,
 }
@@ -464,13 +424,10 @@ impl<A: Clone> Palette<A> {
 
     pub(crate) fn open_sub(&mut self, sub: SubPalette<A>) {
         let from_main = self.ran_main || self.is_main_open() || (sub.stage && self.ran_from_main);
-        let choice = sub
-            .dropdown
-            .as_ref()
-            .map_or(0, |dropdown| dropdown.selected);
+        let choice = sub.dropdown.as_ref().map_or(0, Dropdown::selected);
         let initial = sub.initial.clone();
         let mut open = self.opened(sub.id, Some(sub), initial.as_deref(), from_main);
-        open.state.choice = choice;
+        open.state.dropdown.choice = choice;
         self.open = Some(open);
     }
 
@@ -501,10 +458,7 @@ impl<A: Clone> Palette<A> {
                 scroll: 0.0,
                 reveal: false,
                 focus: Some(focus),
-                choice: 0,
-                menu: None,
-                flashed: f64::NEG_INFINITY,
-                picked: None,
+                dropdown: DropdownState::default(),
                 nudge: None,
             },
         }
@@ -544,37 +498,28 @@ impl<A: Clone> Palette<A> {
         // The dropdown's keys go first, because they change the rows.
         let dropdown = sub.and_then(|sub| sub.dropdown.as_ref());
         if let Some(dropdown) = dropdown {
-            dropdown_keys(ctx, state, dropdown);
-        }
-        let ordered;
-        let rows: Vec<Ranked<'_, A>> = match sub.map(|sub| &sub.rows) {
-            Some(Rows::Ranked(rows)) => rank_rows(rows, &state.query),
-            Some(Rows::Ordered(rows)) => {
-                ordered = rows(&state.query, state.choice);
-                ordered.iter().map(Ranked::unranked).collect()
+            let before = state.dropdown.choice;
+            dropdown.keys(ctx, &mut state.dropdown);
+            if state.dropdown.choice != before {
+                state.highlight = 0;
+                state.scroll = 0.0;
             }
-            None => rank_main(main, &state.query),
-        };
-        let footer = match sub {
-            Some(sub) => sub
-                .footer
-                .as_ref()
-                .and_then(|footer| footer(&state.query))
-                .map(|row| FooterRow::Command(Box::new(row)))
-                .or_else(|| {
-                    sub.note(&state.query)
-                        .filter(|_| rows.is_empty())
-                        .map(FooterRow::Text)
-                }),
-            None => main_footer(&state.query, rows.len()),
-        };
-        let count = rows.len() + usize::from(footer.as_ref().is_some_and(FooterRow::is_actionable));
+        }
+        let ordered = ordered_rows(sub, &state.query, state.dropdown.choice);
+        let rows = build_rows(sub, main, &state.query, &ordered);
+        let footer = build_footer(sub, &state.query, rows.len());
+        let count = item_count(rows.len(), footer.as_ref());
+        state.highlight = state.highlight.min(count.saturating_sub(1));
 
         let opens_menu = dropdown.is_some() && !rows.is_empty();
+        let mut cleared = false;
         let outcome = match keyboard(ctx, state, count, opens_menu) {
             Some((Key::Escape, _)) if !state.query.is_empty() => {
                 state.query.clear();
                 state.highlight = 0;
+                state.scroll = 0.0;
+                state.reveal = false;
+                cleared = true;
                 None
             }
             Some((Key::Escape, _)) if sub.is_some() && open.from_main => Some(Outcome::BackToMain),
@@ -586,10 +531,24 @@ impl<A: Clone> Palette<A> {
         let outcome = match outcome {
             Some(outcome) => outcome,
             None => {
-                let outcome = draw(ctx, area, sub, state, &rows, footer.as_ref());
+                let choice_before = state.dropdown.choice;
+                let outcome = if cleared {
+                    let ordered = ordered_rows(sub, &state.query, state.dropdown.choice);
+                    let rows = build_rows(sub, main, &state.query, &ordered);
+                    let footer = build_footer(sub, &state.query, rows.len());
+                    let count = item_count(rows.len(), footer.as_ref());
+                    state.highlight = state.highlight.min(count.saturating_sub(1));
+                    draw(ctx, area, sub, state, &rows, footer.as_ref())
+                } else {
+                    draw(ctx, area, sub, state, &rows, footer.as_ref())
+                };
+                if state.dropdown.choice != choice_before {
+                    state.highlight = 0;
+                    state.scroll = 0.0;
+                }
                 if let (Some(picked), Some((option, hint))) = (
-                    state.picked.take(),
-                    dropdown.and_then(|dropdown| dropdown.hint.as_ref()),
+                    state.dropdown.picked.take(),
+                    dropdown.and_then(Dropdown::hint),
                 ) {
                     self.hint = (picked == *option).then(|| hint.clone());
                 }
@@ -650,7 +609,43 @@ fn main_footer<A>(query: &str, rows: usize) -> Option<FooterRow<A>> {
     }
 }
 
-/// The highlighted row (the footer's, past the last row).
+fn ordered_rows<A>(sub: Option<&SubPalette<A>>, query: &str, choice: usize) -> Vec<Command<A>> {
+    match sub.map(|sub| &sub.rows) {
+        Some(Rows::Ordered(rows)) => rows(query, choice),
+        _ => Vec::new(),
+    }
+}
+
+fn build_rows<'a, A>(
+    sub: Option<&'a SubPalette<A>>,
+    main: &[&'a Command<A>],
+    query: &str,
+    ordered: &'a [Command<A>],
+) -> Vec<Ranked<'a, A>> {
+    match sub.map(|sub| &sub.rows) {
+        Some(Rows::Ranked(rows)) => rank_rows(rows, query),
+        Some(Rows::Ordered(_)) => ordered.iter().map(Ranked::unranked).collect(),
+        None => rank_main(main, query),
+    }
+}
+
+fn build_footer<A>(sub: Option<&SubPalette<A>>, query: &str, rows: usize) -> Option<FooterRow<A>> {
+    match sub {
+        Some(sub) => sub
+            .footer
+            .as_ref()
+            .and_then(|footer| footer(query))
+            .map(|row| FooterRow::Command(Box::new(row)))
+            .or_else(|| sub.note(query).filter(|_| rows == 0).map(FooterRow::Text)),
+        None => main_footer(query, rows),
+    }
+}
+
+fn item_count<A>(rows: usize, footer: Option<&FooterRow<A>>) -> usize {
+    rows + usize::from(footer.is_some_and(FooterRow::is_actionable))
+}
+
+/// The highlighted row (the footer's, at `rows.len()`).
 fn run<'a, A>(
     rows: &[Ranked<'a, A>],
     footer: Option<&'a FooterRow<A>>,
@@ -658,66 +653,13 @@ fn run<'a, A>(
 ) -> Option<&'a Command<A>> {
     match (rows.get(highlight), footer) {
         (Some(row), _) => Some(row.command),
-        (None, Some(FooterRow::Command(command))) => Some(command),
+        (None, Some(FooterRow::Command(command))) if highlight == rows.len() => Some(command),
         _ => None,
     }
 }
 
 /// The input's id.
 const INPUT_ID: &str = "exo_commands::palette_input";
-
-/// A dropdown's keys, handled before the palette's: its cycle key and, while its menu is open, the
-/// menu's. ↑ ↓ K J move, Enter picks, and Escape, Tab and ← close it. While the menu is open,
-/// nothing reaches the input.
-fn dropdown_keys(ctx: &Context, state: &mut State, dropdown: &Dropdown) {
-    let os = ctx.os();
-    let cycle = crate::keys::Binding::parse(dropdown.cycle, os)
-        .and_then(|binding| binding.chords.first().copied());
-    let count = dropdown.options.len().max(1);
-    let now = ctx.input(|input| input.time);
-    ctx.input_mut(|input| {
-        input.events.retain(|event| {
-            if state.menu.is_some() && matches!(event, Event::Text(_)) {
-                return false;
-            }
-            let Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } = event
-            else {
-                return true;
-            };
-            let chord = Chord::from_event(*key, *modifiers);
-            if Some(chord) == cycle {
-                // `cycle`: the next option, the menu's highlight with it, and a flash.
-                state.choice = (state.choice + 1) % count;
-                state.menu = state.menu.map(|_| state.choice);
-                state.flashed = now;
-                return false;
-            }
-            let Some(highlight) = state.menu else {
-                return true;
-            };
-            let plain = !chord.shift && !chord.ctrl && !chord.alt && !chord.meta;
-            match chord.key {
-                Key::ArrowDown | Key::ArrowUp | Key::J | Key::K if plain => {
-                    state.menu = Some((highlight + 1) % count)
-                }
-                Key::Enter if plain => {
-                    state.choice = highlight;
-                    state.menu = None;
-                    state.picked = Some(highlight);
-                }
-                Key::Tab | Key::ArrowLeft => state.menu = None,
-                _ if chord.is_escape(os) => state.menu = None,
-                _ => {}
-            }
-            false
-        });
-    });
-}
 
 /// Whether the input's caret is at the end of `query`, with nothing selected.
 fn caret_at_end(ctx: &Context, query: &str) -> bool {
@@ -797,7 +739,7 @@ fn keyboard(
                 Key::Tab | Key::ArrowRight
                     if opens_menu && (chord.key == Key::Tab || (plain && at_end)) =>
                 {
-                    state.menu = Some(state.choice)
+                    state.dropdown.menu = Some(state.dropdown.choice)
                 }
                 Key::Enter | Key::Tab if !*repeat => result = Some((Key::Enter, *modifiers)),
                 Key::Enter | Key::Tab => {}
@@ -849,14 +791,91 @@ fn draw<A: Clone>(
         .inner
 }
 
+/// Cached text shaping for one rendered palette row so measurement and painting shape once.
+struct RowLayout {
+    top: f32,
+    height: f32,
+    meta_width: f32,
+    title: Arc<Galley>,
+    description: Option<(f32, Arc<Galley>)>,
+    side: Option<Arc<Galley>>,
+    keycaps: Option<Keycaps>,
+}
+
+impl RowLayout {
+    fn new<A>(ctx: &Context, row: &Ranked<'_, A>, top: f32) -> Self {
+        let command = row.command;
+        let tick = if command.in_use { 14.0 } else { 0.0 };
+        let (side, keycaps, meta_width) = if let Some(side) = &command.side_title {
+            let galley = layout_job(
+                ctx,
+                LayoutJob::single_section(side.to_string(), SIDE.format(Color32::WHITE)),
+            );
+            let width = tick + 32.0 + galley.size().x;
+            (Some(galley), None, width)
+        } else {
+            let keys = command.display_keys();
+            if keys.is_empty() {
+                (None, None, tick)
+            } else {
+                let caps = Keycaps::new(ctx, &keys, KeycapColors::base(palette(ctx)));
+                let width = tick + caps.width() + if command.in_use { 4.0 } else { 0.0 };
+                (None, Some(caps), width)
+            }
+        };
+
+        let icon = if command.icon.is_some() {
+            ICON + 13.0
+        } else if command.avatar.is_some() {
+            AVATAR - 2.0 + 10.0
+        } else {
+            0.0
+        };
+        let title_budget = WIDTH - 2.0 * GUTTER - icon - (meta_width + 12.0);
+        let title = shape_title_galley(ctx, row, Color32::WHITE, title_budget);
+        let description = command.description.as_ref().and_then(|desc| {
+            let desc_offset = title.size().x + TITLE_LETTER_SPACING + DESCRIPTION_GAP;
+            let desc_width = title_budget - desc_offset;
+            (desc_width > 0.0).then(|| {
+                let mut job =
+                    LayoutJob::single_section(desc.to_string(), SIDE.format(Color32::WHITE));
+                job.wrap = TextWrapping::truncate_at_width(desc_width);
+                (desc_offset, layout_job(ctx, job))
+            })
+        });
+
+        let avatar = command.avatar.as_ref().map_or(0.0, |avatar| {
+            if avatar.photo.is_some() {
+                AVATAR - 2.0
+            } else {
+                AVATAR
+            }
+        });
+        let lines = title.rows.len().clamp(1, 2) as f32;
+        let content = (lines * TITLE.line_height).max(avatar);
+        let height = 2.0 * ROW_PADDING + content;
+
+        Self {
+            top,
+            height,
+            meta_width,
+            title,
+            description,
+            side,
+            keycaps,
+        }
+    }
+}
+
 /// Where everything goes this frame.
 struct Layout {
     panel: Rect,
     list: Rect,
-    /// Each rendered row's top (relative to the list's content) and height.
-    rows: Vec<(f32, f32)>,
+    /// Each rendered row's geometry and pre-shaped galleys.
+    rows: Vec<RowLayout>,
     content_height: f32,
     footer: Option<Rect>,
+    footer_row: Option<RowLayout>,
     /// How far the panel moved to land on a whole pixel. Row icons (SVGs in the list's
     /// composited layer) stay where layout put them, so they don't move with it.
     snap: f32,
@@ -871,6 +890,7 @@ impl Layout {
         footer: Option<&FooterRow<A>>,
         hide_input: bool,
     ) -> Self {
+        let ctx = ui.ctx();
         let left = area.center().x - WIDTH / 2.0;
         // `top: calc(50% - 199px)`. Chromium paints the panel on a whole CSS pixel (measured: 221.5
         // in an 800px window draws at 222), but not the row icons (see `snap`).
@@ -889,23 +909,12 @@ impl Layout {
             rows.len().min(FIRST_ROWS)
         };
         let mut y = 0.0;
-        let row_rects = rows[..shown]
+        let row_layouts = rows[..shown]
             .iter()
             .map(|row| {
-                // The avatar is taller than a title line. A photo's box pulls itself 2px up
-                // (`margin-top: -2px`).
-                let avatar = row.command.avatar.as_ref().map_or(0.0, |avatar| {
-                    if avatar.photo.is_some() {
-                        AVATAR - 2.0
-                    } else {
-                        AVATAR
-                    }
-                });
-                let content = (title_lines(ui, row) * TITLE.line_height).max(avatar);
-                let height = 2.0 * ROW_PADDING + content;
-                let rect = (y, height);
-                y += height - 8.0;
-                rect
+                let laid = RowLayout::new(ctx, row, y);
+                y += laid.height - 8.0;
+                laid
             })
             .collect::<Vec<_>>();
         // The last row has `margin-bottom: 8px` instead of −8px.
@@ -914,10 +923,16 @@ impl Layout {
         let list = Rect::from_min_size(Pos2::new(left, list_top), Vec2::new(WIDTH, list_height));
         // The footer: a 1px break, then a row padded `19px 36px 20px` with the last child's 8px
         // bottom margin.
-        let footer = footer.map(|_| {
+        let footer_rect = footer.map(|_| {
             Rect::from_min_size(Pos2::new(left, list.bottom()), Vec2::new(WIDTH, 1.0 + 59.0))
         });
-        let bottom = footer.map_or(list.bottom(), |footer| footer.bottom() + 8.0);
+        let footer_row = match footer {
+            Some(FooterRow::Command(command)) => {
+                Some(RowLayout::new(ctx, &Ranked::unranked(command), 0.0))
+            }
+            _ => None,
+        };
+        let bottom = footer_rect.map_or(list.bottom(), |footer| footer.bottom() + 8.0);
         let panel = Rect::from_min_max(
             Pos2::new(left, top),
             Pos2::new(left + WIDTH, bottom.min(area.bottom())),
@@ -925,37 +940,24 @@ impl Layout {
         Self {
             panel,
             list,
-            rows: row_rects,
+            rows: row_layouts,
             content_height,
-            footer,
+            footer: footer_rect,
+            footer_row,
             snap: top - unsnapped,
         }
     }
 }
 
-/// How many lines a row's title takes. It wraps to two at most, or one beside a description.
-fn title_lines<A>(ui: &Ui, row: &Ranked<'_, A>) -> f32 {
-    let galley = title_galley(ui, row, Color32::WHITE, title_width(ui, row));
-    galley.rows.len().clamp(1, 2) as f32
-}
-
 /// The gap between a title and its description.
 const DESCRIPTION_GAP: f32 = 28.0;
 
-fn title_width<A>(ui: &Ui, row: &Ranked<'_, A>) -> f32 {
-    let icon = if row.command.icon.is_some() {
-        ICON + 13.0
-    } else if row.command.avatar.is_some() {
-        AVATAR - 2.0 + 10.0
-    } else {
-        0.0
-    };
-    // The right-hand side's 12px left margin, there even when it's empty.
-    let meta = meta_width(ui, row.command) + 12.0;
-    WIDTH - 2.0 * GUTTER - icon - meta
-}
-
-fn title_galley<A>(ui: &Ui, row: &Ranked<'_, A>, color: Color32, width: f32) -> Arc<Galley> {
+fn shape_title_galley<A>(
+    ctx: &Context,
+    row: &Ranked<'_, A>,
+    color: Color32,
+    width: f32,
+) -> Arc<Galley> {
     let mut job = LayoutJob::single_section(row.title.clone().into_owned(), TITLE.format(color));
     // Beside a description the title keeps to one line (`white-space: nowrap`) and gives way
     // only once the description is gone (`flex: 0 1 auto` against its `1 99999999999 auto`).
@@ -973,27 +975,33 @@ fn title_galley<A>(ui: &Ui, row: &Ranked<'_, A>, color: Color32, width: f32) -> 
         break_anywhere: one_line,
         overflow_character: Some('…'),
     };
-    ui.fonts_mut(|fonts| fonts.layout_job(job))
+    layout_job(ctx, job)
 }
 
-/// The right-hand side's width: a tick, then a side title or keycaps.
-fn meta_width<A>(ui: &Ui, command: &Command<A>) -> f32 {
-    let tick = if command.in_use { 14.0 } else { 0.0 };
-    if let Some(side) = &command.side_title {
-        return tick
-            + 32.0
-            + SIDE
-                .single_line(ui.painter(), side, Color32::WHITE, None)
-                .size()
-                .x;
+fn tint_galley(galley: &Arc<Galley>, color: Color32) -> Arc<Galley> {
+    let mut out = galley.clone();
+    let made = Arc::make_mut(&mut out);
+    let mut job = (*made.job).clone();
+    for section in &mut job.sections {
+        section.format.color = color;
     }
-    let keys = command.display_keys();
-    if keys.is_empty() {
-        return tick;
+    made.job = Arc::new(job);
+    for placed in &mut made.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        for glyph in &row.glyphs {
+            let first = glyph.first_vertex as usize;
+            if glyph.uv_rect.is_nothing()
+                || glyph.uv_rect.size.x <= 0.0
+                || !row.visuals.glyph_vertex_range.contains(&first)
+            {
+                continue;
+            }
+            for vertex in &mut row.visuals.mesh.vertices[first..first + 4] {
+                vertex.color = color;
+            }
+        }
     }
-    let keycaps = Keycaps::new(ui.ctx(), &keys, KeycapColors::base(palette(ui.ctx())));
-    // After a tick the first cap's margin is 8px instead of 4px.
-    tick + keycaps.width() + if command.in_use { 4.0 } else { 0.0 }
+    out
 }
 
 /// Paints the palette and handles the mouse over it, and returns the clicked row.
@@ -1072,7 +1080,7 @@ fn paint<A: Clone>(
         // rest.
         let dropdown = sub.and_then(|sub| sub.dropdown.as_ref()).map(|dropdown| {
             let right = panel.right() - GUTTER;
-            let width = dropdown_width(ui, dropdown, state.choice, state.menu.is_some());
+            let width = dropdown.width(ui, &state.dropdown);
             menu = Some((
                 dropdown,
                 Rect::from_min_size(
@@ -1093,7 +1101,7 @@ fn paint<A: Clone>(
             width,
         );
         if let Some((dropdown, rect)) = menu {
-            paint_dropdown_button(ui, &painter, dropdown, state, rect, !rows.is_empty());
+            dropdown.paint_button(ui, &painter, &mut state.dropdown, rect, !rows.is_empty());
         }
     }
 
@@ -1114,22 +1122,23 @@ fn paint<A: Clone>(
         (state.scroll - wheel).clamp(0.0, (layout.content_height - layout.list.height()).max(0.0));
     if state.reveal {
         state.reveal = false;
-        if let Some(&(top, height)) = layout.rows.get(state.highlight) {
+        if let Some(laid) = layout.rows.get(state.highlight) {
             // Scrolled in at the nearest edge.
-            if top < state.scroll {
-                state.scroll = top;
-            } else if top + height > state.scroll + layout.list.height() {
-                state.scroll = top + height - layout.list.height();
+            if laid.top < state.scroll {
+                state.scroll = laid.top;
+            } else if laid.top + laid.height > state.scroll + layout.list.height() {
+                state.scroll = laid.top + laid.height - layout.list.height();
             }
         }
     }
-    let mut list_ui = ui.new_child(egui::UiBuilder::new());
-    list_ui.set_clip_rect(layout.list);
+
     let mut ran = None;
-    for (index, (&(top, height), row)) in layout.rows.iter().zip(rows).enumerate() {
+    let modifiers = ui.input(|input| input.modifiers);
+    let mut row_rects = Vec::with_capacity(layout.rows.len());
+    for (index, (laid, row)) in layout.rows.iter().zip(rows).enumerate() {
         let rect = Rect::from_min_size(
-            Pos2::new(panel.left(), layout.list.top() + top - state.scroll),
-            Vec2::new(WIDTH, height),
+            Pos2::new(panel.left(), layout.list.top() + laid.top - state.scroll),
+            Vec2::new(WIDTH, laid.height),
         );
         let response = ui.interact(
             rect.intersect(layout.list),
@@ -1140,16 +1149,38 @@ fn paint<A: Clone>(
             state.highlight = index;
         }
         if response.clicked() {
-            ran = Some(Ran::new(row.command, ui.input(|input| input.modifiers)));
+            ran = Some(Ran::new(row.command, modifiers));
         }
+        row_rects.push((index, rect, laid, row));
+    }
+
+    if let (Some(rect), Some(FooterRow::Command(command))) = (layout.footer, footer) {
+        let row_rect = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + 1.0), rect.max);
+        let response = ui.interact(
+            row_rect,
+            exo_ui::id(ui.ctx(), "exo_commands::palette_footer"),
+            Sense::click(),
+        );
+        if (response.hovered() && pointer_moved) || response.is_pointer_button_down_on() {
+            state.highlight = rows.len();
+        }
+        if response.clicked() {
+            ran = Some(Ran::new(command, modifiers));
+        }
+    }
+
+    let mut list_ui = ui.new_child(egui::UiBuilder::new());
+    list_ui.set_clip_rect(layout.list);
+    for (index, rect, laid, row) in row_rects {
         let active = index == state.highlight;
         if active {
             list_ui
                 .painter()
                 .rect_filled(rect, 0.0, Color32::WHITE.gamma_multiply(0.1));
         }
-        paint_row(&list_ui, rect, row, active, layout.snap);
+        paint_row(&list_ui, rect, laid, row, active, layout.snap);
     }
+
     if let (Some(rect), Some(footer)) = (layout.footer, footer) {
         let divider = Rect::from_min_size(
             Pos2::new(rect.left() + GUTTER, rect.top()),
@@ -1166,17 +1197,18 @@ fn paint<A: Clone>(
         let line_top = Pos2::new(rect.left() + GUTTER, row_rect.top() + 19.0 + 1.0);
         match footer {
             FooterRow::Command(command) => {
-                let response = ui.interact(
-                    row_rect,
-                    exo_ui::id(ui.ctx(), "exo_commands::palette_footer"),
-                    Sense::click(),
-                );
-                if response.clicked() {
-                    ran = Some(Ran::new(command, ui.input(|input| input.modifiers)));
+                if let Some(footer_laid) = &layout.footer_row {
+                    // Footer rows are padded 19px on top, rows 20px.
+                    let shifted = row_rect.translate(Vec2::Y * -1.0);
+                    paint_row(
+                        ui,
+                        shifted,
+                        footer_laid,
+                        &Ranked::unranked(command),
+                        active,
+                        layout.snap,
+                    );
                 }
-                // Footer rows are padded 19px on top, rows 20px.
-                let shifted = row_rect.translate(Vec2::Y * -1.0);
-                paint_row(ui, shifted, &Ranked::unranked(command), active, layout.snap);
             }
             FooterRow::Text(text) => paint_text(
                 &painter,
@@ -1188,199 +1220,10 @@ fn paint<A: Clone>(
         }
     }
     // The open menu is over the rows.
-    if let (Some((dropdown, rect)), Some(highlight)) = (menu, state.menu) {
-        paint_dropdown_menu(ui, dropdown, state, highlight, rect);
+    if let (Some((dropdown, rect)), Some(highlight)) = (menu, state.dropdown.menu) {
+        dropdown.paint_menu(ui, &mut state.dropdown, highlight, rect);
     }
     ran
-}
-
-/// The dropdown's button and menu items: Exo Mono 14px, `-0.0225em`. The button sits in a 20px
-/// line, and the menu's items in 28px ones.
-const DROPDOWN: TextStyle =
-    TextStyle::new(Font::new(Family::Mono, 400), 14.0, 20.0).letter_spacing(-0.315);
-const DROPDOWN_ITEM: TextStyle =
-    TextStyle::new(Font::new(Family::Mono, 400), 14.0, 28.0).letter_spacing(-0.315);
-/// The dropdown's arrow: `margin-left: 6px` before the 10×6 `DEPRECATED_dropdown`.
-const ARROW_GAP: f32 = 6.0;
-const ARROW: Vec2 = Vec2::new(10.0, 6.0);
-/// A menu item: 32px tall, `padding: 0 16px`.
-const MENU_ITEM: f32 = 32.0;
-const MENU_PADDING: f32 = 16.0;
-
-/// The dropdown's width: its button's (the option chosen, then the arrow), or with its menu
-/// open, the widest item's if wider.
-fn dropdown_width(ui: &Ui, dropdown: &Dropdown, choice: usize, open: bool) -> f32 {
-    let painter = ui.painter();
-    // Chromium's text box takes the last letter's (negative) spacing too.
-    let text = |text: &str, style: &TextStyle| {
-        style
-            .single_line(painter, text, Color32::WHITE, None)
-            .size()
-            .x
-            + style.letter_spacing
-    };
-    let button = text(
-        dropdown.options.get(choice).copied().unwrap_or_default(),
-        &DROPDOWN,
-    ) + ARROW_GAP
-        + ARROW.x;
-    let menu = if open {
-        dropdown
-            .options
-            .iter()
-            .map(|option| text(option, &DROPDOWN_ITEM) + 2.0 * MENU_PADDING)
-            .fold(0.0_f32, f32::max)
-    } else {
-        0.0
-    };
-    button.max(menu)
-}
-
-/// The dropdown's button: the choice and the arrow, in the dropdown's box `rect` in the input row.
-/// The dropdown sits 10px down the row and the button 2px further, right-aligned. The button is at
-/// half opacity until it's hovered, open or flashed by its key, and it's underlined while open. A
-/// click opens or closes the menu, and with no rows it does nothing.
-fn paint_dropdown_button(
-    ui: &Ui,
-    painter: &Painter,
-    dropdown: &Dropdown,
-    state: &mut State,
-    rect: Rect,
-    enabled: bool,
-) {
-    let ctx = ui.ctx();
-    let id = exo_ui::id(ctx, "exo_commands::palette_dropdown");
-    let label = dropdown
-        .options
-        .get(state.choice)
-        .copied()
-        .unwrap_or_default();
-    let text_box = DROPDOWN
-        .single_line(painter, label, Color32::WHITE, None)
-        .size()
-        .x
-        + DROPDOWN.letter_spacing;
-    let width = text_box + ARROW_GAP + ARROW.x;
-    let line = Rect::from_min_size(
-        Pos2::new(rect.right() - width, rect.top() + 12.0),
-        Vec2::new(width, DROPDOWN.line_height),
-    );
-    let response = ui.interact(
-        line,
-        id,
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    if enabled && response.clicked() {
-        state.menu = match state.menu {
-            Some(_) => None,
-            None => Some(state.choice),
-        };
-    }
-    let open = state.menu.is_some();
-    let flashing = ctx.input(|input| input.time) - state.flashed < 0.05;
-    // `opacity: .5`, or 1 on hover, open or flashed. `transition: opacity 150ms ease`, with none
-    // while flashing.
-    let lit = enabled && (response.hovered() || open);
-    let eased = exo_ui::motion::transition(
-        ctx,
-        id.with("opacity"),
-        lit || flashing,
-        0.15,
-        exo_ui::motion::CubicBezier::EASE,
-    );
-    let opacity = if flashing { 1.0 } else { 0.5 + 0.5 * eased };
-    if flashing {
-        ctx.request_repaint();
-    }
-    let color = HEADER_COLOR.gamma_multiply(opacity);
-    DROPDOWN.paint_line(painter, line.min, label, color, None);
-    // The arrow's 7px inline block sits on the baseline, the 10×6 glyph at its top.
-    let baseline = line.top() + DROPDOWN.baseline(ctx);
-    let arrow = Rect::from_min_size(
-        Pos2::new(line.left() + text_box + ARROW_GAP, baseline - 7.0),
-        ARROW,
-    );
-    paint_icon(
-        ui,
-        "legacy/DEPRECATED_dropdown",
-        arrow,
-        Color32::WHITE.gamma_multiply(opacity),
-    );
-    if open {
-        // `box-shadow: 0 2px #aeb1dd` under the inline button's box. The box is its glyphs' 18px
-        // plus the 2px bottom padding, which ends at the line's bottom (measured).
-        painter.rect_filled(
-            Rect::from_min_size(Pos2::new(line.left(), line.bottom()), Vec2::new(width, 2.0)),
-            0.0,
-            INPUT_BAR,
-        );
-    }
-}
-
-/// The dropdown's open menu under its button (white, `padding: 8px 0`, `margin-top: 8px`), its
-/// items right-aligned in the dropdown's box `rect`, the highlighted one on `#e4e4e4`. A click
-/// picks one, and the pointer moves the highlight.
-fn paint_dropdown_menu(
-    ui: &Ui,
-    dropdown: &Dropdown,
-    state: &mut State,
-    highlight: usize,
-    rect: Rect,
-) {
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(
-        Order::Tooltip,
-        Id::new("exo_commands::palette_menu"),
-    ));
-    let top = rect.top() + 10.0 + DROPDOWN.line_height + 8.0;
-    let menu = Rect::from_min_size(
-        Pos2::new(rect.left(), top),
-        Vec2::new(
-            rect.width(),
-            16.0 + MENU_ITEM * dropdown.options.len() as f32,
-        ),
-    );
-    painter.rect_filled(menu, 0.0, Color32::WHITE);
-    let pointer_moved = ui.input(|input| input.pointer.delta() != Vec2::ZERO);
-    for (index, option) in dropdown.options.iter().enumerate() {
-        let item = Rect::from_min_size(
-            Pos2::new(menu.left(), menu.top() + 8.0 + MENU_ITEM * index as f32),
-            Vec2::new(menu.width(), MENU_ITEM),
-        );
-        let response = ui.interact(
-            item,
-            exo_ui::id(ui.ctx(), ("exo_commands::palette_menu_item", index)),
-            Sense::click(),
-        );
-        if response.hovered() && pointer_moved {
-            state.menu = Some(index);
-        }
-        if response.clicked() {
-            state.choice = index;
-            state.menu = None;
-            state.picked = Some(index);
-        }
-        let highlighted = index == highlight;
-        if highlighted {
-            painter.rect_filled(item, 0.0, Color32::from_rgb(0xe4, 0xe4, 0xe4));
-        }
-        let color = Color32::from_black_alpha(if highlighted { 153 } else { 102 });
-        let width = DROPDOWN_ITEM
-            .single_line(&painter, option, color, None)
-            .size()
-            .x;
-        // The text 2px down, its 28px line at the item's top.
-        DROPDOWN_ITEM.paint_line(
-            &painter,
-            Pos2::new(item.right() - MENU_PADDING - width, item.top() + 2.0),
-            option,
-            color,
-            None,
-        );
-    }
 }
 
 /// The nudge's gradient. The input's background, `linear-gradient(90deg, #8ea6ff 0%, #ffbcd5 25%,
@@ -1472,8 +1315,15 @@ fn input(
     }
 }
 
-/// Paints one row with `ui`'s painter (clipped to the list).
-fn paint_row<A>(ui: &Ui, rect: Rect, row: &Ranked<'_, A>, active: bool, snap: f32) {
+/// Paints one pre-laid-out row with `ui`'s painter (clipped to the list).
+fn paint_row<A>(
+    ui: &Ui,
+    rect: Rect,
+    laid: &RowLayout,
+    row: &Ranked<'_, A>,
+    active: bool,
+    snap: f32,
+) {
     let painter = ui.painter();
     let tokens = palette(ui.ctx());
     let command = row.command;
@@ -1496,9 +1346,6 @@ fn paint_row<A>(ui: &Ui, rect: Rect, row: &Ranked<'_, A>, active: bool, snap: f3
     } else if let Some(avatar) = &command.avatar {
         let rect = Rect::from_min_size(Pos2::new(x - 2.0, content_top), Vec2::splat(AVATAR));
         match &avatar.photo {
-            // The photo's ring has `border-width: 2.5px`, which Chromium floors to 2px, and its
-            // `margin-top: -2px` is undone by `top: 2px`. It moves with the panel's snap
-            // (measured), and like the icons it's 70% opaque off the active row.
             Some(photo) => exo_ui::paint_photo_avatar(
                 painter,
                 rect,
@@ -1507,7 +1354,6 @@ fn paint_row<A>(ui: &Ui, rect: Rect, row: &Ranked<'_, A>, active: bool, snap: f3
                 avatar.fill,
                 if active { 1.0 } else { 0.7 },
             ),
-            // An inline SVG, so it moves with the panel's snap, as the tick does.
             None => exo_ui::paint_initial_avatar(
                 painter,
                 rect,
@@ -1520,34 +1366,26 @@ fn paint_row<A>(ui: &Ui, rect: Rect, row: &Ranked<'_, A>, active: bool, snap: f3
         }
         x += AVATAR - 2.0 + 10.0;
     }
-    let title = title_galley(ui, row, color, title_width(ui, row));
-    if let Some(description) = &command.description {
-        // The description: the rest of the line, ellipsized, 35% white (70% on the active row),
-        // `top: 3px` to the title's 2px, which lands its line where the title's is (measured).
-        // Chromium counts the title's letter spacing after its last letter too.
-        let left = x + title.size().x + TITLE_LETTER_SPACING + DESCRIPTION_GAP;
-        let width = x + title_width(ui, row) - left;
-        if width > 0.0 {
-            let ink = Color32::WHITE.gamma_multiply(if active { 0.7 } else { 0.35 });
-            SIDE.paint_line(
-                painter,
-                Pos2::new(left, content_top + 1.0),
-                description,
-                ink,
-                Some(width),
-            );
-        }
+    if let Some((desc_offset, desc_galley)) = &laid.description {
+        let ink = Color32::WHITE.gamma_multiply(if active { 0.7 } else { 0.35 });
+        paint_text(
+            painter,
+            Pos2::new(x + desc_offset, content_top + 1.0),
+            tint_galley(desc_galley, ink),
+            &SIDE,
+        );
     }
-    paint_text(painter, Pos2::new(x, content_top + 1.0), title, &TITLE);
+    paint_text(
+        painter,
+        Pos2::new(x, content_top + 1.0),
+        tint_galley(&laid.title, color),
+        &TITLE,
+    );
 
     // Right side, right-aligned at the gutter.
     let right = rect.right() - GUTTER;
-    let mut meta_left = right - meta_width(ui, command);
+    let mut meta_left = right - laid.meta_width;
     if command.in_use {
-        // The tick: a 14×11 background SVG, `M1 5.142L4.858 9l7.587-7.587` stroked 2px white,
-        // `top: 6px`. Unlike the icons it moves with the panel's snap (measured). Its background
-        // lands on the whole px left of a fractional box (measured with keys after it, which make
-        // the box start off the pixel).
         let tick = Pos2::new(meta_left.floor(), content_top + 6.0);
         let points =
             [[1.0, 5.142], [4.858, 9.0], [12.445, 1.413]].map(|[x, y]| tick + Vec2::new(x, y));
@@ -1557,30 +1395,21 @@ fn paint_row<A>(ui: &Ui, rect: Rect, row: &Ranked<'_, A>, active: bool, snap: f3
         ));
         meta_left += 14.0;
     }
-    if let Some(side) = &command.side_title {
-        SIDE.paint_line(
+    if let Some(side_galley) = &laid.side {
+        paint_text(
             painter,
             Pos2::new(meta_left + 32.0, content_top + 1.0),
-            side,
-            color,
-            None,
+            tint_galley(side_galley, color),
+            &SIDE,
         );
         return;
     }
-    let keys = command.display_keys();
-    if !keys.is_empty() {
-        // The caps' labels take the row's color.
-        let keycaps = Keycaps::new(
-            ui.ctx(),
-            &keys,
-            KeycapColors {
-                text: color,
-                divider: color,
-                ..KeycapColors::base(tokens)
-            },
-        );
-        // After a tick the caps are 4px further right and 1px lower, because the tick's box
-        // lowers the line (measured in the Accounts palette).
+    if let Some(base_caps) = &laid.keycaps {
+        let keycaps = base_caps.with_colors(KeycapColors {
+            text: color,
+            divider: color,
+            ..KeycapColors::base(tokens)
+        });
         let (gap, drop) = if command.in_use {
             (4.0, 1.0)
         } else {
@@ -1638,4 +1467,370 @@ fn paint_key_hint(painter: &Painter, line_top_left: Pos2, label: &str) -> f32 {
         None,
     );
     width - 2.0
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{RawInput, pos2, vec2};
+
+    use super::*;
+
+    #[test]
+    fn hovering_a_sub_palette_footer_command_highlights_it_so_enter_runs_it() {
+        let ctx = Context::default();
+        exo_ui::install(&ctx).expect("the system fonts load");
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0));
+        let mut palette = Palette::<&'static str>::new();
+        let sub = SubPalette::new(
+            "LABEL",
+            "Add label",
+            "data/label",
+            vec![
+                Command::new("ONE", "Alpha", "alpha"),
+                Command::new("TWO", "Beta", "beta"),
+            ],
+        )
+        .footer(|_| Some(Command::new("CREATE", "Create label", "create")));
+        palette.open_sub(sub);
+
+        // Initial pass + sizing settle pass: highlight starts on row 0 (`Alpha`).
+        for pos in [pos2(10.0, 10.0), pos2(12.0, 10.0)] {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(area),
+                    events: vec![Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = palette.show(ui.ctx(), area, &[]);
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(0)
+        );
+
+        // Panel top = 800/2 - 199 = 201; list top = 201 + 16 + 36 + 80 = 333;
+        // 2 rows (60 + 52 + 8 = 120) => footer starts at y = 453 (`454..513`).
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(area),
+                events: vec![Event::PointerMoved(pos2(640.0, 480.0))],
+                ..Default::default()
+            },
+            |ui| {
+                let _ = palette.show(ui.ctx(), area, &[]);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(2),
+            "moving over FooterRow::Command updates highlight to rows.len()"
+        );
+
+        let mut ran = None;
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(area),
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                ran = palette.show(ui.ctx(), area, &[]).map(|r| r.action);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(ran, Some("create"));
+    }
+
+    fn key_press(key: Key, modifiers: Modifiers) -> Vec<Event> {
+        vec![
+            Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ]
+    }
+
+    fn step_palette<A: Clone>(
+        ctx: &Context,
+        area: Rect,
+        palette: &mut Palette<A>,
+        main: &[&Command<A>],
+        events: Vec<Event>,
+    ) -> (Option<A>, Vec<String>) {
+        let mut ran = None;
+        let output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(area),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                ran = palette.show(ui.ctx(), area, main).map(|r| r.action);
+            },
+        );
+        let texts = painted_texts(&output.shapes);
+        output.drop_without_applying_deltas();
+        (ran, texts)
+    }
+
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn run_only_selects_footer_at_exact_rows_len() {
+        let first = Command::new("ONE", "One", "one");
+        let second = Command::new("TWO", "Two", "two");
+        let rows = [Ranked::unranked(&first), Ranked::unranked(&second)];
+        let footer = FooterRow::Command(Box::new(Command::new("FOOTER", "Footer", "footer")));
+
+        assert_eq!(run(&rows, Some(&footer), 0).map(|c| c.action), Some("one"));
+        assert_eq!(run(&rows, Some(&footer), 1).map(|c| c.action), Some("two"));
+        assert_eq!(
+            run(&rows, Some(&footer), 2).map(|c| c.action),
+            Some("footer"),
+            "exact rows.len() selects the footer command"
+        );
+        assert!(
+            run(&rows, Some(&footer), 3).is_none(),
+            "out-of-bounds highlight past rows.len() must not run the footer"
+        );
+        assert!(run(&rows, Some(&footer), 99).is_none());
+
+        let empty: [Ranked<'_, &str>; 0] = [];
+        assert_eq!(
+            run(&empty, Some(&footer), 0).map(|c| c.action),
+            Some("footer")
+        );
+        assert!(run(&empty, Some(&footer), 1).is_none());
+    }
+
+    #[test]
+    fn dropdown_switch_shrinking_rows_clamps_highlight_and_does_not_run_footer() {
+        let ctx = Context::default();
+        ctx.set_os(OperatingSystem::Mac);
+        exo_ui::install(&ctx).expect("the system fonts load");
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0));
+        let cmd_shift = Modifiers::MAC_CMD
+            .plus(Modifiers::COMMAND)
+            .plus(Modifiers::SHIFT);
+
+        let make_sub = || {
+            let dropdown = Dropdown::new(vec!["many", "few"], 0, "mod+shift+l");
+            SubPalette::ordered_with(
+                "DROPDOWN_TEST",
+                "Pick option",
+                "data/snooze",
+                dropdown,
+                |_, choice| {
+                    if choice == 0 {
+                        vec![
+                            Command::new("ONE", "One", "one"),
+                            Command::new("TWO", "Two", "two"),
+                            Command::new("THREE", "Three", "three"),
+                            Command::new("FOUR", "Four", "four"),
+                        ]
+                    } else {
+                        vec![Command::new("ONLY", "Only", "only")]
+                    }
+                },
+            )
+            .footer(|_| Some(Command::new("FOOTER", "Footer action", "footer")))
+        };
+
+        let mut palette = Palette::<&'static str>::new();
+        palette.open_sub(make_sub());
+        step_palette(&ctx, area, &mut palette, &[], Vec::new());
+
+        // Move highlight to row 3 (`Four`), past the shrunk choice's row + footer count (2).
+        for _ in 0..3 {
+            step_palette(
+                &ctx,
+                area,
+                &mut palette,
+                &[],
+                key_press(Key::ArrowDown, Modifiers::NONE),
+            );
+        }
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(3)
+        );
+
+        // Cycle dropdown to `"few"` (1 row + 1 footer = count 2): highlight resets/clamps inside
+        // valid rows and does not accidentally select the footer.
+        step_palette(&ctx, area, &mut palette, &[], key_press(Key::L, cmd_shift));
+        let open = palette.open.as_ref().expect("palette remains open");
+        assert_eq!(open.state.dropdown.choice, 1);
+        assert_eq!(open.state.highlight, 0);
+
+        let (ran, _) = step_palette(
+            &ctx,
+            area,
+            &mut palette,
+            &[],
+            key_press(Key::Enter, Modifiers::NONE),
+        );
+        assert_eq!(
+            ran,
+            Some("only"),
+            "Enter after shrinking rows must run the highlighted row, not the footer"
+        );
+
+        // Explicitly highlighting the footer after switching still runs the footer on Enter.
+        palette.open_sub(make_sub());
+        step_palette(&ctx, area, &mut palette, &[], Vec::new());
+        step_palette(&ctx, area, &mut palette, &[], key_press(Key::L, cmd_shift));
+        step_palette(
+            &ctx,
+            area,
+            &mut palette,
+            &[],
+            key_press(Key::ArrowDown, Modifiers::NONE),
+        );
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(1),
+            "ArrowDown explicitly moves highlight onto the footer at rows.len()"
+        );
+        let (ran, _) = step_palette(
+            &ctx,
+            area,
+            &mut palette,
+            &[],
+            key_press(Key::Enter, Modifiers::NONE),
+        );
+        assert_eq!(ran, Some("footer"));
+
+        // Shrinking candidate rows without a dropdown change also clamps highlight to count - 1.
+        let commands = [
+            Command::new("A", "Alpha", "alpha").default_score(4.0),
+            Command::new("B", "Beta", "beta").default_score(3.0),
+            Command::new("C", "Gamma", "gamma").default_score(2.0),
+            Command::new("D", "Delta", "delta").default_score(1.0),
+        ];
+        let four: Vec<_> = commands.iter().collect();
+        let two: Vec<_> = commands[..2].iter().collect();
+        palette.open_main(None);
+        step_palette(&ctx, area, &mut palette, &four, Vec::new());
+        for _ in 0..3 {
+            step_palette(
+                &ctx,
+                area,
+                &mut palette,
+                &four,
+                key_press(Key::ArrowDown, Modifiers::NONE),
+            );
+        }
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(3)
+        );
+        step_palette(&ctx, area, &mut palette, &two, Vec::new());
+        assert_eq!(
+            palette.open.as_ref().map(|open| open.state.highlight),
+            Some(1),
+            "highlight clamps to count.saturating_sub(1) when rows shrink"
+        );
+    }
+
+    #[test]
+    fn escape_clearing_query_resets_scroll_and_immediately_renders_updated_rows() {
+        let ctx = Context::default();
+        ctx.set_os(OperatingSystem::Mac);
+        exo_ui::install(&ctx).expect("the system fonts load");
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0));
+
+        let mut rows = vec![Command::new("ALPHA", "Alpha", "alpha")];
+        for i in 1..=8 {
+            rows.push(Command::new(
+                format!("ITEM_{i}"),
+                format!("Item {i}"),
+                "item",
+            ));
+        }
+
+        let mut palette = Palette::<&'static str>::new();
+        palette
+            .open_sub(SubPalette::new("ESCAPE_TEST", "Choose", "data/label", rows).initial("item"));
+        step_palette(&ctx, area, &mut palette, &[], Vec::new());
+
+        // Move down past the 244px list viewport so `state.scroll > 0.0` while filtered to "item".
+        let mut texts = Vec::new();
+        for _ in 0..6 {
+            (_, texts) = step_palette(
+                &ctx,
+                area,
+                &mut palette,
+                &[],
+                key_press(Key::ArrowDown, Modifiers::NONE),
+            );
+        }
+        let open = palette.open.as_ref().expect("palette open");
+        assert_eq!(open.state.query, "item");
+        assert_eq!(open.state.highlight, 6);
+        assert!(
+            open.state.scroll > 0.0,
+            "list scrolled down while moving through filtered rows"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Alpha"),
+            "pre-Escape frame only renders rows matching the query"
+        );
+
+        // Single Escape frame clears query, resets scroll, and paints the full unfiltered list
+        // immediately on that same frame.
+        let (ran, texts) = step_palette(
+            &ctx,
+            area,
+            &mut palette,
+            &[],
+            key_press(Key::Escape, Modifiers::NONE),
+        );
+        assert!(ran.is_none());
+        let open = palette.open.as_ref().expect("Escape only cleared query");
+        assert!(open.state.query.is_empty());
+        assert_eq!(open.state.highlight, 0);
+        assert_eq!(open.state.scroll, 0.0);
+        assert!(
+            texts.iter().any(|text| text == "Alpha"),
+            "Escape frame immediately renders recomputed unfiltered rows, got {texts:?}"
+        );
+    }
 }

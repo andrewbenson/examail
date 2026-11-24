@@ -97,24 +97,32 @@ impl Store {
     /// On database failures.
     pub async fn address_book(&self) -> Result<Vec<ScoredContact>> {
         let mut db = self.inner.db.clone();
-        let rows = MessageRow::all().exec(&mut db).await?;
+        let fields = MessageRow::fields();
+        let rows = MessageRow::all()
+            .select((
+                fields.internal_date(),
+                fields.label_ids(),
+                fields.sender(),
+                fields.to(),
+                fields.cc(),
+                fields.bcc(),
+            ))
+            .exec(&mut db)
+            .await?;
         let mut people: HashMap<String, Person> = HashMap::new();
-        for row in rows {
-            let labels = &row.label_ids;
+        for (internal_date, labels, sender, to, cc, bcc) in rows {
             if labels.iter().any(|label| label == DRAFT || label == SPAM) {
                 continue;
             }
             let sent = labels.iter().any(|label| label == SENT);
             let credited: Vec<&crate::db::Mailbox> = if sent {
-                row.to
-                    .0
-                    .iter()
-                    .chain(&row.cc.0)
-                    .chain(&row.bcc.0)
-                    .chain(row.sender.0.as_ref())
+                to.0.iter()
+                    .chain(&cc.0)
+                    .chain(&bcc.0)
+                    .chain(sender.0.as_ref())
                     .collect()
             } else {
-                row.sender.0.iter().collect()
+                sender.0.iter().collect()
             };
             for mailbox in credited {
                 let key = mailbox.email.to_lowercase();
@@ -127,14 +135,14 @@ impl Store {
                     && person
                         .name
                         .as_ref()
-                        .is_none_or(|(at, _)| *at <= row.internal_date)
+                        .is_none_or(|(at, _)| *at <= internal_date)
                 {
-                    person.name = Some((row.internal_date, name.clone()));
+                    person.name = Some((internal_date, name.clone()));
                 }
                 if sent {
-                    person.sent.add(row.internal_date);
+                    person.sent.add(internal_date);
                 } else {
-                    person.received.add(row.internal_date);
+                    person.received.add(internal_date);
                 }
             }
         }

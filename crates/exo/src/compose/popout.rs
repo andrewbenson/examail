@@ -237,7 +237,7 @@ impl crate::Mail {
             && self.compose.alert.is_none()
             && !self.compose.palette_open;
         let thread_people = self.compose.thread_people.as_ref().map(|(_, index)| index);
-        let book = self.compose.book.as_ref().map(|(_, index)| index);
+        let book = self.compose.book.as_ref().map(|(_, index)| index.as_ref());
         let Some(open) = self.compose.drafts.iter_mut().find(|open| open.id == id) else {
             self.compose.popped = None;
             return;

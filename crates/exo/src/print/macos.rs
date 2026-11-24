@@ -78,9 +78,18 @@ const SCHEMES: [&str; 4] = [document::SCHEME, "exo-https", "exo-http", "cid"];
 thread_local! {
     /// Print jobs under way, which hold their web views, windows and delegates.
     static JOBS: RefCell<Vec<Job>> = const { RefCell::new(Vec::new()) };
+    /// Print jobs waiting on the account's `RemoteContentBlocking` setting before building HTML.
+    static PENDING: RefCell<HashMap<u64, PendingJob>> = RefCell::new(HashMap::new());
     /// Loads under way, by id, until they finish or WebKit stops them.
     static TASKS: RefCell<HashMap<u64, Retained<ProtocolObject<dyn WKURLSchemeTask>>>> = RefCell::new(HashMap::new());
     static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+struct PendingJob {
+    printout: Printout,
+    loader: Loader,
+    destination: Destination,
+    done: Option<Done>,
 }
 
 fn next_id() -> u64 {
@@ -168,14 +177,84 @@ pub(super) fn print(
         return;
     };
     let id = next_id();
+    if let Some(block_drafts) = printout.blocks_draft_remote_content() {
+        start_print(mtm, id, printout, loader, destination, done, block_drafts);
+        return;
+    }
+    let settings_loader = loader.clone();
+    PENDING.with(|pending| {
+        pending.borrow_mut().insert(
+            id,
+            PendingJob {
+                printout,
+                loader,
+                destination,
+                done,
+            },
+        );
+    });
+    settings_loader.run(
+        |store| async move {
+            match store.settings::<exo_store::Settings>().await {
+                Ok(settings) => {
+                    settings.remote_content_blocking == Some(exo_store::RemoteContentBlocking::All)
+                }
+                Err(error) => {
+                    log::warn!("printing: reading the images setting: {error}");
+                    // Fail closed so draft remote content isn't fetched when settings can't be read.
+                    true
+                }
+            }
+        },
+        move |block_drafts| {
+            dispatch2::DispatchQueue::main().exec_async(move || {
+                let Some(job) = PENDING.with(|pending| pending.borrow_mut().remove(&id)) else {
+                    return;
+                };
+                let Some(mtm) = MainThreadMarker::new() else {
+                    if let Some(done) = job.done {
+                        done(false);
+                    }
+                    return;
+                };
+                start_print(
+                    mtm,
+                    id,
+                    job.printout,
+                    job.loader,
+                    job.destination,
+                    job.done,
+                    block_drafts,
+                );
+            });
+        },
+    );
+}
+
+fn start_print(
+    mtm: MainThreadMarker,
+    id: u64,
+    printout: Printout,
+    loader: Loader,
+    destination: Destination,
+    done: Option<Done>,
+    block_drafts: bool,
+) {
     let page = match destination {
         Destination::Panel => default_page(),
         Destination::Pdf(_) => Page::LETTER,
     };
     let conversation = printout.on(page);
-    let html = document::html(&conversation);
+    let rendered = document::html(&conversation, block_drafts);
     let inline = crate::body::fetch::by_content_id(conversation.inline.clone());
-    let handler = Handler::new(mtm, Loads { loader, inline });
+    let handler = Handler::new(
+        mtm,
+        Loads {
+            loader,
+            inline,
+            allow_remote: rendered.allow_remote,
+        },
+    );
     let printer = Printer::new(
         mtm,
         Printing {
@@ -184,6 +263,7 @@ pub(super) fn print(
             title: conversation.title,
             page: Cell::new(page),
             printout,
+            block_drafts,
             operation: RefCell::new(None),
             done: Cell::new(done),
         },
@@ -237,7 +317,7 @@ pub(super) fn print(
     window.setContentView(Some(&web_view));
     // SAFETY: the delegate is kept alive in `JOBS` for as long as the view is.
     unsafe { web_view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*printer))) };
-    load(&web_view, &html);
+    load(&web_view, &rendered.html);
     JOBS.with(|jobs| {
         jobs.borrow_mut().push(Job {
             id,
@@ -303,6 +383,8 @@ struct Printing {
     page: Cell<Page>,
     /// The conversation, to lay out again for new paper.
     printout: Printout,
+    /// Whether open drafts block remote content for this job.
+    block_drafts: bool,
     /// The operation, once it runs.
     operation: RefCell<Option<Retained<NSPrintOperation>>>,
     done: Cell<Option<Done>>,
@@ -456,7 +538,10 @@ impl Printer {
         let page = page(paper);
         if page != printing.page.get() {
             printing.page.set(page);
-            load(web_view, &document::html(&printing.printout.on(page)));
+            load(
+                web_view,
+                &document::html(&printing.printout.on(page), printing.block_drafts).html,
+            );
         }
     }
 
@@ -492,6 +577,8 @@ struct Loads {
     loader: Loader,
     /// The thread's inline attachments, by lower-cased `Content-ID`.
     inline: HashMap<String, Attachment>,
+    /// Whether this print job permits `exo-http:` / `exo-https:` fetches at all.
+    allow_remote: bool,
 }
 
 define_class!(
@@ -515,7 +602,7 @@ define_class!(
             let id = next_id();
             TASKS.with(|tasks| tasks.borrow_mut().insert(id, task.retain()));
             let loads = self.ivars();
-            match super::resource(&url, &loads.inline) {
+            match super::resource(&url, &loads.inline, loads.allow_remote) {
                 Some(Resource::Font(bytes)) => {
                     respond(id, Some((bytes.to_vec(), "font/ttf".to_owned())))
                 }

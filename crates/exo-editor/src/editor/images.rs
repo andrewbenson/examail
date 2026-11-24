@@ -101,9 +101,10 @@ impl Editor {
     /// Forgets what the remote images loaded to, so they're asked for again. This is for when the
     /// Images setting changes or Show Images is asked for.
     pub fn reload_remote_images(&mut self) {
-        self.view
-            .pictures
-            .forget(|key| key.starts_with("http:") || key.starts_with("https:"));
+        self.view.pictures.forget(|key| {
+            super::starts_with_ignore_ascii_case(key, "http:")
+                || super::starts_with_ignore_ascii_case(key, "https:")
+        });
     }
 
     /// Puts the picture the draft keeps as inline attachment `cid` at the caret, over the
@@ -193,7 +194,7 @@ impl Editor {
         }
         self.set_selection(Selection::new(at, Pos::new(at.block, at.offset + 1)));
         self.image_focus = Some(at);
-        self.view.toolbar.reset();
+        self.close_toolbar();
         true
     }
 
@@ -255,7 +256,8 @@ impl Editor {
         self.view.pictures.natural(&source.key())
     }
 
-    /// Sets the focused image's width as Small or Best Fit do, then records an undo step.
+    /// Sets the focused image's width as Small or Best Fit do, recording an undo step around the
+    /// resize so undo restores the pre-resize width without dropping earlier edits.
     pub fn fit_image(&mut self, fit: Fit) {
         let Some(at) = self.focused_image() else {
             return;
@@ -270,6 +272,7 @@ impl Editor {
             Fit::Small if best < 32.0 => best,
             Fit::Small => best / 2.0,
         };
+        self.undo.save(&self.doc, self.selection);
         self.resize_focused(width);
         self.undo.record(&self.doc, self.selection, false);
     }

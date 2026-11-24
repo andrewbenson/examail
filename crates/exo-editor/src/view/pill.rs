@@ -1,6 +1,6 @@
 //! Autocorrect's marks and its suggestion pill on screen.
 
-use egui::{Area, Color32, CornerRadius, Order, Pos2, Rect, Sense, Ui, pos2, text::CCursor, vec2};
+use egui::{Area, Color32, CornerRadius, Order, Pos2, Rect, Sense, Ui, pos2, vec2};
 use exo_ui::{Family, Font, TextStyle, Theme};
 
 use super::{BlockLayout, BodyText};
@@ -87,30 +87,22 @@ pub(super) fn paint_annotation(
     } else {
         Color32::from_rgb(0xf6, 0x7b, 0x7b)
     };
-    let mut start = 0;
-    for (row_index, row) in view.galley.rows.iter().enumerate() {
-        let count = row.char_count_excluding_newline().0;
-        let (from, to) = (chars.start.max(start), chars.end.min(start + count));
-        if from < to {
-            let x0 = galley_origin.x + view.galley.pos_from_cursor(CCursor::new(from)).min.x;
-            let x1 = galley_origin.x + view.galley.pos_from_cursor(CCursor::new(to)).min.x;
-            let line = view.lines[row_index.min(view.lines.len() - 1)];
-            let bottom =
-                galley_origin.y + line.top + line.shift + body.content_top + body.content_height;
-            let width = x1 - x0;
-            let tiles = (width / TILE).round().max(1.0);
-            let tile = width / tiles;
-            let strip = Rect::from_x_y_ranges(x0..=x1, bottom - 3.0..=bottom - 1.0);
-            for at in 0..tiles as usize {
-                paint_dot(
-                    painter,
-                    pos2(x0 + 2.0 + at as f32 * tile, bottom - 2.0),
-                    strip,
-                    color,
-                );
-            }
+    for (line, x0, x1) in view.row_spans(chars) {
+        let (x0, x1) = (galley_origin.x + x0, galley_origin.x + x1);
+        let bottom =
+            galley_origin.y + line.top + line.shift + body.content_top + body.content_height;
+        let width = x1 - x0;
+        let tiles = (width / TILE).round().max(1.0);
+        let tile = width / tiles;
+        let strip = Rect::from_x_y_ranges(x0..=x1, bottom - 3.0..=bottom - 1.0);
+        for at in 0..tiles as usize {
+            paint_dot(
+                painter,
+                pos2(x0 + 2.0 + at as f32 * tile, bottom - 2.0),
+                strip,
+                color,
+            );
         }
-        start += row.char_count_including_newline().0;
     }
 }
 

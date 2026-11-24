@@ -1,9 +1,9 @@
 //! A new event's When: the typed text, read by the time parser as the calendar reads it, and its
 //! three suggestions, listed under the field and committed with Enter, Tab or a click.
 
-use egui::{Color32, CornerRadius, Rect, Sense, Ui, pos2, vec2};
-use exo_ui::{BoxShadow, Family, Font, TextStyle, Theme};
-use jiff::{SignedDuration, Timestamp, ToSpan, Zoned, tz::TimeZone};
+use egui::{Color32, Rect, Ui, pos2};
+use exo_ui::{AnchoredCard, AnchoredList, Family, Font, TextStyle, Theme};
+use jiff::{SignedDuration, Timestamp, Zoned, civil::Date, tz::TimeZone};
 
 use crate::time_suggest::{self, Options, ZoneTime};
 
@@ -218,68 +218,41 @@ impl When {
             .collect();
         zones.dedup();
         let many_zones = zones.len() > 1;
-        let mut clicked = None;
-        egui::Area::new(exo_ui::id(&ctx, "calendar-form-when-list"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(list.min)
-            .constrain(false)
-            .show(&ctx, |area| {
-                let painter = area.painter().clone();
-                let snapped = exo_ui::pixel_snap(list);
-                BoxShadow::new([0.0, 2.0], 8.0, 0.0, Color32::from_black_alpha(26)).paint(
-                    &painter,
-                    snapped,
-                    CornerRadius::same(4),
+        let out = AnchoredList::new(
+            exo_ui::id(&ctx, "calendar-form-when-list"),
+            list,
+            AnchoredCard::elevated(background, selected),
+        )
+        .padding(LIST_TOP + 1.0, LIST_BOTTOM - 1.0)
+        .highlighted(Some(self.selected))
+        .show_uniform(&ctx, self.choices.len(), ITEM, |painter, row, index| {
+            let choice = &self.choices[index];
+            let line = pos2(row.left() + padding, row.top() + 11.0);
+            let duration = duration_text(choice, many_zones, now);
+            let duration_width = SMALL.width(&ctx, &duration);
+            SMALL.paint_line(
+                painter,
+                pos2(row.right() - padding - duration_width, line.y),
+                &duration,
+                dim,
+                None,
+            );
+            let mut x = line.x;
+            let room = row.right() - padding - duration_width - 6.0;
+            for (segment, dimmed) in time_label(choice, now) {
+                x += SMALL.paint_line(
+                    painter,
+                    pos2(x, line.y),
+                    &segment,
+                    if dimmed { dim } else { text },
+                    Some((room - x).max(0.0)),
                 );
-                painter.rect_filled(snapped, CornerRadius::same(4), background);
-                for (index, choice) in self.choices.iter().enumerate() {
-                    let row = Rect::from_min_size(
-                        pos2(
-                            list.left(),
-                            list.top() + LIST_TOP + 1.0 + index as f32 * ITEM,
-                        ),
-                        vec2(list.width(), ITEM),
-                    );
-                    let hit = area
-                        .interact(
-                            row,
-                            exo_ui::id(area.ctx(), ("calendar-form-when-choice", index)),
-                            Sense::click(),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if hit.hovered() {
-                        self.selected = index;
-                    }
-                    if index == self.selected {
-                        painter.rect_filled(row, 0.0, selected);
-                    }
-                    let line = pos2(row.left() + padding, row.top() + 11.0);
-                    let duration = duration_text(choice, many_zones, now);
-                    let duration_width = SMALL.width(&ctx, &duration);
-                    SMALL.paint_line(
-                        &painter,
-                        pos2(row.right() - padding - duration_width, line.y),
-                        &duration,
-                        dim,
-                        None,
-                    );
-                    let mut x = line.x;
-                    let room = row.right() - padding - duration_width - 6.0;
-                    for (segment, dimmed) in time_label(choice, now) {
-                        x += SMALL.paint_line(
-                            &painter,
-                            pos2(x, line.y),
-                            &segment,
-                            if dimmed { dim } else { text },
-                            Some((room - x).max(0.0)),
-                        );
-                    }
-                    if hit.clicked() {
-                        clicked = Some(index);
-                    }
-                }
-            });
-        clicked
+            }
+        });
+        if let Some(hovered) = out.hovered {
+            self.selected = hovered;
+        }
+        out.pressed
     }
 }
 
@@ -326,18 +299,27 @@ struct Parts {
 }
 
 fn parts(start: &Zoned, end: &Zoned, all_day: bool, now: &Zoned) -> Parts {
-    let this_year = start.year() == now.year() && end.year() == now.year();
-    let date = |at: &Zoned| {
+    let last_day = if all_day {
+        end.date()
+            .yesterday()
+            .ok()
+            .filter(|day| *day >= start.date())
+            .unwrap_or_else(|| start.date())
+    } else {
+        end.date()
+    };
+    let this_year = start.year() == now.year() && last_day.year() == now.year();
+    let date = |day: Date| {
         let base = format!(
             "{}, {} {}",
-            at.strftime("%a"),
-            at.strftime("%b"),
-            crate::format::dates::ordinal(at.day())
+            day.strftime("%a"),
+            day.strftime("%b"),
+            crate::format::dates::ordinal(day.day())
         );
         if this_year {
             base
         } else {
-            format!("{base}, {}", at.year())
+            format!("{base}, {}", day.year())
         }
     };
     let other_day = start.date() != end.date();
@@ -346,20 +328,13 @@ fn parts(start: &Zoned, end: &Zoned, all_day: bool, now: &Zoned) -> Parts {
     } else {
         start.strftime("%-I:%M")
     };
-    let end_date = other_day.then(|| {
-        if all_day {
-            date(&end.checked_sub(1.day()).unwrap_or_else(|_| end.clone()))
-        } else {
-            date(end)
-        }
-    });
+    let end_date = other_day.then(|| date(last_day));
     Parts {
-        date: date(start),
+        date: date(start.date()),
         start_time: start_time.to_string(),
         end_time: end.strftime("%-I:%M %p").to_string(),
         end_date,
-        one_day: all_day
-            && end.timestamp().duration_since(start.timestamp()) == SignedDuration::from_hours(24),
+        one_day: all_day && start.date().tomorrow().ok() == Some(end.date()),
     }
 }
 
@@ -436,13 +411,6 @@ fn duration_text(choice: &Choice, many_zones: bool, now: &Zoned) -> String {
             abbreviation(now.time_zone(), choice.start.timestamp())
         );
     }
-    let millis = choice
-        .end
-        .timestamp()
-        .duration_since(choice.start.timestamp())
-        .as_millis() as f64;
-    // To one decimal place.
-    let round = |unit: f64| (millis / unit * 10.0).round() / 10.0;
     let plural = |count: f64, unit: &str| {
         let number = if count.fract() == 0.0 {
             format!("{}", count as i64)
@@ -451,32 +419,44 @@ fn duration_text(choice: &Choice, many_zones: bool, now: &Zoned) -> String {
         };
         format!("{number} {unit}{}", if count > 1.0 { "s" } else { "" })
     };
+    if choice.all_day {
+        let civil_days = f64::from(
+            choice
+                .start
+                .date()
+                .until(choice.end.date())
+                .map_or(1, |span| span.get_days())
+                .max(1),
+        );
+        let round_days = |unit: f64| (civil_days / unit * 10.0).round() / 10.0;
+        let (weeks, months, years) = (round_days(7.0), round_days(30.0), round_days(365.0));
+        return if civil_days < 7.0 {
+            if civil_days == 1.0 {
+                "all day".to_owned()
+            } else {
+                plural(civil_days, "day")
+            }
+        } else if weeks < 4.0 {
+            plural(weeks, "wk")
+        } else if months < 12.0 {
+            plural(months, "mo")
+        } else {
+            plural(years, "yr")
+        };
+    }
+    let millis = choice
+        .end
+        .timestamp()
+        .duration_since(choice.start.timestamp())
+        .as_millis() as f64;
+    // To one decimal place.
+    let round = |unit: f64| (millis / unit * 10.0).round() / 10.0;
     const MINUTE: f64 = 60_000.0;
-    const DAY: f64 = 24.0 * 60.0 * MINUTE;
-    let (minutes, hours, days, weeks, months, years) = (
-        round(MINUTE),
-        round(60.0 * MINUTE),
-        round(DAY),
-        round(7.0 * DAY),
-        round(30.0 * DAY),
-        round(365.0 * DAY),
-    );
+    let (minutes, hours) = (round(MINUTE), round(60.0 * MINUTE));
     if minutes < 60.0 {
         plural(minutes, "min")
-    } else if hours < 24.0 || !choice.all_day {
-        plural(hours, "hr")
-    } else if days < 7.0 {
-        if days == 1.0 {
-            "all day".to_owned()
-        } else {
-            plural(days, "day")
-        }
-    } else if weeks < 4.0 {
-        plural(weeks, "wk")
-    } else if months < 12.0 {
-        plural(months, "mo")
     } else {
-        plural(years, "yr")
+        plural(hours, "hr")
     }
 }
 
@@ -660,5 +640,32 @@ mod tests {
             label(&choice("2026-11-21T00:00", true)),
             "Wed, Nov 18th – Fri, Nov 20th"
         );
+
+        // 23-hour spring-forward day (2026-03-08) and 25-hour fall-back day (2026-11-01) in
+        // America/New_York remain single-day `(all day)`.
+        for (start_str, end_str, expected_when) in [
+            (
+                "2026-03-08T00:00",
+                "2026-03-09T00:00",
+                "Sun, Mar 8th (all day)",
+            ),
+            (
+                "2026-11-01T00:00",
+                "2026-11-02T00:00",
+                "Sun, Nov 1st (all day)",
+            ),
+        ] {
+            let dst_choice = Choice {
+                start: at(start_str),
+                end: at(end_str),
+                all_day: true,
+                zone: None,
+            };
+            assert_eq!(duration_text(&dst_choice, false, &now), "all day");
+            assert_eq!(
+                when_text(&dst_choice.start, &dst_choice.end, true, &now),
+                expected_when
+            );
+        }
     }
 }

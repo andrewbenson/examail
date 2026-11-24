@@ -9,19 +9,17 @@
 //! as its file. A message's text selects and ⌘C copies it, its links open and its body scrolls
 //! under the header.
 
-use std::sync::mpsc;
-
 use egui::{
     Color32, ColorImage, Context, CornerRadius, Mesh, Order, Painter, Pos2, Rect, Sense, Shape,
     Stroke, TextureHandle, TextureOptions, Ui, Vec2, pos2, text::LayoutJob, vec2,
 };
 use exo_commands::{Command, Commands, Region};
-use exo_store::{Attachment, Contact, MessageDetail};
+use exo_store::{Attachment, Contact, MessageDetail, RemoteContentBlocking};
 use exo_ui::{BoxShadow, Family, Font, TextStyle, motion};
 
 use super::eml::{self, Eml};
-use crate::account::Loader;
-use crate::body::{Bodies, Event, Granularity, Hit, Look};
+use crate::account::{Loader, UiTasks};
+use crate::body::{Bodies, Event, Hit, Look, PointerArea, PointerState};
 
 /// What the viewer's keys and clicks ask for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,14 +145,6 @@ enum Item {
     Unreadable,
 }
 
-/// What a fetch for the viewer came back with.
-enum Loaded {
-    Image(ColorImage, Vec2, bool),
-    Eml(Box<Eml>),
-    Failed { offline: bool },
-    Unreadable,
-}
-
 /// The viewer, open over some files.
 pub(crate) struct Viewer {
     attachments: Vec<Attachment>,
@@ -176,57 +166,68 @@ pub(crate) struct Viewer {
     /// The messages' bodies, rendered as the thread's are, by a worker of the viewer's own.
     bodies: Bodies,
     rendered: Vec<String>,
-    loaded: Channel<(usize, Loaded)>,
+    tasks: UiTasks<[Item]>,
     /// The card's subject and header text, selectable.
     selection: exo_ui::TextSelection,
-    /// The last press in the body: when, where, and how many in a row (a double or triple
-    /// click).
-    clicks: Option<(f64, Pos2, u32)>,
-    /// Whether a drag in the body is selecting its text.
-    selecting: bool,
-    /// Whether ⌘ was held on the last click in the body. A link the click lands on then opens in
-    /// the background.
-    command_click: bool,
+    /// Multi-click, drag-selection and click-modifier state over the message body.
+    pointer: PointerState,
     /// The body's scrollbar.
     scrollbar: exo_ui::Scrollbar,
 }
 
-/// A channel's two ends.
-type Channel<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
-
 impl Viewer {
     /// Opens the viewer over `attachments` at the `start`th, and fetches every file's bytes at
-    /// once.
+    /// once. `images` sets how `.eml` previews handle remote content.
     pub(crate) fn open(
         ctx: &Context,
         loader: &Loader,
         attachments: Vec<Attachment>,
         start: usize,
+        images: RemoteContentBlocking,
         now: f64,
     ) -> Self {
-        let loaded = mpsc::channel();
+        let tasks = UiTasks::<[Item]>::default();
         for (at, attachment) in attachments.iter().enumerate() {
-            let (sender, ctx, is_eml) = (loaded.0.clone(), ctx.clone(), super::is_eml(attachment));
+            let (ui, ctx, is_eml) = (tasks.sender(ctx), ctx.clone(), super::is_eml(attachment));
             loader.attachment(attachment, move |bytes| {
                 // Decoding a photo takes a while, so it gets its own thread and leaves the
                 // account's tasks free.
                 std::thread::spawn(move || {
-                    let loaded = match bytes {
-                        Err(error) => Loaded::Failed {
-                            offline: matches!(error, exo_store::Error::Offline(_)),
-                        },
-                        Ok(bytes) if is_eml => eml::parse(&bytes)
-                            .map_or(Loaded::Unreadable, |eml| Loaded::Eml(Box::new(eml))),
-                        Ok(bytes) => decode(&bytes).map_or(
-                            Loaded::Failed { offline: false },
-                            |(image, size, opaque)| Loaded::Image(image, size, opaque),
+                    enum Outcome {
+                        Image(ColorImage, Vec2, bool),
+                        Item(Item),
+                    }
+                    let outcome = match bytes {
+                        Err(exo_store::Error::Offline(_)) => Outcome::Item(Item::Offline),
+                        Err(_) => Outcome::Item(Item::Loading),
+                        Ok(bytes) if is_eml => Outcome::Item(
+                            eml::parse(&bytes)
+                                .map_or(Item::Unreadable, |eml| Item::Eml(Box::new(eml))),
                         ),
+                        Ok(bytes) => decode(&bytes)
+                            .map_or(Outcome::Item(Item::Loading), |(image, size, opaque)| {
+                                Outcome::Image(image, size, opaque)
+                            }),
                     };
-                    let _ = sender.send((at, loaded));
-                    ctx.request_repaint();
+                    ui.send(move |items| {
+                        items[at] = match outcome {
+                            Outcome::Image(image, size, opaque) => Item::Image {
+                                texture: ctx.load_texture(
+                                    format!("exo-preview-{at}"),
+                                    image,
+                                    TextureOptions::LINEAR,
+                                ),
+                                size,
+                                opaque,
+                            },
+                            Outcome::Item(item) => item,
+                        };
+                    });
                 });
             });
         }
+        let mut bodies = Bodies::new(ctx).cleaned_only();
+        bodies.set_images(images);
         Self {
             items: attachments.iter().map(|_| Item::Loading).collect(),
             position: start.min(attachments.len().saturating_sub(1)),
@@ -239,15 +240,18 @@ impl Viewer {
             card: None,
             page: ctx.content_rect(),
             now: jiff::Zoned::now(),
-            bodies: Bodies::new(ctx).cleaned_only(),
+            bodies,
             rendered: Vec::new(),
-            loaded,
+            tasks,
             selection: exo_ui::TextSelection::default(),
-            clicks: None,
-            selecting: false,
-            command_click: false,
+            pointer: PointerState::default(),
             scrollbar: exo_ui::Scrollbar::default(),
         }
+    }
+
+    /// Follows the account's Images setting for `.eml` previews.
+    pub(crate) fn set_images(&mut self, images: RemoteContentBlocking) {
+        self.bodies.set_images(images);
     }
 
     /// The file shown.
@@ -325,28 +329,13 @@ impl Viewer {
         self.counter_at = now;
         self.selection.clear();
         self.bodies.clear_selection();
+        self.pointer.clear();
     }
 
     /// Takes in the files that arrived and hands the messages' bodies to the renderer. Returns the
     /// link a click in a body landed on, if any.
     fn poll(&mut self, ctx: &Context, loader: &Loader, account: &str) -> Option<Output> {
-        while let Ok((at, loaded)) = self.loaded.1.try_recv() {
-            self.items[at] = match loaded {
-                Loaded::Image(image, size, opaque) => Item::Image {
-                    texture: ctx.load_texture(
-                        format!("exo-preview-{at}"),
-                        image,
-                        TextureOptions::LINEAR,
-                    ),
-                    size,
-                    opaque,
-                },
-                Loaded::Eml(eml) => Item::Eml(eml),
-                Loaded::Failed { offline: true } => Item::Offline,
-                Loaded::Failed { offline: false } => Item::Loading,
-                Loaded::Unreadable => Item::Unreadable,
-            };
-        }
+        self.tasks.drain(&mut self.items);
         let messages: Vec<MessageDetail> = self
             .items
             .iter()
@@ -376,7 +365,7 @@ impl Viewer {
                 } => {
                     link = Some(Output::Link {
                         url: href,
-                        background: self.command_click,
+                        background: self.pointer.click_modifiers.command,
                     })
                 }
                 // At the scrollable's top, under its 19px of padding.
@@ -768,67 +757,21 @@ impl Viewer {
     /// thread.
     fn body_pointer(&mut self, ui: &Ui, id: &str, body: Rect, origin: Pos2) {
         let response = ui.interact(body, ui.id().with("preview-body"), Sense::click_and_drag());
-        let local = |at: Pos2| (at - origin).to_pos2();
-        match response.hover_pos() {
-            Some(at) => {
-                self.bodies.hover(id, local(at));
-                if matches!(self.bodies.hovered(id), Some(Hit::Link { .. })) {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-            }
-            None => self.bodies.unhover(id),
-        }
-        let (pressed, time) = ui.input(|input| (input.pointer.primary_pressed(), input.time));
-        if pressed && let Some(at) = response.hover_pos() {
-            let count = match self.clicks {
-                Some((then, place, count))
-                    if time - then < crate::thread::MULTI_CLICK_DELAY
-                        && place.distance(at) < crate::thread::MULTI_CLICK_DISTANCE =>
-                {
-                    (count + 1).min(3)
-                }
-                _ => 1,
-            };
-            self.clicks = Some((time, at, count));
-            let granularity = match count {
-                1 => None,
-                2 => Some(Granularity::Word),
-                _ => Some(Granularity::Paragraph),
-            };
-            if let Some(granularity) = granularity {
-                self.bodies.select_from(id, local(at), granularity);
-                self.selecting = true;
-                self.selection.clear();
-            }
-        }
-        let multi_click = self.clicks.is_some_and(|(.., count)| count > 1);
-        // A drag selects from where the button went down. After a double or triple click, the
-        // drag extends that word or paragraph instead.
-        if response.drag_started() && !multi_click {
-            self.selecting = false;
-            if let Some(at) = ui
-                .input(|input| input.pointer.press_origin())
-                .filter(|at| body.contains(*at))
-            {
-                self.bodies
-                    .select_from(id, local(at), Granularity::Character);
-                self.selecting = true;
-                self.selection.clear();
-            }
-        }
-        if response.dragged()
-            && self.selecting
-            && let Some(at) = response.interact_pointer_pos()
-        {
-            self.bodies.select_to(id, local(at));
-        }
-        if response.clicked()
-            && !multi_click
-            && let Some(at) = response.interact_pointer_pos()
-        {
-            self.bodies.clear_selection();
-            self.command_click = ui.input(|input| input.modifiers.command);
-            self.bodies.click(id, local(at));
+        let outcome = self.bodies.handle_pointer(
+            ui,
+            &response,
+            PointerArea {
+                id,
+                body,
+                origin,
+                pointer: response.hover_pos(),
+                context_menu: false,
+            },
+            &mut self.pointer,
+            |_| false,
+        );
+        if outcome.started_selection {
+            self.selection.clear();
         }
     }
 
@@ -896,7 +839,9 @@ impl Viewer {
             Color32::WHITE.gamma_multiply(fade),
         );
         // The file's type and name: `margin: 0 auto; padding: 12px`, between the two.
-        let kind = extension(&attachment.filename).to_uppercase();
+        let kind = super::extension(&attachment.filename)
+            .map(|extension| extension.to_uppercase())
+            .unwrap_or_default();
         let name = name_shown(&attachment.filename);
         let kind_width = if kind.is_empty() {
             0.0
@@ -1129,22 +1074,14 @@ fn header_value(
         };
         job.append(&date, 0.0, HEADER_ROW.format(light));
     }
-    for (n, contact) in contacts.iter().enumerate() {
-        if n > 0 {
-            job.append(", ", 0.0, HEADER_ROW.format(dark));
-        }
-        match &contact.name {
-            Some(name) => {
-                job.append(name, 0.0, HEADER_ROW.format(dark));
-                job.append(
-                    &format!(" <{}>", contact.email),
-                    0.0,
-                    HEADER_ROW.format(light),
-                );
-            }
-            None => job.append(&contact.email, 0.0, HEADER_ROW.format(dark)),
-        }
-    }
+    crate::thread::append_contacts(
+        &mut job,
+        contacts.iter().copied(),
+        &HEADER_ROW,
+        dark,
+        light,
+        dark,
+    );
     let indent = if label.is_empty() { 0.0 } else { LABEL_WIDTH };
     lines(ctx, &job, width, indent)
 }
@@ -1202,20 +1139,14 @@ fn files_grid(count: usize, width: f32) -> Option<(usize, f32)> {
     ))
 }
 
-/// `filename`'s extension.
-fn extension(filename: &str) -> String {
-    filename
-        .rsplit_once('.')
-        .map(|(_, extension)| extension)
-        .filter(|extension| !extension.contains(' '))
-        .unwrap_or_default()
-        .to_owned()
-}
-
 /// The name the header shows: without its extension, cut at 75 characters with "…".
 fn name_shown(filename: &str) -> String {
     let stem = match filename.rsplit_once('.') {
-        Some((stem, extension)) if !extension.contains(' ') => stem,
+        Some((stem, extension))
+            if !extension.is_empty() && !extension.chars().any(char::is_whitespace) =>
+        {
+            stem
+        }
         _ => filename,
     };
     if stem.chars().count() <= 75 {
@@ -1348,7 +1279,10 @@ mod tests {
     #[test]
     fn the_header_names_the_file_without_its_extension() {
         assert_eq!(name_shown("millbrook-lake.png"), "millbrook-lake");
-        assert_eq!(extension("Room block confirmed.eml"), "eml");
+        assert_eq!(
+            super::super::extension("Room block confirmed.eml").as_deref(),
+            Some("eml")
+        );
         assert_eq!(
             name_shown(&format!("{}.pdf", "a".repeat(80))),
             format!("{}…", "a".repeat(75))

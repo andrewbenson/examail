@@ -459,6 +459,36 @@ fn changing_from_swaps_an_untouched_signature() {
     let mut edited = Editor::from_html(&html.replace("Hello from Maya", "Cheers"));
     assert!(!edited.switch_signature(id, &hello, &maya));
     assert!(edited.html().contains("Cheers"));
+
+    // Nested `<div>`s and a `<table>` inside a signature swap cleanly and keep the body caret.
+    let nested = outgoing::signature(
+        Some(
+            r#"<div dir="ltr"><div data-note="<div"><table><tbody><tr><td>Maya Okafor</td><td><div>Design</div></td></tr></tbody></table></div></div>"#,
+        ),
+        true,
+        Some(id),
+    );
+    let empty = outgoing::signature(None, true, Some(id));
+    let mut rich = run(&[Type("hi")]);
+    rich.reveal_quoted(Some(&nested), Some(&quote()));
+    rich.set_selection(exo_editor::Selection::caret(exo_editor::Pos::new(0, 2)));
+    assert!(rich.switch_signature(id, &nested, &hello));
+    assert_eq!(
+        rich.selection(),
+        exo_editor::Selection::caret(exo_editor::Pos::new(0, 2))
+    );
+    assert!(
+        rich.html().contains("Hello from Maya") && !rich.html().contains("<table"),
+        "{}",
+        rich.html()
+    );
+    assert!(rich.switch_signature(id, &hello, &empty));
+    assert!(rich.switch_signature(id, &empty, &nested));
+    assert!(
+        rich.html().contains("<table") && rich.html().contains("Maya Okafor"),
+        "{}",
+        rich.html()
+    );
 }
 
 #[test]

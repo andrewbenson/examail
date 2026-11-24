@@ -155,7 +155,10 @@ impl ThreadView {
                 && width <= SANDBOX_MAX_WIDTH
                 && content > WIDE_CONTENT
             {
-                self.wide.entry(item.id.clone()).or_insert(content);
+                self.scroll_state
+                    .wide
+                    .entry(item.id.clone())
+                    .or_insert(content);
             }
         }
     }
@@ -165,7 +168,7 @@ impl ThreadView {
         self.items
             .iter()
             .filter(|item| item.expanded)
-            .filter_map(|item| self.wide.get(&item.id).copied())
+            .filter_map(|item| self.scroll_state.wide.get(&item.id).copied())
             .reduce(f32::max)
     }
 
@@ -177,7 +180,7 @@ impl ThreadView {
             return layout.clone();
         };
         let item = &self.items[at];
-        match self.wide.get(&item.id) {
+        match self.scroll_state.wide.get(&item.id) {
             Some(width) if item.expanded => layout.sized(*width),
             _ if item.expanded => layout.clone(),
             _ => layout.sized(column.rows - 4.0 * layout.rem),
@@ -196,9 +199,10 @@ impl ThreadView {
     /// Scrolls the widened column `direction` steps sideways. Returns whether it moved. A column
     /// that isn't widened never does.
     pub fn scroll_sideways(&mut self, direction: isize) -> bool {
-        let to = (self.scroll_x + direction as f32 * STEP).clamp(0.0, self.max_scroll_x);
-        let moved = to != self.scroll_x;
-        self.scroll_x = to;
+        let to = (self.scroll_state.scroll_x + direction as f32 * STEP)
+            .clamp(0.0, self.scroll_state.max_scroll_x);
+        let moved = to != self.scroll_state.scroll_x;
+        self.scroll_state.scroll_x = to;
         moved
     }
 }

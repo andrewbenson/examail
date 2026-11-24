@@ -422,3 +422,74 @@ async fn filters_narrow_a_list_and_keep_sticky_rows() {
             .all(|thread| sent.contains(thread.id.as_str()))
     );
 }
+
+#[tokio::test]
+async fn recheck_strips_html_decodes_entities_includes_drafts_and_quotes_fts_keywords() {
+    let harness = Harness::synced().await;
+    // FTS5 keyword prefixes like `OR*` must not crash SQLite.
+    let _ = search(&harness, "OR*").await;
+    let _ = search(&harness, "AND* NOT* NEAR* label:OR* label:AND*").await;
+
+    // Deliver an HTML-only message where words sit across tags/entities and a style block holds
+    // CSS tokens that aren't visible text. Use a long message so the phrase falls outside the
+    // short FTS snippet and exercises `recheck` against `BodyRow`.
+    let filler = "alpha ".repeat(80);
+    let delivered = harness
+        .deliver(serde_json::json!({
+            "from": "Priya Raman <priya@brightmoor.co>",
+            "subject": "Quarterly Deck",
+            "html": format!(
+                "<style>.secretcssphrase {{ color: red; }}</style><div>{filler}<b>crystal</b> &amp; clear now</div>"
+            ),
+        }))
+        .await;
+    let thread_id = exo_store::ThreadId::new(delivered.thread_id.unwrap());
+    harness.store.sync().await.unwrap();
+    harness.store.load_bodies(&thread_id).await.unwrap();
+
+    // Phrase with entity + HTML tag boundary passes `recheck` once stripped/unescaped.
+    let hits = search(&harness, "\"crystal & clear\"").await;
+    assert!(
+        hits.results.iter().any(|r| r.thread.id == thread_id),
+        "decoded HTML text matches phrase"
+    );
+
+    // An unsaved editable reply draft on the thread is also visible to phrase `recheck`.
+    let record = exo_store::DraftRecord {
+        action: exo_store::DraftAction::Reply,
+        from: None,
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: "Re: Quarterly Deck".into(),
+        body: format!("<div>{filler}unsaved velvet giraffe note</div>"),
+        quoted_content: None,
+        quoted_inlined: false,
+        in_reply_to: None,
+        in_reply_to_rfc822: None,
+        references: Vec::new(),
+        rfc822_id: "draft-recheck@exo".into(),
+        fingerprint: String::new(),
+        attachments: Vec::new(),
+        send_later: None,
+        reminder: None,
+    };
+    harness
+        .store
+        .save_draft(exo_store::Draft {
+            id: "draft00000000000099".into(),
+            thread: Some(thread_id.clone()),
+            adopted: None,
+            record,
+            raw: String::new(),
+            complete: true,
+            sending: false,
+        })
+        .await
+        .unwrap();
+    let draft_hits = search(&harness, "\"velvet giraffe\"").await;
+    assert!(
+        draft_hits.results.iter().any(|r| r.thread.id == thread_id),
+        "editable draft phrase passes recheck"
+    );
+}

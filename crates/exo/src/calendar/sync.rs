@@ -195,8 +195,8 @@ enum Request {
     /// From the task fetching it: a guest's calendar over a time, `None` when it couldn't be
     /// reached.
     GuestLoaded(String, (Timestamp, Timestamp), Option<Option<Vec<Event>>>),
-    /// From the task fetching it: a thread's invite, if it has one.
-    InviteLoaded(String, Option<Vec<u8>>),
+    /// From the task fetching it: a thread's invite, tagged with its request sequence number.
+    InviteLoaded(u64, String, Option<Vec<u8>>),
     /// Panics the task, as a bug would.
     #[cfg(test)]
     Panic,
@@ -283,6 +283,7 @@ impl CalendarSync {
                     fetched: Vec::new(),
                     listed: None,
                     retry_at: None,
+                    invite: LatestInvite::default(),
                 };
                 task.run(receiver.clone(), resumed)
             }
@@ -469,6 +470,42 @@ fn token() -> u64 {
     getrandom::u64().unwrap_or_else(|_| Timestamp::now().as_nanosecond().unsigned_abs() as u64) >> 1
 }
 
+/// Tracks the latest invite request so out-of-order completions are ignored.
+#[derive(Default)]
+struct LatestInvite {
+    seq: u64,
+    thread: Option<String>,
+}
+
+impl LatestInvite {
+    fn start(&mut self, thread: &str) -> u64 {
+        self.seq = self.seq.wrapping_add(1);
+        self.thread = Some(thread.to_owned());
+        self.seq
+    }
+
+    fn matches(&self, seq: u64, thread: &str) -> bool {
+        self.seq == seq && self.thread.as_deref() == Some(thread)
+    }
+}
+
+/// Applies an invite fetch completion if it still matches the latest requested thread/sequence.
+fn apply_invite_loaded(
+    latest: &LatestInvite,
+    sender: &watch::Sender<Arc<Data>>,
+    seq: u64,
+    thread: String,
+    ics: Option<Vec<u8>>,
+) -> bool {
+    if !latest.matches(seq, &thread) {
+        return false;
+    }
+    let mut data = Data::clone(&sender.borrow());
+    data.invite = ics.map(|ics| (thread, ics));
+    sender.send_replace(Arc::new(data));
+    true
+}
+
 struct Task {
     store: Store,
     loader: Loader,
@@ -487,6 +524,8 @@ struct Task {
     listed: Option<Instant>,
     /// When the next queued change is due, once its hold or its backoff is over.
     retry_at: Option<Timestamp>,
+    /// The latest invite request, so stale fetches don't overwrite newer ones.
+    invite: LatestInvite,
 }
 
 /// Counts as busy until dropped.
@@ -605,6 +644,7 @@ impl Task {
                 }
                 self.shared.tokens().undone.remove(&token);
                 self.read().await;
+                self.flush(false).await;
             }
             Request::Busy(calendars, from, to) => {
                 match self.store.free_busy(&calendars, from, to).await {
@@ -622,7 +662,10 @@ impl Task {
                 self.flush(true).await;
                 let _ = done.send(());
             }
-            Request::Invite(thread) => self.load_invite(thread).await,
+            Request::Invite(thread) => {
+                let seq = self.invite.start(&thread);
+                self.load_invite(seq, thread).await;
+            }
             Request::Accounts { added } => {
                 if let Some(email) = &added {
                     self.list_account(email).await;
@@ -689,11 +732,10 @@ impl Task {
                     self.repaint.request();
                 }
             }
-            Request::InviteLoaded(thread, ics) => {
-                let mut data = Data::clone(&self.shared.data.borrow());
-                data.invite = ics.map(|ics| (thread, ics));
-                self.shared.data.send_replace(Arc::new(data));
-                self.repaint.request();
+            Request::InviteLoaded(seq, thread, ics) => {
+                if apply_invite_loaded(&self.invite, &self.shared.data, seq, thread, ics) {
+                    self.repaint.request();
+                }
             }
             #[cfg(test)]
             Request::Panic => panic!("a test panic in the calendar's task"),
@@ -723,8 +765,8 @@ impl Task {
     }
 
     /// Finds thread `id`'s invite in the store and fetches its `.ics` off the task. The bytes
-    /// come back as a request.
-    async fn load_invite(&self, id: String) {
+    /// come back as a request tagged with `seq`.
+    async fn load_invite(&self, seq: u64, id: String) {
         let detail = match self
             .store
             .thread(&exo_store::ThreadId::new(id.clone()))
@@ -745,7 +787,11 @@ impl Task {
         let shared = self.shared.clone();
         shared.busy.fetch_add(1, Ordering::SeqCst);
         let Some(attachment) = attachment else {
-            if self.requests.send(Request::InviteLoaded(id, None)).is_err() {
+            if self
+                .requests
+                .send(Request::InviteLoaded(seq, id, None))
+                .is_err()
+            {
                 shared.busy.fetch_sub(1, Ordering::SeqCst);
             }
             return;
@@ -753,7 +799,7 @@ impl Task {
         let requests = self.requests.clone();
         self.loader.attachment(&attachment, move |bytes| {
             if requests
-                .send(Request::InviteLoaded(id, bytes.ok()))
+                .send(Request::InviteLoaded(seq, id, bytes.ok()))
                 .is_err()
             {
                 shared.busy.fetch_sub(1, Ordering::SeqCst);
@@ -1024,21 +1070,23 @@ mod tests {
 
     const ME: &str = "maya@brightmoor.co";
 
-    /// An account on a new gmail-mock, its store in a folder of its own.
+    /// An account on fresh mock servers, its store in a folder of its own.
     fn account(
         name: &str,
     ) -> (
         tokio::runtime::Runtime,
-        gmail_mock::MockServer,
+        mock_servers::MockServer,
         gmail::Client,
         std::path::PathBuf,
         crate::account::Account,
     ) {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let server = runtime
-            .block_on(gmail_mock::MockServer::start(gmail_mock::Config::default()))
+            .block_on(mock_servers::MockServer::start(
+                mock_servers::Config::default(),
+            ))
             .expect("mock starts");
-        let tokens = Arc::new(gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()));
+        let tokens = Arc::new(gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()));
         let gmail = gmail::Client::new(server.endpoints(), tokens.as_ref().clone());
         let dir = std::env::temp_dir().join(format!("exo-calendar-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1172,5 +1220,70 @@ mod tests {
             .expect("lists");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(found.items.is_empty(), "Calendar never heard of it");
+    }
+
+    #[test]
+    fn stale_invite_loaded_does_not_overwrite_latest_thread_or_request() {
+        let (sender, receiver) = watch::channel(Arc::new(Data::default()));
+        let mut latest = LatestInvite::default();
+
+        let seq_a1 = latest.start("thread-a");
+        let seq_b = latest.start("thread-b");
+
+        // thread-b completes first and populates data.invite.
+        assert!(apply_invite_loaded(
+            &latest,
+            &sender,
+            seq_b,
+            "thread-b".into(),
+            Some(b"BEGIN:VCALENDAR-B".to_vec()),
+        ));
+        assert_eq!(
+            receiver.borrow().invite,
+            Some(("thread-b".into(), b"BEGIN:VCALENDAR-B".to_vec()))
+        );
+
+        // Stale thread-a completion arrives late (both Some and None) and must be ignored.
+        assert!(!apply_invite_loaded(
+            &latest,
+            &sender,
+            seq_a1,
+            "thread-a".into(),
+            Some(b"BEGIN:VCALENDAR-A".to_vec()),
+        ));
+        assert!(!apply_invite_loaded(
+            &latest,
+            &sender,
+            seq_a1,
+            "thread-a".into(),
+            None,
+        ));
+        assert_eq!(
+            receiver.borrow().invite,
+            Some(("thread-b".into(), b"BEGIN:VCALENDAR-B".to_vec())),
+            "stale thread-a response leaves thread-b intact"
+        );
+
+        // Switching back to thread-a starts a newer sequence; old seq_a1 is still rejected.
+        let seq_a2 = latest.start("thread-a");
+        assert!(apply_invite_loaded(
+            &latest,
+            &sender,
+            seq_a2,
+            "thread-a".into(),
+            Some(b"BEGIN:VCALENDAR-A2".to_vec()),
+        ));
+        assert!(!apply_invite_loaded(
+            &latest,
+            &sender,
+            seq_a1,
+            "thread-a".into(),
+            None,
+        ));
+        assert_eq!(
+            receiver.borrow().invite,
+            Some(("thread-a".into(), b"BEGIN:VCALENDAR-A2".to_vec())),
+            "stale request for same thread does not clobber newer response"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! The inbox rows Exo reads from its store after syncing gmail-mock's default mailbox, checked
+//! The inbox rows Exo reads from its store after syncing mock-servers' default mailbox, checked
 //! against the text they show at 1440×900: participants, subjects and snippets cut to the row's
 //! width, dates and separators.
 
@@ -16,13 +16,13 @@ const CENTER_WIDTH: f64 = 687.34;
 const FROM_LABEL_WIDTH: f64 = 185.8;
 
 async fn rows() -> Vec<String> {
-    let config = gmail_mock::Config::default();
+    let config = mock_servers::Config::default();
     let now = config.now.clone();
-    let server = gmail_mock::MockServer::start(config)
+    let server = mock_servers::MockServer::start(config)
         .await
         .expect("mock starts");
     let dir = std::env::temp_dir().join(format!("exo-inbox-rows-{}", std::process::id()));
-    let tokens = gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into());
+    let tokens = gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into());
     let store = exo_store::Store::open(&dir, "maya@brightmoor.co", server.endpoints(), tokens)
         .await
         .expect("store opens");

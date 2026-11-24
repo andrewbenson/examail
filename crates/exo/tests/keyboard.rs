@@ -1,4 +1,4 @@
-//! The app driven by keys (and the odd click), end to end: gmail-mock, a fresh store, the
+//! The app driven by keys (and the odd click), end to end: mock-servers, a fresh store, the
 //! commands, the toasts and their undo.
 
 mod support;

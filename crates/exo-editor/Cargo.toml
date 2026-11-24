@@ -13,10 +13,9 @@ egui = { workspace = true }
 exo-mail = { workspace = true }
 exo-ui = { workspace = true }
 getrandom = { workspace = true }
-html5ever = { workspace = true }
+icu_segmenter = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
-markup5ever_rcdom = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
 
@@ -24,3 +23,6 @@ url = { workspace = true }
 anyhow = { workspace = true }
 egui_kittest = { workspace = true }
 image = { workspace = true }
+
+[lints]
+workspace = true

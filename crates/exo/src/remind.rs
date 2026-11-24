@@ -587,7 +587,7 @@ impl Mail {
 mod tests {
     use super::*;
 
-    /// gmail-mock's now: Tuesday, November 17th 2026, 9:00 AM in New York.
+    /// mock-servers' now: Tuesday, November 17th 2026, 9:00 AM in New York.
     fn now() -> Zoned {
         "2026-11-17T09:00[America/New_York]".parse().expect("now")
     }

@@ -46,7 +46,7 @@ impl Endpoints {
         }
     }
 
-    /// Every service served from one origin, the way `gmail-mock` serves them.
+    /// Every service served from one origin, the way `mock-servers` serves them.
     #[must_use]
     pub fn mock(origin: &Url) -> Self {
         let at = |path: &str| {

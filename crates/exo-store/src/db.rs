@@ -7,13 +7,24 @@
 //! Changing a model here changes the schema, so files written before the change need a step in
 //! [`crate::migrations`], which says how.
 
+use std::borrow::Cow;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use toasty::codegen_support::core as toasty_core;
 use toasty::stmt::Value;
 use toasty::{Db, Executor, Json};
 use toasty_driver_sqlite::Sqlite;
+
+/// Maximum number of bound items per `IN (...)` query chunk, staying well below SQLite's
+/// default host parameter limit (999/32766).
+pub(crate) const IN_LIST_CHUNK: usize = 500;
+/// Milliseconds a SQLite connection waits on a busy lock before returning `SQLITE_BUSY`.
+const BUSY_TIMEOUT_MS: i64 = 5_000;
 
 use crate::error::{Error, Result};
 use crate::ids::ListId;
@@ -27,8 +38,6 @@ pub(crate) const HISTORY_ID: &str = "history_id";
 pub(crate) const IDENTITY: &str = "identity";
 /// Where the account's send-as aliases are kept in `kv`.
 pub(crate) const ALIASES: &str = "aliases";
-/// The draft messages Exo wrote, a JSON set in `kv`.
-pub(crate) const EXO_DRAFTS: &str = "exo_drafts";
 /// A JSON map in `kv` from each held send whose reminder is already on its thread to that
 /// reminder, so the thread's reminder is left alone when Gmail sends them.
 pub(crate) const GIVEN_REMINDERS: &str = "given_reminders";
@@ -94,12 +103,7 @@ pub(crate) struct MessageRow {
     pub has_attachments: bool,
 }
 
-/// A name and address from a header.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Mailbox {
-    pub name: Option<String>,
-    pub email: String,
-}
+pub(crate) use gmail::mime::Mailbox;
 
 #[derive(Debug, toasty::Model)]
 #[table = "attachments"]
@@ -234,6 +238,7 @@ pub(crate) struct DraftRow {
     #[key]
     pub id: String,
     /// The Gmail thread, once there is one.
+    #[index]
     pub thread_id: Option<String>,
     /// The Gmail draft, once created.
     pub gmail_id: Option<String>,
@@ -309,6 +314,7 @@ pub(crate) struct EventRow {
     /// Start and end, in epoch milliseconds. An all-day event's are the UTC midnights of its
     /// dates.
     pub start: i64,
+    #[index]
     pub end: i64,
     pub all_day: bool,
     #[column(type = text)]
@@ -324,8 +330,10 @@ pub(crate) struct CalendarChangeRow {
     #[auto]
     pub id: u64,
     /// What the caller queued it under, to take it back with.
+    #[index]
     pub token: u64,
     /// The event and its series, for one FIFO per event.
+    #[index]
     pub queue: String,
     #[column(type = text)]
     pub change: Json<crate::CalendarChange>,
@@ -455,16 +463,17 @@ async fn keep(db: &Db, old: &Path) {
         return log::error!("keeping nothing of the old database: {error}");
     }
     for table in KEPT_TABLES {
-        let columns = toasty::sql::query(r#"SELECT group_concat('"' || new.name || '"', ', ') FROM pragma_table_info(?1, 'main') new JOIN pragma_table_info(?1, 'old') old ON old.name = new.name"#)
-            .bind(table)
-            .exec(&mut connection)
-            .await;
-        let columns = match columns.as_deref() {
-            Ok([Value::Record(row)]) => match row.fields.first() {
-                Some(Value::String(columns)) => columns.clone(),
-                _ => continue,
+        let columns = query_rows::<(String,)>(
+            &mut connection,
+            toasty::sql::query(r#"SELECT group_concat('"' || new.name || '"', ', ') FROM pragma_table_info(?1, 'main') new JOIN pragma_table_info(?1, 'old') old ON old.name = new.name"#)
+                .bind(table),
+        )
+        .await;
+        let columns = match columns {
+            Ok(rows) => match rows.into_iter().next() {
+                Some((columns,)) => columns,
+                None => continue,
             },
-            Ok(_) => continue,
             Err(error) => {
                 log::error!("dropping the {table} the old database can't hand over: {error}");
                 continue;
@@ -512,11 +521,97 @@ fn remove(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Wraps `Sqlite` so every pooled connection configures `PRAGMA busy_timeout` upon opening.
+/// Unlike `journal_mode = WAL`, `busy_timeout` is per-connection in SQLite.
+#[derive(Debug)]
+struct BusySqlite {
+    inner: Sqlite,
+    schema: Arc<toasty_core::Schema>,
+}
+
+impl BusySqlite {
+    fn open(path: &Path) -> Self {
+        let schema = toasty_core::schema::Builder::new()
+            .build(
+                toasty_core::schema::app::Schema::default(),
+                &toasty_core::driver::Capability::SQLITE,
+            )
+            .expect("empty schema builds for SQLite");
+        Self {
+            inner: Sqlite::open(path),
+            schema: Arc::new(schema),
+        }
+    }
+}
+
+impl toasty_core::driver::Driver for BusySqlite {
+    fn url(&self) -> Cow<'_, str> {
+        self.inner.url()
+    }
+
+    fn capability(&self) -> &'static toasty_core::driver::Capability {
+        self.inner.capability()
+    }
+
+    fn connect<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        cx: &'life1 toasty_core::driver::ConnectContext,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = toasty::Result<Box<dyn toasty_core::driver::Connection>>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut conn = self.inner.connect(cx).await?;
+            conn.exec(
+                &self.schema,
+                toasty_core::driver::operation::Operation::RawSql(
+                    toasty_core::driver::operation::RawSql {
+                        sql: format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"),
+                        params: Vec::new(),
+                        ret: toasty_core::driver::operation::RawSqlRet::Infer,
+                    },
+                ),
+            )
+            .await?;
+            Ok(conn)
+        })
+    }
+
+    fn max_connections(&self) -> Option<usize> {
+        self.inner.max_connections()
+    }
+
+    fn generate_migration(
+        &self,
+        schema_diff: &toasty_core::schema::diff::Schema<'_>,
+    ) -> toasty_core::schema::db::Migration {
+        self.inner.generate_migration(schema_diff)
+    }
+
+    fn reset_db<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn Future<Output = toasty::Result<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.reset_db()
+    }
+}
+
 /// Connects to the file at `path` as it is, neither created nor upgraded.
 pub(crate) async fn connect(path: &Path) -> Result<Db> {
     let mut db = Db::builder()
         .models(toasty::models!(crate::*))
-        .build(Sqlite::open(path))
+        .build(BusySqlite::open(path))
         .await?;
     // WAL lets the UI read while sync writes. The mode is stored in the file, so every pooled
     // connection gets it.
@@ -526,27 +621,168 @@ pub(crate) async fn connect(path: &Path) -> Result<Db> {
     Ok(db)
 }
 
-/// Runs a query returning one integer.
-pub(crate) async fn query_i64(db: &mut dyn Executor, sql: &str) -> Result<i64> {
-    let rows = toasty::sql::query(sql).exec(db).await?;
-    Ok(match rows.first() {
-        Some(Value::Record(row)) => match row.fields.first() {
-            Some(Value::I64(value)) => *value,
-            _ => 0,
-        },
-        _ => 0,
-    })
+/// Extracts one typed column from a raw SQL [`Value`].
+pub(crate) trait FromSqlValue: Sized {
+    fn from_sql_value(value: Value) -> Option<Self>;
 }
 
-/// A query's first column, as text.
-pub(crate) fn strings(rows: Vec<Value>) -> impl Iterator<Item = String> {
-    rows.into_iter().filter_map(|row| match row {
-        Value::Record(row) => row.fields.into_iter().next().and_then(|value| match value {
+impl FromSqlValue for String {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
             Value::String(text) => Some(text),
             _ => None,
-        }),
-        _ => None,
-    })
+        }
+    }
+}
+
+impl FromSqlValue for i64 {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::I64(number) => Some(number),
+            _ => None,
+        }
+    }
+}
+
+impl FromSqlValue for u64 {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::U64(number) => Some(number),
+            Value::I64(number) => Self::try_from(number).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl FromSqlValue for u32 {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::U32(number) => Some(number),
+            Value::I64(number) => Self::try_from(number).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl FromSqlValue for jiff::Timestamp {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::Timestamp(ts) => Some(ts),
+            Value::String(text) => text.parse().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl<T: DeserializeOwned> FromSqlValue for Json<T> {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::String(text) => serde_json::from_str(&text).ok().map(Json),
+            _ => None,
+        }
+    }
+}
+
+impl FromSqlValue for bool {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::Bool(flag) => Some(flag),
+            Value::I64(number) => Some(number != 0),
+            _ => None,
+        }
+    }
+}
+
+impl<T: FromSqlValue> FromSqlValue for Option<T> {
+    fn from_sql_value(value: Value) -> Option<Self> {
+        match value {
+            Value::Null => Some(None),
+            other => T::from_sql_value(other).map(Some),
+        }
+    }
+}
+
+/// Extracts a positional tuple of columns from a raw SQL `Value::Record`.
+pub(crate) trait FromRecord: Sized {
+    fn from_record(fields: Vec<Value>) -> Option<Self>;
+}
+
+impl<A: FromSqlValue> FromRecord for (A,) {
+    fn from_record(fields: Vec<Value>) -> Option<Self> {
+        let [a]: [Value; 1] = fields.try_into().ok()?;
+        Some((A::from_sql_value(a)?,))
+    }
+}
+
+impl<A: FromSqlValue, B: FromSqlValue> FromRecord for (A, B) {
+    fn from_record(fields: Vec<Value>) -> Option<Self> {
+        let [a, b]: [Value; 2] = fields.try_into().ok()?;
+        Some((A::from_sql_value(a)?, B::from_sql_value(b)?))
+    }
+}
+
+impl<A: FromSqlValue, B: FromSqlValue, C: FromSqlValue> FromRecord for (A, B, C) {
+    fn from_record(fields: Vec<Value>) -> Option<Self> {
+        let [a, b, c]: [Value; 3] = fields.try_into().ok()?;
+        Some((
+            A::from_sql_value(a)?,
+            B::from_sql_value(b)?,
+            C::from_sql_value(c)?,
+        ))
+    }
+}
+
+impl<A: FromSqlValue, B: FromSqlValue, C: FromSqlValue, D: FromSqlValue> FromRecord
+    for (A, B, C, D)
+{
+    fn from_record(fields: Vec<Value>) -> Option<Self> {
+        let [a, b, c, d]: [Value; 4] = fields.try_into().ok()?;
+        Some((
+            A::from_sql_value(a)?,
+            B::from_sql_value(b)?,
+            C::from_sql_value(c)?,
+            D::from_sql_value(d)?,
+        ))
+    }
+}
+
+/// Decodes raw [`Value`] rows into typed records, skipping rows whose shape doesn't match `T`.
+pub(crate) fn decode_rows<T: FromRecord>(rows: Vec<Value>) -> Vec<T> {
+    rows.into_iter()
+        .filter_map(|row| match row {
+            Value::Record(record) => T::from_record(record.fields),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `stmt` and decodes its rows as `T`.
+pub(crate) async fn query_rows<T: FromRecord>(
+    exec: &mut dyn Executor,
+    stmt: toasty::sql::Query,
+) -> Result<Vec<T>> {
+    Ok(decode_rows(stmt.exec(exec).await?))
+}
+
+/// Runs `stmt` and extracts each row's single column as `T`.
+pub(crate) async fn query_col<T: FromSqlValue>(
+    exec: &mut dyn Executor,
+    stmt: toasty::sql::Query,
+) -> Result<Vec<T>> {
+    Ok(query_rows::<(T,)>(exec, stmt)
+        .await?
+        .into_iter()
+        .map(|(value,)| value)
+        .collect())
+}
+
+/// Runs a query returning one integer.
+pub(crate) async fn query_i64(db: &mut dyn Executor, sql: &str) -> Result<i64> {
+    Ok(query_rows::<(i64,)>(db, toasty::sql::query(sql))
+        .await?
+        .into_iter()
+        .next()
+        .map_or(0, |(value,)| value))
 }
 
 /// Reads a JSON value from `kv`.
@@ -601,4 +837,92 @@ pub(crate) async fn coverage(exec: &mut dyn Executor, list: &ListId) -> Result<O
             }
         })
         .min())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn query_rows_decodes_tuples_options_and_booleans() {
+        let dir = std::env::temp_dir().join(format!("exo-store-db-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = open(&dir.join("rows.sqlite3")).await.expect("opens");
+
+        let one = query_rows::<(String,)>(&mut db, toasty::sql::query("SELECT 'alpha'"))
+            .await
+            .expect("queries 1-tuple");
+        assert_eq!(one, vec![("alpha".to_owned(),)]);
+
+        let two = query_rows::<(i64, Option<i64>)>(
+            &mut db,
+            toasty::sql::query("SELECT 7, NULL UNION ALL SELECT 9, 42"),
+        )
+        .await
+        .expect("queries 2-tuple");
+        assert_eq!(two, vec![(7, None), (9, Some(42))]);
+
+        let three = query_rows::<(String, Option<String>, bool)>(
+            &mut db,
+            toasty::sql::query("SELECT 'm1', NULL, 0 UNION ALL SELECT 'm2', 'att1', 1"),
+        )
+        .await
+        .expect("queries 3-tuple");
+        assert_eq!(
+            three,
+            vec![
+                ("m1".to_owned(), None, false),
+                ("m2".to_owned(), Some("att1".to_owned()), true),
+            ]
+        );
+
+        let four = query_rows::<(String, String, Option<String>, i64)>(
+            &mut db,
+            toasty::sql::query("SELECT 'msg', '1.2', 'id9', 1024"),
+        )
+        .await
+        .expect("queries 4-tuple");
+        assert_eq!(
+            four,
+            vec![(
+                "msg".to_owned(),
+                "1.2".to_owned(),
+                Some("id9".to_owned()),
+                1024
+            )]
+        );
+
+        assert_eq!(FromSqlValue::from_sql_value(Value::Bool(true)), Some(true));
+        assert_eq!(
+            <Option<String> as FromSqlValue>::from_sql_value(Value::I64(5)),
+            None,
+            "mismatched column types do not coerce to None"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn every_pooled_connection_configures_busy_timeout() {
+        let dir =
+            std::env::temp_dir().join(format!("exo-store-busy-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir.join("busy.sqlite3")).await.expect("opens");
+        // Hold two distinct pooled connections simultaneously so the pool must open at least two.
+        let mut c1 = db.connection().await.expect("conn 1");
+        let mut c2 = db.connection().await.expect("conn 2");
+        assert_eq!(
+            query_i64(&mut c1, "PRAGMA busy_timeout").await.expect("p1"),
+            BUSY_TIMEOUT_MS
+        );
+        assert_eq!(
+            query_i64(&mut c2, "PRAGMA busy_timeout").await.expect("p2"),
+            BUSY_TIMEOUT_MS
+        );
+        drop(c1);
+        drop(c2);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

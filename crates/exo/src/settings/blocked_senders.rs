@@ -2,8 +2,11 @@
 //! Unblock behind an `Unblock` alert. Unblocking takes the sender off the list and deletes the
 //! Gmail filter its block made. What the filter trashed stays in Trash.
 
-use egui::{Color32, Context, CornerRadius, Rect, Sense, Ui, pos2};
-use exo_ui::{Alert, Dialog, Family, Font, KeycapColors, Keycaps, TextStyle, palette};
+use egui::{Context, CornerRadius, Rect, Sense, Ui, pos2};
+use exo_commands::{Command, Commands, Region};
+use exo_ui::{
+    Alert, Dialog, Family, Font, TextStyle, dialog_highlight, paint_dialog_footer, palette,
+};
 
 /// The subheader: 12px/20px, 24px down (and `top: 3px`).
 const TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
@@ -25,45 +28,6 @@ const FOOTER_BELOW: f32 = 18.0;
 /// `Unblock`: `#000` at `opacity: .5` on the focused row (`:focus`), hidden on the others.
 const UNBLOCK_FOCUSED: f32 = 0.5;
 
-/// The focused row's fill, `hsl(220, 45%, 97%)` or `#eaeaea` in Carbon. Bulk Actions' rows take it
-/// too.
-pub(crate) fn highlight(ctx: &Context) -> Color32 {
-    match exo_ui::app_theme(ctx) {
-        exo_ui::Theme::Snow => exo_ui::Theme::Snow.palette().fill_hover_default,
-        exo_ui::Theme::Carbon => Color32::from_rgb(0xea, 0xea, 0xea),
-    }
-}
-
-/// A dialog's footer line with `⌘ K` in it, with the caps' tops at `top`. The text is
-/// `rgba(0, 0, 0, .6)`, and the caps are 19px and in the app's theme (dark in Carbon), which drops
-/// the text 1px. The first cap sits `first_gap` after `lead` (a cap's own 4px, or Bulk Actions'
-/// 2px), and `rest` sits `after_keys` after the last cap (Blocked Senders' keeps a 1px right
-/// margin, the Images dialog's none). Blocked Senders' footer is a flex row, which trims its
-/// lead's trailing space.
-pub(crate) fn paint_footer(
-    ui: &Ui,
-    left: f32,
-    top: f32,
-    lead: &str,
-    first_gap: f32,
-    after_keys: f32,
-    rest: &str,
-) {
-    let painter = ui.painter();
-    let ink = Color32::from_black_alpha(153);
-    let mut x = left + TEXT.paint_line(painter, pos2(left, top + 1.0), lead, ink, None);
-    let keys = Keycaps::new(
-        ui.ctx(),
-        &["⌘", "K"],
-        KeycapColors::shortcuts_pane(exo_ui::app_theme(ui.ctx()).palette()),
-    )
-    .height(19.0);
-    x += first_gap - exo_ui::KEYCAP_GAP;
-    keys.paint(painter, x, top);
-    x += keys.width() + after_keys;
-    TEXT.paint_line(painter, pos2(x, top + 1.0), rest, ink, None);
-}
-
 /// The dialog's row focus and its alert.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
@@ -83,6 +47,8 @@ pub enum Event {
     Activate,
     /// The alert's action, by index (`Unblock` first).
     AlertAction(usize),
+    /// Enter or Space in the alert, which runs its selected action.
+    AlertConfirm,
     /// ← / → in the alert.
     AlertCycle(isize),
     /// Escape or a click outside the alert.
@@ -98,6 +64,37 @@ impl State {
     /// Back to the first row, as the dialog opens.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Registers the dialog's keyboard bindings in `Region::Dialog` (and its alert's keys).
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let blocked = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::Blocked(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        commands.add(blocked(
+            "BLOCKED_DOWN",
+            Event::Move(1),
+            &["down", "j", "tab", "ctralt+j", "ctralt+n"],
+        ));
+        commands.add(blocked(
+            "BLOCKED_UP",
+            Event::Move(-1),
+            &["up", "k", "shift+tab", "ctralt+k", "ctralt+p"],
+        ));
+        commands.add(blocked("BLOCKED_ENTER", Event::Activate, &["enter"]));
+        crate::notice::register_alert_keys(
+            commands,
+            wrap(super::Action::Blocked(Event::AlertConfirm)),
+            wrap(super::Action::Blocked(Event::AlertDismiss)),
+            |step| wrap(super::Action::Blocked(Event::AlertCycle(step))),
+        );
     }
 
     /// Applies `event` over `senders`, and returns the sender to unblock once the alert says so.
@@ -119,9 +116,13 @@ impl State {
                 let (sender, _) = self.alert.take()?;
                 return (index == 0).then_some(sender);
             }
+            Event::AlertConfirm => {
+                let (_, selected) = self.alert.as_ref()?;
+                return self.handle(Event::AlertAction(*selected), senders);
+            }
             Event::AlertCycle(step) => {
                 if let Some((_, selected)) = &mut self.alert {
-                    *selected = selected.saturating_add_signed(step).min(1);
+                    *selected = Alert::move_selection(*selected, 2, step, true);
                 }
             }
             Event::AlertDismiss => self.alert = None,
@@ -169,26 +170,17 @@ pub fn show(
         });
     if let (Some(event), Some((sender, selected))) = (&mut response.inner, &state.alert) {
         let text = format!("Remove the block on {sender}?");
-        let alert = Alert {
+        let (clicked, backdrop) = (Alert {
             title: "Unblock",
             text: &text,
             actions: &["Unblock", "Cancel"],
             selected: *selected,
-        };
-        let clicked = egui::Area::new(exo_ui::id(ctx, "blocked-senders-alert"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(area.min)
-            .show(ctx, |ui| {
-                // The alert's backdrop, over the dialog's.
-                let backdrop = ui.allocate_rect(area, Sense::click());
-                ui.painter()
-                    .rect_filled(area, 0.0, Color32::from_black_alpha(128));
-                match alert.show(ui, area) {
-                    Some(index) => Some(Event::AlertAction(index)),
-                    None => backdrop.clicked().then_some(Event::AlertDismiss),
-                }
-            });
-        *event = clicked.inner.or(event.take());
+        })
+        .show_modal(ctx, "blocked-senders-alert", area);
+        *event = clicked
+            .map(Event::AlertAction)
+            .or_else(|| backdrop.then_some(Event::AlertDismiss))
+            .or(event.take());
         response.close = false;
     }
     response
@@ -254,7 +246,7 @@ fn draw(
         }
         let focused = state.focus == i;
         if focused {
-            painter.rect_filled(rect, CornerRadius::same(4), highlight(ui.ctx()));
+            painter.rect_filled(rect, CornerRadius::same(4), dialog_highlight(ui.ctx()));
         }
         // The sender: `rgba(0, 0, 0, .85)`.
         SENDER.paint_line(
@@ -277,7 +269,7 @@ fn draw(
     }
 
     // `To block a sender, open a message from them, hit ⌘ K → Block.`
-    paint_footer(
+    paint_dialog_footer(
         ui,
         body.left(),
         body.top() + footer,
@@ -322,6 +314,25 @@ mod tests {
         state.handle(Event::Row(0), &senders);
         assert_eq!(
             state.handle(Event::AlertAction(0), &senders).as_deref(),
+            Some("a@x.com")
+        );
+    }
+
+    #[test]
+    fn tab_and_arrows_wrap_between_unblock_and_cancel() {
+        let senders = ["a@x.com"];
+        let mut state = State::default();
+        state.handle(Event::Activate, &senders);
+        // Tab (-1) from 0 wraps to Cancel (1), and Enter confirms Cancel rather than Unblock.
+        state.handle(Event::AlertCycle(-1), &senders);
+        assert_eq!(state.handle(Event::AlertConfirm, &senders), None);
+        assert!(!state.alert_open());
+        // ArrowLeft (+1) selects Cancel, ArrowRight (-1) moves back to Unblock.
+        state.handle(Event::Activate, &senders);
+        state.handle(Event::AlertCycle(1), &senders);
+        state.handle(Event::AlertCycle(-1), &senders);
+        assert_eq!(
+            state.handle(Event::AlertConfirm, &senders).as_deref(),
             Some("a@x.com")
         );
     }
