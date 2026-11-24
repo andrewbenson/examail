@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "examail-cloud"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "exo"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "exo-auth"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "exo-commands"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "egui",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "exo-editor"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2421,11 +2421,11 @@ dependencies = [
 
 [[package]]
 name = "exo-fonts"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "exo-mail"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "anyrender",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "exo-store"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "futures",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "exo-ui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "egui",
  "egui_extras",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "gmail"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "gmail-mock"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -9757,7 +9757,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
