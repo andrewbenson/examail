@@ -65,6 +65,11 @@ pub enum Action {
     PhoneNotificationsOn,
     /// ⌘K's `Turn Off Phone Notifications`.
     PhoneNotificationsOff,
+    /// ⌘K's `Create Remote MCP Token`: copies the command that adds Examail Cloud's MCP server
+    /// to Claude Code.
+    McpTokenCreate,
+    /// ⌘K's `Revoke Remote MCP Tokens`.
+    McpTokensRevoke,
 }
 
 /// The ntfy server phone notifications go through.
@@ -130,6 +135,28 @@ pub(crate) fn register(
             .icon("data/icon"),
         ),
         None => {}
+    }
+    if phone_notifications.is_some() {
+        commands.add(
+            Command::new(
+                "MCP_TOKEN_CREATE",
+                "Create Remote MCP Token",
+                act(Action::McpTokenCreate),
+            )
+            .aliases(["MCP", "Claude", "AI Agent"])
+            .default_score(0.0)
+            .icon("data/icon"),
+        );
+        commands.add(
+            Command::new(
+                "MCP_TOKENS_REVOKE",
+                "Revoke Remote MCP Tokens",
+                act(Action::McpTokensRevoke),
+            )
+            .aliases(["MCP", "Claude", "AI Agent"])
+            .default_score(0.0)
+            .icon("data/icon"),
+        );
     }
     commands.add(
         Command::new("VERSION", "Version Info", act(Action::VersionInfo))
@@ -237,6 +264,14 @@ impl crate::Mail {
                 self.commands
                     .hint(Hint::new().text("Phone notifications off."));
             }
+            Action::McpTokenCreate => {
+                self.account.mint_mcp_token(false);
+                self.commands.hint(Hint::new().text("Creating a remote MCP token…"));
+            }
+            Action::McpTokensRevoke => {
+                self.account.mint_mcp_token(true);
+                self.commands.hint(Hint::new().text("Revoking remote MCP tokens…"));
+            }
             Action::Copy => {
                 if let Some(notice) = self.notice {
                     self.ctx.copy_text(notice.text());
@@ -245,6 +280,21 @@ impl crate::Mail {
                 }
             }
         }
+    }
+
+    /// Examail Cloud's answer to `Create Remote MCP Token` or `Revoke Remote MCP Tokens`.
+    pub(crate) fn mcp_token(&mut self, answer: Result<Option<(String, String)>, String>) {
+        let text = match answer {
+            Ok(Some((token, url))) => {
+                self.ctx.copy_text(format!(
+                    "claude mcp add --transport http examail {url} --header \"Authorization: Bearer {token}\""
+                ));
+                "Copied a command that adds Examail to Claude Code. Keep it secret: it reads your mail.".to_owned()
+            }
+            Ok(None) => "Remote MCP tokens revoked.".to_owned(),
+            Err(why) => format!("Examail Cloud: {why}"),
+        };
+        self.commands.hint(Hint::new().text(text));
     }
 
     /// The alert on screen, if any, with the updater's check's alert over any other.

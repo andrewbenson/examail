@@ -1814,6 +1814,7 @@ impl Mail {
                 Event::Unsent(unsent) => self.sign_out_unsent(unsent),
                 Event::Thread { id, detail } => self.unsubscribe_thread_read(id, detail),
                 Event::Unavailable { id, offline } => self.thread_unavailable(&id, offline),
+                Event::McpToken(answer) => self.mcp_token(answer),
                 event => self.compose_event(event),
             }
         }

@@ -236,6 +236,9 @@ pub struct SearchResults {
 /// Something the UI should tell the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Examail Cloud minted an MCP token (`Some((token, url))`), or revoked them (`None`), or
+    /// couldn't (why).
+    McpToken(Result<Option<(String, String)>, String>),
     /// The stored settings changed from `from` to `to` other than through the UI (Examail Cloud
     /// brought another Mac's changes). [`Account::events`] applies it to the UI's copy itself.
     SettingsChanged {
@@ -499,6 +502,10 @@ struct Shared {
     power: watch::Sender<Power>,
     events: RefCell<Events>,
     loader: Loader,
+    /// Sends the account's events from the UI's own background work ([`Account::mint_mcp_token`]).
+    event_sender: std::sync::mpsc::Sender<Event>,
+    /// How to reach Examail Cloud, once [`Account::start_cloud`] has.
+    cloud: RefCell<Option<crate::cloud::Keys>>,
     /// The UI's copy of the settings. Changes apply here at once and are saved in the background.
     settings: RefCell<Versioned>,
     /// How many times [`Account::apply`] was called.
@@ -978,7 +985,7 @@ impl Account {
             store,
             repaint: repaint.clone(),
             requests: requests.clone(),
-            events: event_sender,
+            events: event_sender.clone(),
             views: HashMap::from([(0, ViewState::new(snapshot_sender))]),
             focused: 0,
             opening: HashSet::new(),
@@ -1017,6 +1024,8 @@ impl Account {
                 receiver: events,
                 readers: Vec::new(),
             }),
+            event_sender,
+            cloud: RefCell::new(None),
             loader,
             settings: RefCell::new(Versioned {
                 version: 0,
@@ -1139,6 +1148,11 @@ impl Account {
     /// there, while the account is open ([`crate::cloud`]).
     pub fn start_cloud(&self, mut access: crate::cloud::Access) {
         let loader = &self.shared.loader;
+        *self.shared.cloud.borrow_mut() = Some(crate::cloud::Keys {
+            config: access.config.clone(),
+            email: access.email.clone(),
+            tokens: access.tokens.clone(),
+        });
         let requests = loader.requests.clone();
         access.merge_settings = Box::new(move |from, to| {
             requests.post(Request::MergeSettings { from, to });
@@ -1147,6 +1161,30 @@ impl Account {
             &loader.runtime,
             crate::cloud::run(loader.store.clone(), access),
         );
+    }
+
+    /// Whether Examail Cloud is set up for the account (it may not be connected yet).
+    pub fn has_cloud(&self) -> bool {
+        self.shared.cloud.borrow().is_some()
+    }
+
+    /// Mints a token for Examail Cloud's MCP server, or revokes them all (`revoke`), in the
+    /// background. [`Event::McpToken`] answers.
+    pub fn mint_mcp_token(&self, revoke: bool) {
+        let Some(keys) = self.shared.cloud.borrow().clone() else {
+            return;
+        };
+        let events = self.shared.event_sender.clone();
+        let ctx = self.shared.repaint.ctx.clone();
+        self.shared.loader.runtime.spawn(async move {
+            let answer = if revoke {
+                crate::cloud::revoke_mcp_tokens(keys).await.map(|()| None)
+            } else {
+                crate::cloud::mint_mcp_token(keys).await.map(Some)
+            };
+            let _ = events.send(Event::McpToken(answer));
+            ctx.request_repaint();
+        });
     }
 
     /// Signs calendar accounts in with `auth` from now on, and reads the ones the settings list as

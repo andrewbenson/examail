@@ -3207,7 +3207,8 @@ impl crate::Mail {
             | Event::Unsent(_)
             | Event::Thread { .. }
             | Event::Unavailable { .. }
-            | Event::SettingsChanged { .. } => {}
+            | Event::SettingsChanged { .. }
+            | Event::McpToken(_) => {}
         }
     }
 

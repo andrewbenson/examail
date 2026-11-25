@@ -187,6 +187,81 @@ struct Client {
     device: Option<String>,
 }
 
+/// What reaching Examail Cloud for an account takes, kept by the account for calls the UI asks
+/// for ([`mint_mcp_token`]).
+#[derive(Clone)]
+pub struct Keys {
+    pub config: Config,
+    pub email: String,
+    pub tokens: exo_auth::Tokens,
+}
+
+impl Keys {
+    fn client(self) -> Client {
+        Client {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("a client builds"),
+            access: Access {
+                config: self.config,
+                email: self.email,
+                tokens: self.tokens,
+                merge_settings: Box::new(|_, _| {}),
+            },
+            device: None,
+        }
+    }
+}
+
+/// This Mac's name, as Sharing settings has it.
+fn device_name() -> String {
+    std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Mac".into())
+}
+
+/// Mints a token for Examail Cloud's MCP server: `(token, the server's URL)`.
+///
+/// # Errors
+/// Why it couldn't, to show.
+pub async fn mint_mcp_token(keys: Keys) -> Result<(String, String), String> {
+    let mut client = keys.client();
+    client.ensure_device().await.map_err(|failure| failure.to_string())?;
+    let name = format!("Examail on {}", device_name());
+    let answer = client
+        .call(
+            reqwest::Method::POST,
+            "v1/mcp-tokens",
+            Some(&json!({ "name": name })),
+        )
+        .await
+        .map_err(|failure| failure.to_string())?;
+    match (answer["token"].as_str(), answer["url"].as_str()) {
+        (Some(token), Some(url)) => Ok((token.to_owned(), url.to_owned())),
+        _ => Err("Examail Cloud didn't answer with a token".into()),
+    }
+}
+
+/// Revokes every token of the account for Examail Cloud's MCP server.
+///
+/// # Errors
+/// Why it couldn't, to show.
+pub async fn revoke_mcp_tokens(keys: Keys) -> Result<(), String> {
+    let mut client = keys.client();
+    client.ensure_device().await.map_err(|failure| failure.to_string())?;
+    client
+        .call(reqwest::Method::DELETE, "v1/mcp-tokens", None)
+        .await
+        .map(|_| ())
+        .map_err(|failure| failure.to_string())
+}
+
 impl Client {
     async fn call(
         &self,
@@ -248,14 +323,7 @@ impl Client {
         if self.device.is_some() {
             return Ok(());
         }
-        let name = std::process::Command::new("scutil")
-            .args(["--get", "ComputerName"])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Mac".into());
+        let name = device_name();
         let answer = self
             .call(
                 reqwest::Method::POST,
