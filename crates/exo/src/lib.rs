@@ -618,12 +618,16 @@ impl Mail {
     }
 
     /// The status bar at the bottom of the window, if one shows: the offline bar, else Out of
-    /// Office Reply's.
+    /// Office Reply's, else Examail Cloud's.
     pub fn status_bar(&self) -> Option<status_bar::StatusBar> {
         status_bar::StatusBar::offline(&self.snapshot.connection, self.calendar_week().is_some())
             .or_else(|| {
                 self.out_of_office()
                     .then(status_bar::StatusBar::out_of_office)
+            })
+            .or_else(|| {
+                cloud::status(self.account.email())
+                    .and_then(|status| status_bar::StatusBar::cloud(&status))
             })
     }
 

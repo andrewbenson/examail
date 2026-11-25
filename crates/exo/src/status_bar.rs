@@ -1,5 +1,5 @@
 //! The status bar at the bottom of the window: the offline bar, else the Out of Office bar, else
-//! Quick Tips' (`crate::quick_tips`).
+//! Examail Cloud's, else Quick Tips' (`crate::quick_tips`).
 //!
 //! The offline bar says what's down and what Exo does meanwhile. The Out of Office bar says how
 //! to turn replies off.
@@ -96,6 +96,31 @@ impl StatusBar {
         }
     }
 
+    /// The bar while Examail Cloud can't act for the account, so its reminders and scheduled
+    /// sends would only go out while Examail is open. None while it works.
+    pub fn cloud(status: &crate::cloud::Status) -> Option<Self> {
+        use crate::cloud::Status;
+        let runs = match status {
+            Status::Working => return None,
+            Status::NotConnected { connect } => vec![
+                MessageBarRun::Text("Reminders and scheduled sends wait for Examail to open. "),
+                MessageBarRun::Link("Connect Examail Cloud", connect),
+            ],
+            Status::SignInAgain => vec![
+                MessageBarRun::Text(
+                    "Reminders and scheduled sends wait for Examail to open. Sign out and in again:",
+                ),
+                MessageBarRun::Keys(&["⌘", "K"]),
+                MessageBarRun::Text(" → Sign Out."),
+            ],
+        };
+        Some(Self {
+            title: "Examail Cloud",
+            runs,
+            color: MessageBarColor::Blue,
+        })
+    }
+
     /// The description as one line of text.
     pub fn text(&self) -> String {
         self.runs.iter().map(MessageBarRun::text).collect()
@@ -190,6 +215,22 @@ mod tests {
             throttled.text().ends_with("catch up when Gmail responds."),
             "throttling isn't the disk"
         );
+    }
+
+    #[test]
+    fn examail_cloud_asks_to_connect_or_sign_in_again_and_is_quiet_when_working() {
+        use crate::cloud::Status;
+        assert_eq!(StatusBar::cloud(&Status::Working), None);
+        let connect = StatusBar::cloud(&Status::NotConnected {
+            connect: "https://relay.example/v1/connect",
+        })
+        .unwrap();
+        assert!(connect.runs.contains(&MessageBarRun::Link(
+            "Connect Examail Cloud",
+            "https://relay.example/v1/connect"
+        )));
+        let sign_in = StatusBar::cloud(&Status::SignInAgain).unwrap();
+        assert!(sign_in.text().contains("Sign Out"));
     }
 
     #[test]

@@ -35,6 +35,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           EXO_GOOGLE_CLIENT_ID: ${{ secrets.EXO_GOOGLE_CLIENT_ID }}
           EXO_GOOGLE_CLIENT_SECRET: ${{ secrets.EXO_GOOGLE_CLIENT_SECRET }}
+          # Examail Cloud's address. Without it the build leaves Examail Cloud off unless cloud.json names it.
+          EXO_CLOUD_URL: ${{ secrets.EXO_CLOUD_URL }}
           DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
           DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
           APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}

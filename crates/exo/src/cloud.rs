@@ -22,29 +22,49 @@ const RECHECK: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_secs(2);
 /// How long to wait while the service can't be used (not connected, offline, no ID token).
 const IDLE: Duration = Duration::from_secs(300);
+/// How long to wait when the service's gateway doesn't admit the account.
+const NOT_ALLOWED: Duration = Duration::from_secs(6 * 60 * 60);
 /// How often the service is asked whether it can still act for the account.
 const CHECK_EVERY: Duration = Duration::from_secs(600);
 
 /// The header that carries the device token.
 const DEVICE: &str = "x-examail-device";
 
-/// Where Examail Cloud is, from `cloud.json` beside `accounts` (the stores' folder).
+/// Examail Cloud's address in release builds, from the build's environment (a CI secret), so
+/// it isn't in the repository. `cloud.json` overrides it.
+const BUILT_IN: Option<&str> = option_env!("EXO_CLOUD_URL");
+
+/// Where Examail Cloud is: `cloud.json` beside `accounts` (the stores' folder), else the address
+/// the build has. `{"enabled": false}` there turns it off.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub url: url::Url,
 }
 
 impl Config {
-    /// The config, when there's one that reads.
+    /// The config, when Examail Cloud is on.
     #[must_use]
     pub fn load(accounts: &Path) -> Option<Self> {
-        let path: PathBuf = accounts.parent()?.join("cloud.json");
-        let text = std::fs::read_to_string(&path).ok()?;
-        let value: Value = serde_json::from_str(&text)
-            .inspect_err(|error| log::warn!("{} doesn't read: {error}", path.display()))
-            .ok()?;
-        let url = value["url"].as_str()?.parse().ok()?;
-        Some(Self { url })
+        Self::from(accounts.parent()?, BUILT_IN)
+    }
+
+    fn from(state: &Path, built_in: Option<&str>) -> Option<Self> {
+        let path: PathBuf = state.join("cloud.json");
+        let file = std::fs::read_to_string(&path).ok().and_then(|text| {
+            serde_json::from_str::<Value>(&text)
+                .inspect_err(|error| log::warn!("{} doesn't read: {error}", path.display()))
+                .ok()
+        });
+        if file.as_ref().is_some_and(|value| value["enabled"] == false) {
+            return None;
+        }
+        let url = file
+            .as_ref()
+            .and_then(|value| value["url"].as_str().map(str::to_owned))
+            .or_else(|| built_in.filter(|url| !url.is_empty()).map(str::to_owned))?;
+        Some(Self {
+            url: url.parse().ok()?,
+        })
     }
 
     /// Where the account connects the service in the browser.
@@ -53,6 +73,68 @@ impl Config {
         let mut url = self.url.join("v1/connect").expect("a fixed path");
         url.query_pairs_mut().append_pair("login_hint", email);
         url.to_string()
+    }
+}
+
+/// How Examail Cloud stands for an account, for the status bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// It holds the account's jobs, or nothing has gone wrong.
+    Working,
+    /// The account hasn't connected it, or Google stopped honoring its grant: the reminders and
+    /// sends go out only while Examail is open. `connect` is where to connect it.
+    NotConnected { connect: &'static str },
+    /// The account's grant predates the ID token the service needs: it signs out and in again.
+    SignInAgain,
+}
+
+type Statuses = std::sync::Mutex<HashMap<String, Status>>;
+
+fn statuses() -> &'static Statuses {
+    static STATUSES: std::sync::OnceLock<Statuses> = std::sync::OnceLock::new();
+    STATUSES.get_or_init(Statuses::default)
+}
+
+/// How Examail Cloud stands for account `email`, when it's on for it.
+#[must_use]
+pub fn status(email: &str) -> Option<Status> {
+    statuses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&email.to_lowercase())
+        .cloned()
+}
+
+fn set_status(email: &str, status: Option<Status>) {
+    let mut statuses = statuses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match status {
+        Some(status) => statuses.insert(email.to_lowercase(), status),
+        None => statuses.remove(&email.to_lowercase()),
+    };
+}
+
+/// `connect_url` as a `'static` string for the status bar's link, made once per account.
+fn connect_link(config: &Config, email: &str) -> &'static str {
+    type Links = std::sync::Mutex<HashMap<String, &'static str>>;
+    static LINKS: std::sync::OnceLock<Links> = std::sync::OnceLock::new();
+    let mut links = LINKS
+        .get_or_init(Links::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let url = config.connect_url(email);
+    links
+        .entry(url.clone())
+        .or_insert_with(|| Box::leak(url.into_boxed_str()))
+}
+
+/// Clears the account's status when its loop ends.
+struct StatusGuard(String);
+
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        set_status(&self.0, None);
     }
 }
 
@@ -72,6 +154,8 @@ enum Failure {
     UnknownDevice,
     /// The account hasn't connected the service.
     NotConnected,
+    /// The service's gateway doesn't admit the account (it isn't one of the service's users).
+    NotAllowed,
     /// Anything else: offline, the service down, a refusal.
     Other(String),
 }
@@ -82,6 +166,7 @@ impl std::fmt::Display for Failure {
             Self::NoIdToken => write!(f, "the account has no ID token; sign it in again"),
             Self::UnknownDevice => write!(f, "the service doesn't know this Mac"),
             Self::NotConnected => write!(f, "the account hasn't connected Examail Cloud"),
+            Self::NotAllowed => write!(f, "Examail Cloud doesn't admit the account"),
             Self::Other(message) => write!(f, "{message}"),
         }
     }
@@ -134,6 +219,10 @@ impl Client {
         Err(match status.as_u16() {
             401 if self.device.is_some() && message.contains("device") => Failure::UnknownDevice,
             409 => Failure::NotConnected,
+            // IAP's refusal, which is a page rather than the service's JSON.
+            403 if !message.starts_with('{') && !text.trim_start().starts_with('{') => {
+                Failure::NotAllowed
+            }
             _ => Failure::Other(format!("Examail Cloud answered {status}: {message}")),
         })
     }
@@ -231,18 +320,34 @@ pub async fn run(store: Store, access: Access) {
     let mut checked: Option<std::time::Instant> = None;
     let mut told_no_id = false;
     let mut told_not_connected = false;
+    let email = client.access.email.clone();
+    let _status = StatusGuard(email.clone());
     loop {
+        // Waiting on the account (to connect, to sign in again) or for the gateway, the loop
+        // doesn't try again on every change to the mail, only after the wait.
+        let mut quiet = false;
         let wait = match round(&store, &mut client, &mut sent, &mut checked).await {
             Ok(()) => {
                 told_not_connected = false;
+                set_status(&email, Some(Status::Working));
                 RECHECK
+            }
+            Err(Failure::NotAllowed) => {
+                log::warn!("Examail Cloud doesn't admit an account; trying again in 6 hours");
+                set_status(&email, None);
+                sent.clear();
+                let _ = store.set_handed_off([]).await;
+                quiet = true;
+                NOT_ALLOWED
             }
             Err(Failure::NoIdToken) => {
                 if !told_no_id {
                     log::warn!("Examail Cloud needs an account signed in again, for an ID token");
                     told_no_id = true;
                 }
+                set_status(&email, Some(Status::SignInAgain));
                 let _ = store.set_handed_off([]).await;
+                quiet = true;
                 IDLE
             }
             Err(Failure::NotConnected) => {
@@ -250,9 +355,17 @@ pub async fn run(store: Store, access: Access) {
                     log::warn!("an account hasn't connected Examail Cloud (open /v1/connect)");
                     told_not_connected = true;
                 }
+                set_status(
+                    &email,
+                    Some(Status::NotConnected {
+                        connect: connect_link(&client.access.config, &email),
+                    }),
+                );
                 sent.clear();
+                checked = None;
                 let _ = store.set_handed_off([]).await;
-                IDLE
+                quiet = true;
+                RECHECK
             }
             Err(Failure::UnknownDevice) => {
                 client.forget_device();
@@ -271,7 +384,7 @@ pub async fn run(store: Store, access: Access) {
         }
         // A change is sent once things settle; otherwise look again after `wait`.
         tokio::select! {
-            changed = changes.changed() => {
+            changed = changes.changed(), if !quiet => {
                 if changed.is_err() {
                     return;
                 }
@@ -399,6 +512,42 @@ fn encode(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_address_serves_unless_cloud_json_says_otherwise() {
+        let dir = std::env::temp_dir().join(format!("exo-cloud-built-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("cloud.json"));
+        let built = Some("https://built.example/");
+        assert_eq!(
+            Config::from(&dir, built).unwrap().url.as_str(),
+            "https://built.example/"
+        );
+        assert!(Config::from(&dir, None).is_none(), "off with neither");
+        std::fs::write(
+            dir.join("cloud.json"),
+            r#"{"url": "https://file.example/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::from(&dir, built).unwrap().url.as_str(),
+            "https://file.example/"
+        );
+        std::fs::write(dir.join("cloud.json"), r#"{"enabled": false}"#).unwrap();
+        assert!(Config::from(&dir, built).is_none(), "turned off");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn statuses_are_per_account_and_go_with_the_loop() {
+        let email = "status-test@example.com";
+        {
+            let _guard = StatusGuard(email.into());
+            set_status(email, Some(Status::SignInAgain));
+            assert_eq!(status("Status-Test@example.com"), Some(Status::SignInAgain));
+        }
+        assert_eq!(status(email), None);
+    }
 
     #[test]
     fn the_config_names_the_service() {
