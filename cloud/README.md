@@ -1,13 +1,18 @@
 # Examail Cloud (Relay)
 
-The service that does what Examail can only do while it's open (bring back snoozed threads, send
-scheduled mail, apply mail rules) when the Mac is closed. The code is `crates/examail-cloud`; one
-binary runs as both Cloud Run services:
+The service that does what Examail can only do while it's open when the Mac is closed: bring
+back snoozed threads, send scheduled mail, keep each account's settings in step across Macs, and
+act on arriving mail (muted threads, if-no-reply reminders, split labels, phone notifications).
+It also serves the mail to AI agents over MCP. The code is `crates/examail-cloud`; one binary
+runs as all three Cloud Run services:
 
 - **`relay-api`**, behind IAP: what the app and the browser call. IAP admits only the Google
   accounts given `roles/iap.httpsResourceAccessor`, and the service checks IAP's signed assertion
   on every request.
 - **`relay-worker`**, Cloud Run IAM only: Cloud Scheduler's tick and Gmail's Pub/Sub push.
+- **`relay-mcp`**, open to the internet: the MCP server. Every request needs a token the app
+  minted (⌘K → Create Remote MCP Token); only tokens' hashes are kept. It searches, reads and
+  saves drafts, and never sends.
 
 ## Deploying
 
@@ -93,6 +98,45 @@ Release builds take the `relay-api` URL from the `EXO_CLOUD_URL` secret at build
 Examail Cloud off with `{"enabled": false}`. Until an account connects (in the browser, from the
 link in Examail's status bar, or `<relay-api URL>/v1/connect?login_hint=<address>`), its
 reminders and scheduled sends wait for Examail to open.
+
+## The mail watcher
+
+Gmail publishes each connected inbox's changes to the Pub/Sub topic `gmail-push`, which pushes
+them to the worker. The tick renews each account's `users.watch` before it lapses (a week) and
+also reads what changed every minute, so a lost push only delays things. `cloud/deploy` turns the
+watcher on (`GMAIL_TOPIC`) once the topic exists:
+
+```sh
+gcloud pubsub topics create gmail-push --project $P
+gcloud pubsub topics add-iam-policy-binding gmail-push --project $P \
+    --member serviceAccount:gmail-api-push@system.gserviceaccount.com --role roles/pubsub.publisher
+gcloud iam service-accounts add-iam-policy-binding relay-scheduler@$P.iam.gserviceaccount.com \
+    --project $P --member serviceAccount:service-$N@gcp-sa-pubsub.iam.gserviceaccount.com \
+    --role roles/iam.serviceAccountTokenCreator
+W=$(gcloud run services describe relay-worker --project $P --region $R --format 'value(status.url)')
+gcloud pubsub subscriptions create gmail-push-worker --project $P --topic gmail-push \
+    --push-endpoint $W/hooks/gmail --push-auth-service-account relay-scheduler@$P.iam.gserviceaccount.com \
+    --push-auth-token-audience $W --ack-deadline 60 --message-retention-duration 1h \
+    --expiration-period never
+```
+
+For each message newly in an inbox that isn't the user's own, the worker:
+
+- takes a reply on a muted thread (`[Exo]/Muted`) back out of the inbox, unless it added one of
+  the user's addresses as a new recipient;
+- ends if-no-reply reminders and sends on that thread at once;
+- with phone notifications on (⌘K → Turn On Phone Notifications, a random ntfy.sh topic in the
+  synced settings), posts the sender and subject to that topic, by the Mac's notification rules;
+- once Gmail's search has the message, labels it `[Exo]/<split>` for each split whose compiled
+  Gmail query it matches, so Gmail on the web and phone can show the split.
+
+## Settings sync
+
+The app keeps each account's settings document on the service (`GET`/`PUT /v1/settings`, with a
+version that a stale write fails on) and merges key by key against the copy both sides last had.
+A Mac's first sync takes the service's settings and keeps its own in `kv`
+(`cloud_settings_before_sync`). With each write the app sends the account's addresses and label
+names, which the worker needs.
 
 ## Alerts
 
