@@ -1829,7 +1829,13 @@ mod tests {
                 .any(|row| row.id == thread.id),
             "back in the inbox"
         );
-        let posted = mail();
+        // The notice is posted after the account goes idle, so wait for it.
+        let started = Instant::now();
+        let mut posted = mail();
+        while posted.len() == before && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+            posted = mail();
+        }
         let [notice] = &posted[before..] else {
             panic!("one notification: {posted:?}")
         };
