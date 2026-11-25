@@ -145,7 +145,8 @@ pub struct Access {
     pub tokens: exo_auth::Tokens,
     /// Hands the account a settings merge: the settings as read, and as merged
     /// ([`crate::account::Account::start_cloud`] queues it behind the UI's own saves).
-    pub merge_settings: Box<dyn Fn(Value, Value) + Send + Sync>,
+    /// Answers once the stored settings have it, and never when they couldn't be saved.
+    pub merge_settings: Box<dyn Fn(Value, Value) -> tokio::sync::oneshot::Receiver<()> + Send + Sync>,
 }
 
 /// Why a call to the service didn't go.
@@ -207,7 +208,7 @@ impl Keys {
                 config: self.config,
                 email: self.email,
                 tokens: self.tokens,
-                merge_settings: Box::new(|_, _| {}),
+                merge_settings: Box::new(|_, _| tokio::sync::oneshot::channel().1),
             },
             device: None,
         }
@@ -577,10 +578,10 @@ async fn round(
 
 /// Syncs the account's settings with Examail Cloud's copy ([`exo_store::merge_settings`]).
 ///
-/// A merge that changes this Mac's settings goes to the account to apply, and is written to the
-/// service only once it has been (a later round), so the copy both sides agree on is only ever
-/// one this Mac has stored. With none agreed on yet, the service's settings win, and this Mac's
-/// are kept aside first.
+/// A merge that changes this Mac's settings goes to the account to apply. Once it's stored, the
+/// service's copy is the one both agree on, and what this Mac changed meanwhile is written back
+/// in a later round. With none agreed on yet, the service's settings win, and this Mac's are kept
+/// aside first.
 async fn sync_settings(store: &Store, client: &mut Client) -> Result<(), Failure> {
     let other = |what: &str, error: exo_store::Error| Failure::Other(format!("{what}: {error}"));
     let local: exo_store::Settings = store
@@ -613,7 +614,23 @@ async fn sync_settings(store: &Store, client: &mut Client) -> Result<(), Failure
         local.clone()
     };
     if merged != local {
-        (client.access.merge_settings)(local, merged);
+        let applied = (client.access.merge_settings)(local, merged);
+        // Recording the service's copy as agreed only once this Mac has stored what it pulled,
+        // so the pull isn't taken for this Mac's own change if the service moves on meanwhile.
+        if remote.is_object()
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(15), applied).await,
+                Ok(Ok(()))
+            )
+        {
+            store
+                .set_synced_settings(&exo_store::SyncedSettings {
+                    version,
+                    document: remote.clone(),
+                })
+                .await
+                .map_err(|error| other("recording the synced settings", error))?;
+        }
         return Ok(());
     }
     if *remote == merged {

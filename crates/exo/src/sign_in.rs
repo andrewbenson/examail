@@ -216,7 +216,7 @@ impl SignIn {
                 email: email.to_owned(),
                 tokens: tokens.clone(),
                 // `start_cloud` gives it the account's queue.
-                merge_settings: Box::new(|_, _| {}),
+                merge_settings: Box::new(|_, _| tokio::sync::oneshot::channel().1),
             });
         }
         Ok((account, tokens))

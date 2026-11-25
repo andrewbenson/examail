@@ -387,6 +387,8 @@ enum Request {
     MergeSettings {
         from: serde_json::Value,
         to: serde_json::Value,
+        /// Told once the stored settings have it.
+        done: tokio::sync::oneshot::Sender<()>,
     },
     SaveDeviceSettings(DeviceSettings),
     /// Save a draft as `email` with its attachments' bytes added.
@@ -1155,7 +1157,9 @@ impl Account {
         });
         let requests = loader.requests.clone();
         access.merge_settings = Box::new(move |from, to| {
-            requests.post(Request::MergeSettings { from, to });
+            let (done, applied) = tokio::sync::oneshot::channel();
+            requests.post(Request::MergeSettings { from, to, done });
+            applied
         });
         loader.restarts.spawn_task(
             &loader.runtime,
@@ -2023,37 +2027,38 @@ pub fn snippet_tokens(window_width: f32) -> i64 {
 impl Worker {
     /// Merges Examail Cloud's settings into the stored ones (see [`Request::MergeSettings`]),
     /// and tells the UI.
-    async fn merge_settings(&mut self, from: &serde_json::Value, to: &serde_json::Value) {
+    async fn merge_settings(&mut self, from: &serde_json::Value, to: &serde_json::Value) -> bool {
         let stored: Settings = match self.store.settings().await {
             Ok(settings) => settings,
             Err(error) => {
                 log::error!("reading settings: {error}");
-                return;
+                return false;
             }
         };
         let Ok(current) = serde_json::to_value(&stored) else {
-            return;
+            return false;
         };
         let merged = exo_store::merge_settings(from, &current, to);
         if merged == current {
-            return;
+            return true;
         }
         let settings: Settings = match serde_json::from_value(merged.clone()) {
             Ok(settings) => settings,
             Err(error) => {
                 log::warn!("settings from Examail Cloud don't read: {error}");
-                return;
+                return false;
             }
         };
         if let Err(error) = self.store.save_settings(&settings).await {
             log::error!("saving settings: {error}");
-            return;
+            return false;
         }
         let _ = self.events.send(Event::SettingsChanged {
             from: current,
             to: merged,
         });
         self.repaint.ctx.request_repaint();
+        true
     }
 
     /// Keeps the rows that `mutation` stars or unstars in Starred where they are in `view`, the
@@ -2465,7 +2470,11 @@ impl Worker {
                     log::error!("saving settings: {error}");
                 }
             }
-            Request::MergeSettings { from, to } => self.merge_settings(&from, &to).await,
+            Request::MergeSettings { from, to, done } => {
+                if self.merge_settings(&from, &to).await {
+                    let _ = done.send(());
+                }
+            }
             Request::SaveDeviceSettings(settings) => {
                 if let Err(error) = self.store.save_settings(&settings).await {
                     log::error!("saving device settings: {error}");
