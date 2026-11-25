@@ -201,7 +201,8 @@ pub(super) fn adopted(message: &MessageDetail, thread: &ThreadDetail) -> Open {
         (None, None) => String::new(),
     };
     let (body, quoted_content) = match exo_mail::split_draft_quote(&html) {
-        Some((body, quote)) => (body, Some(quote)),
+        // The editor sanitizes the body as it loads it, but not the quote it reveals.
+        Some((body, quote)) => (body, Some(exo_mail::sanitize_fragment(&quote))),
         None => (html, None),
     };
     let quote_signed = quoted_content.is_some();
