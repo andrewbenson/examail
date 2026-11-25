@@ -311,8 +311,8 @@ pub fn show(
     action
 }
 
-/// The company section: the company (or, without one, the title) as its header, 24px in where
-/// an icon would be, and the title as its row, each wrapping. Returns the section's height.
+/// The company section: the company (or, without one, the title) as its header, after the
+/// about-me icon, and the title as its row, each wrapping. Returns the section's height.
 fn company(
     ui: &Ui,
     painter: &Painter,
@@ -331,6 +331,7 @@ fn company(
     let header_lines = BOLD.wrap(ui.ctx(), header, width - 24.0);
     let header_rect =
         Rect::from_min_size(pos2(left, y), vec2(width, 16.0 * header_lines.len() as f32));
+    section_icon(ui, left, y, "legacy/DEPRECATED_aboutme", header_rect);
     // A section header takes the pointer, whether or not it goes anywhere.
     ui.interact(
         header_rect,
@@ -381,6 +382,20 @@ fn section_header(
     area: Rect,
 ) -> Rect {
     let palette = exo_ui::palette(ui.ctx());
+    section_icon(ui, left, top, icon, area);
+    let width = BOLD.paint_line(
+        painter,
+        pos2(left + 24.0, top + 1.0),
+        text,
+        palette.ink(0.8, 0.85),
+        None,
+    );
+    Rect::from_min_size(pos2(left + 24.0, top + 1.0), vec2(width, 16.0))
+}
+
+/// A section header's 16px icon at (`left`, `top`), as [`section_header`] describes it.
+fn section_icon(ui: &Ui, left: f32, top: f32, icon: &str, area: Rect) {
+    let palette = exo_ui::palette(ui.ctx());
     let hovered = ui.rect_contains_pointer(area);
     let (disc, glyph) = match palette.theme {
         exo_ui::Theme::Snow => (Color32::from_rgb(0xbf, 0xc8, 0xd2), Color32::WHITE),
@@ -401,14 +416,6 @@ fn section_header(
         glyph,
         disc,
     );
-    let width = BOLD.paint_line(
-        painter,
-        pos2(left + 24.0, top + 1.0),
-        text,
-        palette.ink(0.8, 0.85),
-        None,
-    );
-    Rect::from_min_size(pos2(left + 24.0, top + 1.0), vec2(width, 16.0))
 }
 
 fn click(ui: &Ui, id: Id, rect: Rect) -> bool {
