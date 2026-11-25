@@ -68,8 +68,7 @@ pub(crate) fn is_marketing_nodes(roots: &[NodeRef], sender: &str) -> bool {
                 }
                 if let (Some(raw), Some(style)) = (raw_style.as_deref(), parsed_style.as_ref()) {
                     if raw.contains("border:") {
-                        let outlook = style.get("border-color") == "windowtext"
-                            && style.get("border-width") == "1pt";
+                        let outlook = is_outlook_border(style);
                         let border = style.get("border");
                         if !outlook
                             && !border.is_empty()
@@ -129,6 +128,29 @@ fn border_is_zero(border: &str) -> bool {
     border
         .split_whitespace()
         .any(|token| matches!(token, "0" | "0px" | "0pt" | "0em"))
+}
+
+/// Outlook's 1pt `windowtext` frame (around "Image removed by sender." and the like), read as
+/// the DOM reads `borderColor` and `borderWidth`: from the longhands, or else from the `border`
+/// shorthand, with `1.0pt` the same as `1pt`.
+fn is_outlook_border(style: &Style) -> bool {
+    let shorthand = style.get("border");
+    let pick = |longhand: &str, matches: &dyn Fn(&str) -> bool| {
+        let value = style.get(longhand);
+        if value.is_empty() {
+            shorthand.split_whitespace().any(matches)
+        } else {
+            matches(value)
+        }
+    };
+    let windowtext = |value: &str| value.eq_ignore_ascii_case("windowtext");
+    let one_point = |value: &str| {
+        value
+            .strip_suffix("pt")
+            .and_then(|number| number.parse::<f64>().ok())
+            .is_some_and(|points| (points - 1.0).abs() < f64::EPSILON)
+    };
+    pick("border-color", &windowtext) && pick("border-width", &one_point)
 }
 
 fn has_positive_length(value: &str) -> bool {
@@ -324,6 +346,16 @@ mod tests {
             "<blockquote style=\"border-left:1px solid #ccc\">old</blockquote>"
         ));
         assert!(!marketing("<div align=\"center\"><hr></div>"));
+        // Outlook frames a removed image this way in an everyday reply.
+        assert!(!marketing(
+            "<p><span style=\"border:solid windowtext 1.0pt;padding:0in\"><img></span></p>"
+        ));
+        assert!(!marketing(
+            "<p style=\"border:solid;border-color:windowtext;border-width:1pt\">x</p>"
+        ));
+        assert!(marketing(
+            "<p style=\"border:solid windowtext 2.0pt\">x</p>"
+        ));
         assert!(!is_marketing(
             &dom::parse("<p align=center>x</p>"),
             "MAILER-DAEMON@x.com"
