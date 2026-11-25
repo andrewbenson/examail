@@ -364,6 +364,16 @@ async fn check(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Json<V
 /// Disconnect: revokes the service's grant at Google and forgets the account.
 async fn disconnect(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<StatusCode> {
     let identity = identify(&app, &headers).await?;
+    // Gmail stops publishing the mailbox while the grant can still say so.
+    match crate::jobs::account_gmail(&app, &identity.sub).await {
+        Ok(Some(gmail)) => {
+            if let Err(error) = gmail.gmail().stop_watch().await {
+                log::warn!("stopping {}'s watch: {error}", identity.sub);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("stopping {}'s watch: {error:#}", identity.sub),
+    }
     if let Some(grant) = app.store.grant(&identity.sub).await? {
         let refresh = String::from_utf8(app.google.open(&grant.sealed_refresh_token).await?)?;
         match app.google.oauth.revoke(&refresh).await {

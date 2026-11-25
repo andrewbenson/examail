@@ -123,7 +123,7 @@ pub async fn queue(app: &App, sub: &str, arrival: &Arrival) -> Result<()> {
         .set(ROUTES, &id, &route, Precondition::Missing)
         .await
     {
-        Ok(()) | Err(crate::firestore::Error::Exists) => Ok(()),
+        Ok(()) | Err(crate::firestore::Error::Exists | crate::firestore::Error::Gone) => Ok(()),
         Err(crate::firestore::Error::Other(error)) => Err(error),
     }
 }
@@ -225,20 +225,22 @@ async fn label(
     if !message.label_ids.iter().any(|label| label == "INBOX") {
         return Ok(true);
     }
+    // The sender writes the Message-ID, so only a plain one goes into a search, quoted.
     let Some(rfc822) = message
         .header("Message-ID")
         .map(|id| id.trim().trim_matches(|c| c == '<' || c == '>').to_owned())
-        .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+        .filter(|id| plain_message_id(id))
     else {
         return Ok(true);
     };
-    let narrowed = |query: &str| format!("rfc822msgid:{rfc822} {query}");
-    if !found(gmail, &narrowed("in:anywhere")).await? {
+    let narrowed = |query: &str| format!("rfc822msgid:\"{rfc822}\" {query}");
+    let id = route.message_id.as_str();
+    if !found(gmail, &narrowed("in:anywhere"), id).await? {
         return Ok(false);
     }
     let mut add = Vec::new();
     for split in splits {
-        if found(gmail, &narrowed(&format!("({})", split.gmail_query))).await? {
+        if found(gmail, &narrowed(&format!("({})", split.gmail_query)), id).await? {
             add.push(label_id(app, gmail, &route.sub, split, labels).await?);
         }
     }
@@ -255,13 +257,29 @@ async fn label(
     Ok(true)
 }
 
-async fn found(gmail: &gmail::Client, query: &str) -> Result<bool> {
+/// Whether the search `query` finds message `id` itself.
+async fn found(gmail: &gmail::Client, query: &str, id: &str) -> Result<bool> {
     let query = gmail::ListQuery {
         q: Some(query.to_owned()),
-        max_results: Some(1),
+        max_results: Some(10),
         ..gmail::ListQuery::default()
     };
-    Ok(!gmail.gmail().messages(&query).await?.messages.is_empty())
+    Ok(gmail
+        .gmail()
+        .messages(&query)
+        .await?
+        .messages
+        .iter()
+        .any(|message| message.id.as_deref() == Some(id)))
+}
+
+/// A Message-ID safe to search by: 1–200 of letters, digits and `.@_+=$%-`, with an `@`.
+pub fn plain_message_id(id: &str) -> bool {
+    (1..=200).contains(&id.len())
+        && id.contains('@')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".@_+=$%-".contains(c))
 }
 
 /// The id of `split`'s label: the one made for it before (renamed if the split was), else one
@@ -363,6 +381,14 @@ mod tests {
             .collect();
         assert_eq!(names, ["Team", "News"]);
         assert!(splits(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn only_a_plain_message_id_is_searched_by() {
+        assert!(plain_message_id("CAGYk1Y-x.y=z@mail.gmail.com"));
+        assert!(!plain_message_id("a@b) OR (in:anywhere"));
+        assert!(!plain_message_id("a\"@b"));
+        assert!(!plain_message_id("no-at-sign"));
     }
 
     #[test]

@@ -3066,7 +3066,14 @@ impl Mail {
         self.pickers.register(&mut self.commands);
         accounts::register(&mut self.commands, ctx.os());
         let notice = self.notice();
-        notice::register(&mut self.commands, notice, self.updates.is_some());
+        let phone_notifications = cloud::status(self.account.email())
+            .map(|_| self.account.settings().ntfy.is_some());
+        notice::register(
+            &mut self.commands,
+            notice,
+            self.updates.is_some(),
+            phone_notifications,
+        );
         first_run::register(&mut self.commands, &self.first_run);
         google_apps::register(
             &mut self.commands,

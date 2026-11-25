@@ -61,7 +61,14 @@ pub enum Action {
     Dismiss,
     /// ⌘C on `Version Info`.
     Copy,
+    /// ⌘K's `Turn On Phone Notifications`: Examail Cloud notifies a new private ntfy topic.
+    PhoneNotificationsOn,
+    /// ⌘K's `Turn Off Phone Notifications`.
+    PhoneNotificationsOff,
 }
+
+/// The ntfy server phone notifications go through.
+const NTFY: &str = "https://ntfy.sh";
 
 impl Notice {
     fn title(self) -> &'static str {
@@ -97,8 +104,33 @@ pub(crate) fn register(
     commands: &mut Commands<commands::Action>,
     open: Option<Notice>,
     updates: bool,
+    phone_notifications: Option<bool>,
 ) {
     let act = commands::Action::Notice;
+    // Only with Examail Cloud on, which sends them.
+    match phone_notifications {
+        Some(false) => commands.add(
+            Command::new(
+                "PHONE_NOTIFICATIONS_ON",
+                "Turn On Phone Notifications",
+                act(Action::PhoneNotificationsOn),
+            )
+            .aliases(["ntfy", "Push Notifications"])
+            .default_score(0.0)
+            .icon("data/icon"),
+        ),
+        Some(true) => commands.add(
+            Command::new(
+                "PHONE_NOTIFICATIONS_OFF",
+                "Turn Off Phone Notifications",
+                act(Action::PhoneNotificationsOff),
+            )
+            .aliases(["ntfy", "Push Notifications"])
+            .default_score(0.0)
+            .icon("data/icon"),
+        ),
+        None => {}
+    }
     commands.add(
         Command::new("VERSION", "Version Info", act(Action::VersionInfo))
             .default_score(0.0)
@@ -181,6 +213,30 @@ impl crate::Mail {
                 }
                 _ => self.notice = None,
             },
+            Action::PhoneNotificationsOn => {
+                let mut bytes = [0u8; 16];
+                if getrandom::fill(&mut bytes).is_err() {
+                    return;
+                }
+                let topic: String = std::iter::once("examail-".to_owned())
+                    .chain(bytes.iter().map(|byte| format!("{byte:02x}")))
+                    .collect();
+                self.account.update_settings(|settings| {
+                    settings.ntfy = Some(exo_store::Ntfy {
+                        server: NTFY.to_owned(),
+                        topic: topic.clone(),
+                    });
+                });
+                self.ctx.copy_text(format!("{NTFY}/{topic}"));
+                self.commands.hint(Hint::new().text(
+                    "Phone notifications on. Subscribe to the copied topic in the ntfy app.",
+                ));
+            }
+            Action::PhoneNotificationsOff => {
+                self.account.update_settings(|settings| settings.ntfy = None);
+                self.commands
+                    .hint(Hint::new().text("Phone notifications off."));
+            }
             Action::Copy => {
                 if let Some(notice) = self.notice {
                     self.ctx.copy_text(notice.text());

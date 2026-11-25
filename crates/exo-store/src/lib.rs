@@ -104,7 +104,7 @@ pub use quota::Quota;
 pub use search::{GmailPage, Highlighted, Search, SearchPage, SearchResult};
 pub use settings::{
     AdditionalTimezone, AutoAdvance, CalendarAccount, CalendarEventNotifications,
-    CalendarNotifications, CalendarSetting, CalendarSettings, DeviceSettings, Document,
+    CalendarNotifications, CalendarSetting, CalendarSettings, DeviceSettings, Document, Ntfy,
     EmojiSkinTone, MeetingLinks, Notifications, Nudge, PreviousDropdown, PreviousReminder,
     PreviousSchedule, PreviousSuggestion, QuickTips, ReminderSettings, RemoteContentBlocking,
     SearchHistoryItem, SearchHistoryKind, Settings, Snippet, SnippetAnalytics, SnippetSend,

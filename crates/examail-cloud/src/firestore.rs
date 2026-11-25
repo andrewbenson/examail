@@ -34,12 +34,17 @@ pub enum Precondition {
     None,
     /// Only create; fails with [`Error::Exists`] when the document is there.
     Missing,
+    /// Only replace; fails with [`Error::Gone`] when the document isn't there (deleted since it
+    /// was read).
+    Present,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("the document already exists")]
     Exists,
+    #[error("the document is gone")]
+    Gone,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -89,6 +94,7 @@ impl Firestore {
         let path = match precondition {
             Precondition::None => format!("{collection}/{id}"),
             Precondition::Missing => format!("{collection}/{id}?currentDocument.exists=false"),
+            Precondition::Present => format!("{collection}/{id}?currentDocument.exists=true"),
         };
         let response = self
             .request(Method::PATCH, &path, Some(json!({ "fields": fields })))
@@ -101,6 +107,9 @@ impl Firestore {
                 return Err(Error::Exists);
             }
             return Err(anyhow::anyhow!("writing {collection}/{id}: {text}").into());
+        }
+        if precondition == Precondition::Present && response.status() == StatusCode::NOT_FOUND {
+            return Err(Error::Gone);
         }
         checked(response).await?;
         Ok(())

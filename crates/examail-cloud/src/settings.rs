@@ -115,7 +115,7 @@ pub async fn put(
             .await
         {
             Ok(()) => true,
-            Err(crate::firestore::Error::Exists) => false,
+            Err(crate::firestore::Error::Exists | crate::firestore::Error::Gone) => false,
             Err(crate::firestore::Error::Other(error)) => return Err(error.into()),
         },
     };

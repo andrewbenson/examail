@@ -203,6 +203,24 @@ pub struct Settings {
     /// Images`).
     #[serde(skip_serializing_if = "is_false")]
     pub reduce_motion: bool,
+    /// `ntfy`: where Examail Cloud sends phone notifications, when it's on. Examail itself
+    /// doesn't send them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntfy: Option<Ntfy>,
+    /// Keys this version doesn't know, from a newer one on another Mac, kept as they are so
+    /// saving and syncing don't drop them.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+/// An ntfy topic Examail Cloud notifies of new mail at ([`Settings::ntfy`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Ntfy {
+    /// The server, `https://ntfy.sh` unless set otherwise.
+    pub server: String,
+    /// The topic: random and unlisted, since anyone who knows it can read it.
+    pub topic: String,
 }
 
 /// `quickTips`: the Quick Tips bar.

@@ -391,3 +391,18 @@ mod merge_tests {
         assert_eq!(merge_settings(&local, &local, &remote), remote);
     }
 }
+
+#[cfg(test)]
+mod unknown_keys {
+    use crate::Settings;
+    use serde_json::json;
+
+    #[test]
+    fn settings_keep_keys_this_version_doesnt_know() {
+        let document = json!({ "theme": "carbon", "fromTheFuture": { "a": 1 } });
+        let settings: Settings = serde_json::from_value(document.clone()).unwrap();
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["fromTheFuture"], document["fromTheFuture"]);
+        assert_eq!(saved["theme"], "carbon");
+    }
+}

@@ -31,6 +31,8 @@ use crate::settings::Context as SettingsContext;
 pub const COLLECTION: &str = "watches";
 /// The label a muted thread carries ([`exo_store`'s `EXO_MUTED`]).
 pub const MUTED: &str = "[Exo]/Muted";
+/// The one ntfy server phone notifications go to.
+const NTFY: &str = "https://ntfy.sh";
 /// How long one run may hold an account's watch before another may take it over.
 const LEASE: SignedDuration = SignedDuration::from_mins(2);
 /// A watch is renewed once it has less than this left.
@@ -185,10 +187,17 @@ pub async fn catch_up(app: &App, sub: &str) -> Result<()> {
     };
     watch.history_id = next.to_string();
     watch.lease_until = String::new();
-    app.store
+    // Only if the watch is still there: a disconnect meanwhile deleted it, and it stays deleted.
+    match app
+        .store
         .db()
-        .set(COLLECTION, sub, &watch, Precondition::None)
-        .await?;
+        .set(COLLECTION, sub, &watch, Precondition::Present)
+        .await
+    {
+        Ok(()) | Err(crate::firestore::Error::Gone) => {}
+        Err(crate::firestore::Error::Exists) => {}
+        Err(crate::firestore::Error::Other(error)) => return Err(error),
+    }
     result.map(|_| ())
 }
 
@@ -458,8 +467,8 @@ pub fn notifies(settings: &Value, labels: &[String]) -> bool {
     settings["unifiedInbox"] == true || (has("CATEGORY_PERSONAL") && !has("CATEGORY_SOCIAL"))
 }
 
-/// Where the account's phone notifications go: an ntfy server and topic, from the settings'
-/// `ntfy` (`{"server": "https://ntfy.sh", "topic": "…"}`).
+/// Where the account's phone notifications go: a topic on ntfy.sh, from the settings' `ntfy`
+/// (`{"topic": "…"}`; a `server` there is ignored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ntfy {
     pub server: String,
@@ -477,15 +486,9 @@ impl Ntfy {
         {
             return None;
         }
-        let server = ntfy["server"]
-            .as_str()
-            .map(str::trim)
-            .filter(|server| server.starts_with("https://"))
-            .unwrap_or("https://ntfy.sh")
-            .trim_end_matches('/')
-            .to_owned();
+        // Only ntfy.sh: the service posts nowhere a setting could point it.
         Some(Self {
-            server,
+            server: NTFY.to_owned(),
             topic: topic.to_owned(),
         })
     }
@@ -604,7 +607,7 @@ mod tests {
             None
         );
         assert_eq!(
-            Ntfy::from_settings(&json!({ "ntfy": { "server": "http://x", "topic": "t" } }))
+            Ntfy::from_settings(&json!({ "ntfy": { "server": "https://169.254.169.254", "topic": "t" } }))
                 .unwrap()
                 .server,
             "https://ntfy.sh"
