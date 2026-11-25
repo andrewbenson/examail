@@ -107,7 +107,7 @@ roles! {
     /// Right pane background, `hsl(216, 100%, 99%)`.
     background_base_accent = "#fafcff", "#18191a";
     /// Raised cards: an expanded message.
-    background_elevated_default = "#ffffff", "#363a40";
+    background_elevated_default = "#ffffff", "#393939";
     /// Attachment cards.
     background_elevated_accent = "#dce2ea", "#555b64";
     /// Calendar invite cards.
