@@ -1996,12 +1996,17 @@ impl ThreadView {
                         pos2(layout.inner.left(), top),
                         vec2(layout.inner.width(), draft),
                     );
-                    actions.extend(
-                        drafts
-                            .show(ui, &item.id, form, card, layout.column.x_range())
-                            .into_iter()
-                            .map(Action::Compose),
-                    );
+                    // A marketing card in Carbon is white, so its draft keeps Snow's colors, as the
+                    // header's ink does (and Carbon's dialogs on their light cards).
+                    let shown = if marketing && theme == exo_ui::Theme::Carbon {
+                        let ctx = ui.ctx().clone();
+                        exo_ui::with_theme(&ctx, exo_ui::Theme::Snow, || {
+                            drafts.show(ui, &item.id, form, card, layout.column.x_range())
+                        })
+                    } else {
+                        drafts.show(ui, &item.id, form, card, layout.column.x_range())
+                    };
+                    actions.extend(shown.into_iter().map(Action::Compose));
                 }
                 if let Some(hint) = self.hint.as_ref().filter(|_| at + 1 == self.items.len()) {
                     footer::paint_hint(
