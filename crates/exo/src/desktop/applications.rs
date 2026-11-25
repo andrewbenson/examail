@@ -296,8 +296,11 @@ mod macos {
             return false;
         };
         let app = NSApplication::sharedApplication(mtm);
-        // Exo comes to the front. `activate` is new in macOS 14, and Exo runs on 13.
-        #[allow(deprecated)]
+        // Exo comes to the front.
+        #[expect(
+            deprecated,
+            reason = "`activate` is new in macOS 14, and Exo runs on macOS 13"
+        )]
         app.activateIgnoringOtherApps(true);
         let alert = NSAlert::new(mtm);
         // AppKit's informational alert, with the app's icon.

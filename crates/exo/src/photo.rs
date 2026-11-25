@@ -18,7 +18,6 @@ const MAX_SIDE: u32 = 2048;
 /// build, two seconds in a debug one).
 pub struct Photo {
     tiles: Arc<OnceLock<Option<Tiles>>>,
-    decoding: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The photos decoded or being decoded, keyed by file, whether with a blurred copy, and the
@@ -34,12 +33,26 @@ struct Tiles {
     /// A small blurred copy, for a photo asked for with one.
     blurred: Option<TextureHandle>,
     /// A small copy in memory, for [`Photo::sample`], likewise.
-    small: Option<RgbImage>,
+    small: Option<Arc<RgbImage>>,
     /// Each tile owns a range of the photo's columns and rows, and its texture holds one more
     /// texel on each inner side, so sampling at the seam blends the same texels as one big
     /// texture would.
     tiles: Vec<Tile>,
 }
+
+/// Decoded pixel buffers shared across [`egui::Context`]s (such as compose pop-out windows and
+/// concurrent harnesses) so the same 4096px JPEG is not decoded repeatedly.
+struct Pixels {
+    rgb: RgbImage,
+    small: Option<Arc<RgbImage>>,
+    blurred: Option<RgbImage>,
+}
+
+type PixelKey = (PathBuf, u64, Option<std::time::SystemTime>, bool);
+type PixelSlot = Arc<OnceLock<Option<Arc<Pixels>>>>;
+type PixelCache = Vec<(PixelKey, PixelSlot)>;
+static PIXELS: Mutex<PixelCache> = Mutex::new(Vec::new());
+const MAX_CACHED_PIXELS: usize = 4;
 
 struct Tile {
     texture: TextureHandle,
@@ -75,16 +88,13 @@ impl Photo {
             .find(|(known, _)| *known == key)
             .and_then(|(_, tiles)| tiles.upgrade())
         {
-            return Self {
-                tiles,
-                decoding: None,
-            };
+            return Self { tiles };
         }
         let tiles = Arc::new(OnceLock::new());
         decoded.push((key, Arc::downgrade(&tiles)));
         drop(decoded);
         let (done, ctx) = (tiles.clone(), ctx.clone());
-        let decode = move || {
+        let decode_job = move || {
             // Set whatever happens, for the screens sharing it that wait ([`Photo::wait`]).
             let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 decode(&ctx, &path, blurred)
@@ -92,14 +102,15 @@ impl Photo {
             let _ = done.set(decoded.ok().flatten());
             ctx.request_repaint();
         };
-        let decoding = std::thread::Builder::new()
-            .name("exo-photo".into())
-            .spawn(decode)
-            .inspect_err(|error| log::error!("decoding a photo: {error}"))
-            .ok();
-        let mut photo = Self { tiles, decoding };
-        if photo.decoding.is_none() {
-            photo.give_up();
+        let mut photo = Self { tiles };
+        match crate::account::shared_runtime() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(decode_job);
+            }
+            Err(error) => {
+                log::error!("decoding a photo: {error}");
+                photo.give_up();
+            }
         }
         photo
     }
@@ -108,18 +119,12 @@ impl Photo {
     pub fn share(&self) -> Self {
         Self {
             tiles: self.tiles.clone(),
-            decoding: None,
         }
     }
 
-    /// Blocks until decoding is over, here or for another screen sharing the photo. A screen with
-    /// a photo shows only once it can draw all of it.
+    /// Blocks until decoding is over, here or for another screen sharing the photo, for launch
+    /// before the window is revealed and for headless screenshot harnesses.
     pub fn wait(&mut self) {
-        if let Some(decoding) = self.decoding.take()
-            && decoding.join().is_err()
-        {
-            self.give_up();
-        }
         self.tiles.wait();
     }
 
@@ -251,30 +256,71 @@ impl Photo {
     }
 }
 
+fn decode_pixels(path: &Path, blurred: bool) -> Option<Arc<Pixels>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (
+        path.to_path_buf(),
+        meta.len(),
+        meta.modified().ok(),
+        blurred,
+    );
+    let slot = {
+        let mut cache = PIXELS
+            .lock()
+            .expect("the photo pixel cache's lock is never poisoned");
+        if let Some(pos) = cache.iter().position(|(known, _)| *known == key) {
+            let entry = cache.remove(pos);
+            let slot = entry.1.clone();
+            cache.push(entry);
+            slot
+        } else {
+            if cache.len() >= MAX_CACHED_PIXELS {
+                cache.remove(0);
+            }
+            let slot = Arc::new(OnceLock::new());
+            cache.push((key, slot.clone()));
+            slot
+        }
+    };
+    slot.get_or_init(|| {
+        let decoded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())?;
+        let small = blurred.then(|| {
+            Arc::new(
+                decoded
+                    .thumbnail(
+                        SMALL_WIDTH,
+                        SMALL_WIDTH * decoded.height() / decoded.width().max(1),
+                    )
+                    .into_rgb8(),
+            )
+        });
+        let blurred_rgb = blurred.then(|| {
+            decoded
+                .thumbnail(
+                    BLURRED_WIDTH,
+                    BLURRED_WIDTH * decoded.height() / decoded.width().max(1),
+                )
+                .blur(BLUR)
+                .into_rgb8()
+        });
+        Some(Arc::new(Pixels {
+            rgb: decoded.into_rgb8(),
+            small,
+            blurred: blurred_rgb,
+        }))
+    })
+    .clone()
+}
+
 fn decode(ctx: &egui::Context, path: &Path, blurred: bool) -> Option<Tiles> {
-    let decoded = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| image::load_from_memory(&bytes).ok());
-    let Some(decoded) = decoded else {
+    let Some(pixels_data) = decode_pixels(path, blurred) else {
         log::warn!("no photo at {}", path.display());
         return None;
     };
-    let small = blurred.then(|| {
-        decoded
-            .thumbnail(
-                SMALL_WIDTH,
-                SMALL_WIDTH * decoded.height() / decoded.width().max(1),
-            )
-            .into_rgb8()
-    });
-    let blurred = blurred.then(|| {
-        let small = decoded
-            .thumbnail(
-                BLURRED_WIDTH,
-                BLURRED_WIDTH * decoded.height() / decoded.width().max(1),
-            )
-            .blur(BLUR)
-            .into_rgb8();
+    let small = pixels_data.small.clone();
+    let blurred = pixels_data.blurred.as_ref().map(|small| {
         let image = egui::ColorImage::from_rgb(
             [small.width() as usize, small.height() as usize],
             small.as_raw(),
@@ -285,7 +331,7 @@ fn decode(ctx: &egui::Context, path: &Path, blurred: bool) -> Option<Tiles> {
             egui::TextureOptions::LINEAR,
         )
     });
-    let rgb = decoded.into_rgb8();
+    let rgb = &pixels_data.rgb;
     let (width, height) = rgb.dimensions();
     let (columns, rows) = (spans(width), spans(height));
     let mut tiles = Vec::new();

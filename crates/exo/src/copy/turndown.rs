@@ -5,8 +5,7 @@
 //! It runs on its own small tree, since the serializer edits the message before converting it
 //! and turndown edits it again (whitespace collapsing).
 
-use html5ever::{parse_document, tendril::TendrilSink};
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use exo_mail::dom::{self, NodeRef};
 
 /// `blockElements`.
 const BLOCK: &[&str] = &[
@@ -118,7 +117,7 @@ fn is_ascii_space(c: char) -> bool {
 impl Tree {
     /// `html`'s body, under a root.
     pub(super) fn parse(html: &str) -> Self {
-        let dom = parse_document(RcDom::default(), Default::default()).one(html);
+        let document = dom::parse(html);
         let mut tree = Self {
             nodes: vec![Node {
                 kind: Kind::Element {
@@ -129,31 +128,31 @@ impl Tree {
                 children: Vec::new(),
             }],
         };
-        if let Some(body) = find(&dom.document, "body") {
-            for child in body.children.borrow().iter() {
-                tree.import(child, 0);
+        if let Some(body) = dom::body(&document) {
+            let mut stack: Vec<(NodeRef, usize)> = dom::children(&body)
+                .into_iter()
+                .rev()
+                .map(|child| (child, 0))
+                .collect();
+            while let Some((node, parent)) = stack.pop() {
+                let kind = if let Some(tag) = dom::tag(&node) {
+                    Kind::Element {
+                        name: tag.to_uppercase(),
+                        attributes: dom::attrs(&node),
+                    }
+                } else if let Some(contents) = dom::text(&node) {
+                    Kind::Text(contents)
+                } else {
+                    Kind::Other
+                };
+                let id = tree.push(kind, parent);
+                for child in dom::children(&node).into_iter().rev() {
+                    stack.push((child, id));
+                }
             }
         }
+        dom::drop_tree(document);
         tree
-    }
-
-    fn import(&mut self, handle: &Handle, parent: usize) {
-        let kind = match &handle.data {
-            NodeData::Element { name, attrs, .. } => Kind::Element {
-                name: name.local.to_uppercase(),
-                attributes: attrs
-                    .borrow()
-                    .iter()
-                    .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
-                    .collect(),
-            },
-            NodeData::Text { contents } => Kind::Text(contents.borrow().to_string()),
-            _ => Kind::Other,
-        };
-        let id = self.push(kind, parent);
-        for child in handle.children.borrow().iter() {
-            self.import(child, id);
-        }
     }
 
     pub(super) fn push(&mut self, kind: Kind, parent: usize) -> usize {
@@ -218,22 +217,29 @@ impl Tree {
 
     /// `textContent`.
     pub(super) fn text(&self, id: usize) -> String {
-        match &self.nodes[id].kind {
-            Kind::Text(text) => text.clone(),
-            Kind::Other => String::new(),
-            Kind::Element { .. } => self
-                .children(id)
-                .iter()
-                .map(|child| self.text(*child))
-                .collect(),
+        let mut out = String::new();
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            match &self.nodes[current].kind {
+                Kind::Text(text) => out.push_str(text),
+                Kind::Other => {}
+                Kind::Element { .. } => {
+                    stack.extend(self.children(current).iter().rev().copied());
+                }
+            }
         }
+        out
     }
 
     fn has_descendant(&self, id: usize, names: &[&str]) -> bool {
-        self.children(id).iter().any(|child| {
-            self.name(*child).is_some_and(|name| names.contains(&name))
-                || self.has_descendant(*child, names)
-        })
+        let mut stack: Vec<usize> = self.children(id).to_vec();
+        while let Some(child) = stack.pop() {
+            if self.name(child).is_some_and(|name| names.contains(&name)) {
+                return true;
+            }
+            stack.extend_from_slice(self.children(child));
+        }
+        false
     }
 
     /// Takes `id` and its subtree out of the tree.
@@ -386,19 +392,6 @@ impl Tree {
     }
 }
 
-fn find(handle: &Handle, name: &str) -> Option<Handle> {
-    if let NodeData::Element { name: element, .. } = &handle.data
-        && &*element.local == name
-    {
-        return Some(handle.clone());
-    }
-    handle
-        .children
-        .borrow()
-        .iter()
-        .find_map(|child| find(child, name))
-}
-
 /// `[ \r\n\t]+` → one space.
 fn collapse(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -420,7 +413,7 @@ fn collapse(text: &str) -> String {
 /// Converts `tree`'s content to Markdown.
 pub(super) fn turndown(mut tree: Tree) -> String {
     tree.collapse_whitespace();
-    let output = process(&tree, 0, false);
+    let output = process_root(&tree);
     // No line breaks or tabs at the start, nor whitespace at the end.
     output
         .trim_start_matches(['\t', '\r', '\n'])
@@ -428,28 +421,59 @@ pub(super) fn turndown(mut tree: Tree) -> String {
         .to_owned()
 }
 
-fn process(tree: &Tree, id: usize, code: bool) -> String {
-    let mut output = String::new();
-    for &child in tree.children(id) {
-        let replacement = match tree.kind(child) {
-            Kind::Text(text) if code => text.clone(),
-            Kind::Text(text) => escape(text),
-            Kind::Element { name, .. } => replacement(tree, child, code || name == "CODE"),
-            Kind::Other => String::new(),
-        };
-        output = join(&output, &replacement);
-    }
-    output
+struct Frame<'a> {
+    id: usize,
+    code: bool,
+    children: std::slice::Iter<'a, usize>,
+    output: String,
 }
 
-/// Node `id` as Markdown, as its rule converts it, with the whitespace at its edges moved outside.
-fn replacement(tree: &Tree, id: usize, code: bool) -> String {
-    let mut content = process(tree, id, code);
-    let (leading, trailing) = flanking_whitespace(tree, id);
-    if !leading.is_empty() || !trailing.is_empty() {
-        content = content.trim_matches(is_space).to_owned();
+fn process_root(tree: &Tree) -> String {
+    let mut frames = vec![Frame {
+        id: 0,
+        code: false,
+        children: tree.children(0).iter(),
+        output: String::new(),
+    }];
+    while let Some(frame) = frames.last_mut() {
+        if let Some(&child) = frame.children.next() {
+            match tree.kind(child) {
+                Kind::Text(text) => {
+                    let piece = if frame.code {
+                        text.clone()
+                    } else {
+                        escape(text)
+                    };
+                    frame.output = join(&frame.output, &piece);
+                }
+                Kind::Other => {
+                    frame.output = join(&frame.output, "");
+                }
+                Kind::Element { name, .. } => {
+                    let child_code = frame.code || name == "CODE";
+                    frames.push(Frame {
+                        id: child,
+                        code: child_code,
+                        children: tree.children(child).iter(),
+                        output: String::new(),
+                    });
+                }
+            }
+        } else {
+            let finished = frames.pop().expect("checked non-empty");
+            let Some(parent) = frames.last_mut() else {
+                return finished.output;
+            };
+            let mut content = finished.output;
+            let (leading, trailing) = flanking_whitespace(tree, finished.id);
+            if !leading.is_empty() || !trailing.is_empty() {
+                content = content.trim_matches(is_space).to_owned();
+            }
+            let replaced = format!("{leading}{}{trailing}", rule(tree, finished.id, &content));
+            parent.output = join(&parent.output, &replaced);
+        }
     }
-    format!("{leading}{}{trailing}", rule(tree, id, &content))
+    String::new()
 }
 
 fn is_blank(tree: &Tree, id: usize) -> bool {
@@ -756,5 +780,11 @@ mod tests {
     #[test]
     fn tables_become_paragraphs() {
         assert_eq!(md("<table><tr><td>a</td><td>b</td></tr></table>"), "a\n\nb");
+    }
+
+    #[test]
+    fn deeply_nested_html_converts_without_stack_overflow() {
+        let deep = format!("{}hello{}", "<div>".repeat(5000), "</div>".repeat(5000));
+        assert_eq!(md(&deep), "hello");
     }
 }

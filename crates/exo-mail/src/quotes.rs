@@ -163,11 +163,32 @@ impl<'a> MessageBody<'a> {
         let quoted = match previous {
             Some(previous) => {
                 self.previous = Some(previous);
-                self.find_quoted_portion()
+                match self.find_quoted_ranges() {
+                    Some((range, quote_only)) => self.non_empty_quoted_nodes(range, quote_only),
+                    None => self.signature_nodes(),
+                }
             }
-            None => self.find_signatures(),
+            None => self.signature_nodes(),
         };
         (quoted, self.content)
+    }
+
+    /// Finds the clean range hidden behind the `…` without wrapping or detaching DOM nodes, for
+    /// [`crate::visible_text`].
+    pub(crate) fn hidden_range(
+        mut self,
+        previous: Option<Previous<'a>>,
+    ) -> (Option<Range>, Content) {
+        let hidden = match previous {
+            Some(previous) => {
+                self.previous = Some(previous);
+                self.find_quoted_ranges()
+                    .map(|(range, _)| range)
+                    .or_else(|| self.find_signature_range())
+            }
+            None => self.find_signature_range(),
+        };
+        (hidden, self.content)
     }
 
     fn sender_pattern(&self) -> Option<Regex> {
@@ -179,15 +200,13 @@ impl<'a> MessageBody<'a> {
         Regex::new(&format!("(?i)({})", alternatives.join("|"))).ok()
     }
 
-    fn find_quoted_portion(&mut self) -> Quoted {
-        let Some(previous) = &self.previous else {
-            return self.find_signatures();
-        };
+    fn find_quoted_ranges(&mut self) -> Option<(Range, Range)> {
+        let previous = self.previous.as_ref()?;
         let previous_body =
             dom::body(previous.document).unwrap_or_else(|| previous.document.clone());
         let mut quoted_content = Content::new(&previous_body);
         if self.content.equivalent_to(&quoted_content) {
-            return self.find_signatures();
+            return None;
         }
         let equivalences: Vec<(String, String)> = previous
             .attachment_names
@@ -289,9 +308,7 @@ impl<'a> MessageBody<'a> {
                 separator = Some(header.separator_start);
             }
         }
-        let Some(mut range) = found else {
-            return self.find_signatures();
-        };
+        let mut range = found?;
         range = self.extend_backward_through_banners(range);
         let before = self.content.paragraph_before(range.start);
         let unextended = range;
@@ -337,10 +354,10 @@ impl<'a> MessageBody<'a> {
             }
             range.start = separator;
         }
-        self.non_empty_quoted_nodes(range, quote_only)
+        Some((range, quote_only))
     }
 
-    fn find_signatures(&mut self) -> Quoted {
+    fn find_signature_range(&mut self) -> Option<Range> {
         let candidates = self.potential_signature_ranges();
         let length = self.content.len();
         let range = if let Some(first) = candidates.first() {
@@ -371,17 +388,23 @@ impl<'a> MessageBody<'a> {
                 Direction::Backward,
             )
         };
-        if range.start != range.end && range.start != 0 && range.end == length {
-            let nodes = Content::remove_empty_nodes(self.content.nodes_for_range(range));
-            let classes = vec![(SIGNATURE_CLASS, QUOTED_CLASS); nodes.len()];
-            return Quoted {
-                nodes: mark(nodes, &classes),
-                hidden: Some(range),
-            };
-        }
-        Quoted {
-            nodes: Vec::new(),
-            hidden: None,
+        (range.start != range.end && range.start != 0 && range.end == length).then_some(range)
+    }
+
+    fn signature_nodes(&mut self) -> Quoted {
+        match self.find_signature_range() {
+            Some(range) => {
+                let nodes = Content::remove_empty_nodes(self.content.nodes_for_range(range));
+                let classes = vec![(SIGNATURE_CLASS, QUOTED_CLASS); nodes.len()];
+                Quoted {
+                    nodes: mark(nodes, &classes),
+                    hidden: Some(range),
+                }
+            }
+            None => Quoted {
+                nodes: Vec::new(),
+                hidden: None,
+            },
         }
     }
 
@@ -522,7 +545,7 @@ impl<'a> MessageBody<'a> {
     }
 
     fn find_pre_name_signature_content(&mut self, range: Range) -> Option<Range> {
-        let text = self.content.formatted_slice(range.start, range.end);
+        let text = self.content.search_string(Some(range));
         [&*SEPARATOR_LINE, &*DASH_DASH]
             .iter()
             .filter_map(|pattern| pattern.find(&text))
@@ -735,23 +758,24 @@ impl<'a> MessageBody<'a> {
 
     /// Marks the range's nodes quoted (or, before the quote, signature) and returns them.
     fn non_empty_quoted_nodes(&mut self, range: Range, quote_only: Range) -> Quoted {
-        let nodes = self.content.nodes_for_range(range);
-        let signature = if quote_only.start != range.start {
-            self.content.nodes_for_range(Range {
-                start: range.start,
-                end: quote_only.start,
-            })
+        let signature: std::collections::HashSet<dom::NodeKey> = if quote_only.start != range.start
+        {
+            self.content
+                .nodes_for_range(Range {
+                    start: range.start,
+                    end: quote_only.start,
+                })
+                .iter()
+                .map(dom::key)
+                .collect()
         } else {
-            Vec::new()
+            std::collections::HashSet::new()
         };
+        let nodes = self.content.nodes_for_range(range);
         let classes: Vec<_> = nodes
             .iter()
-            .enumerate()
-            .map(|(index, node)| {
-                let is_signature = signature
-                    .get(index)
-                    .is_some_and(|s| std::rc::Rc::ptr_eq(s, node));
-                if is_signature {
+            .map(|node| {
+                if signature.contains(&dom::key(node)) {
                     (SIGNATURE_CLASS, QUOTED_CLASS)
                 } else {
                     (QUOTED_CLASS, SIGNATURE_CLASS)
@@ -878,4 +902,78 @@ fn is_format_char(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{180E}'
         | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
         | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_single_text_node_containing_signature_and_quote() {
+        let previous = dom::parse("<div>Earlier note from Bob.</div>");
+        let document =
+            dom::parse("<div>Sounds good!<br><br>Ann<br><br>-- Earlier note from Bob.</div>");
+        let ann = Sender {
+            email: "ann@example.com".into(),
+            name: "Ann".into(),
+        };
+        let bob = Sender {
+            email: "bob@example.com".into(),
+            name: "Bob".into(),
+        };
+        let body = MessageBody::new(&document, &ann, "");
+        let (quoted, _) = body.split(Some(Previous {
+            document: &previous,
+            from: &bob,
+            attachment_names: &[],
+        }));
+        dom::detach_all(&quoted.nodes);
+        let unquoted = dom::inner_html(&dom::body(&document).unwrap());
+        let quoted_html: String = quoted.nodes.iter().map(dom::outer_html).collect();
+        assert!(
+            unquoted.contains("Sounds good!")
+                && !unquoted.contains("Ann")
+                && !unquoted.contains("Earlier note from Bob."),
+            "unquoted still had signature or quote: {unquoted}"
+        );
+        assert!(
+            quoted_html.contains("sh-signature")
+                && quoted_html.contains("sh-quoted-content")
+                && quoted_html.contains("Earlier note from Bob."),
+            "quoted nodes missing split tail: {quoted_html}"
+        );
+    }
+
+    #[test]
+    fn pre_name_signature_marker_after_replaced_element_keeps_clean_offsets() {
+        let document = dom::parse(
+            "<p>Thanks for the note.</p>\
+             <div class=\"gmail_signature\">\
+             <p><img src=\"https://x.io/logo.png\"> Keep this note</p>\
+             <p>--</p>\
+             <p>Ann Lee</p>\
+             </div>",
+        );
+        let ann = Sender {
+            email: "ann@example.com".into(),
+            name: "Ann Lee".into(),
+        };
+        let body = MessageBody::new(&document, &ann, "");
+        let (quoted, _) = body.split(None);
+        dom::detach_all(&quoted.nodes);
+        let unquoted = dom::inner_html(&dom::body(&document).unwrap());
+        let quoted_html: String = quoted.nodes.iter().map(dom::outer_html).collect();
+        assert!(
+            unquoted.contains("Keep this note"),
+            "replaced element must not shift the signature start into preceding text: {unquoted}"
+        );
+        assert!(
+            quoted_html.contains("--") && quoted_html.contains("Ann Lee"),
+            "signature should start at `--`: {quoted_html}"
+        );
+        assert!(
+            !quoted_html.contains("Keep this") && !quoted_html.contains("ote"),
+            "signature must not steal bytes from text before `--`: {quoted_html}"
+        );
+    }
 }

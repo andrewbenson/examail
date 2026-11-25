@@ -5,11 +5,59 @@
 
 use std::sync::LazyLock;
 
-use html5ever::{parse_document, tendril::TendrilSink as _};
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use egui::{Id, Rect, Sense, Ui};
+use exo_mail::dom::{self, NodeRef};
 use regex::Regex;
 
-use super::details::{Line, Run};
+/// A line of the description: runs of text, indented for a list.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Line {
+    pub indent: f32,
+    pub runs: Vec<Run>,
+}
+
+/// Text, a link when `link` is set, bold when `bold`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Run {
+    pub text: String,
+    pub link: Option<String>,
+    pub bold: bool,
+}
+
+/// Splits plain `text` into [`Run`]s with any URLs marked as links.
+#[must_use]
+pub(crate) fn linkify(text: &str) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let mut at = 0;
+    for (range, url) in exo_mail::links(text) {
+        if range.start > at {
+            runs.push(Run {
+                text: text[at..range.start].to_owned(),
+                ..Run::default()
+            });
+        }
+        runs.push(Run {
+            text: text[range.clone()].to_owned(),
+            link: Some(url),
+            bold: false,
+        });
+        at = range.end;
+    }
+    if at < text.len() {
+        runs.push(Run {
+            text: text[at..].to_owned(),
+            ..Run::default()
+        });
+    }
+    runs
+}
+
+/// Registers `rect` as an interactive link box for `href` with a pointing-hand hover cursor.
+pub(crate) fn interact_link(ui: &Ui, rect: Rect, id: Id, href: &str) -> egui::Response {
+    exo_ui::link_box(ui.ctx(), rect, href);
+    ui.interact(rect, id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// How far a list sits in: `ul, ol { margin-left: 32px }`.
 const LIST_INDENT: f32 = 32.0;
@@ -49,9 +97,10 @@ pub fn lines(description: &str) -> Vec<Line> {
         cleaned = pattern.replace(&cleaned, "").replace('\n', "<br/>");
     }
     let html = exo_mail::sanitize_description(cleaned.trim());
-    let document = parse_document(RcDom::default(), Default::default()).one(html);
+    let document = dom::parse(&html);
     let mut reader = Reader::default();
-    reader.children(&document.document, &Style::default());
+    reader.walk(&document);
+    dom::drop_tree(document);
     reader.flush();
     while reader.lines.last().is_some_and(|line| line.runs.is_empty()) {
         reader.lines.pop();
@@ -82,80 +131,93 @@ struct Reader {
     lists: Vec<(bool, usize)>,
 }
 
-impl Reader {
-    fn children(&mut self, node: &Handle, style: &Style) {
-        for child in node.children.borrow().iter() {
-            self.node(child, style);
-        }
-    }
+enum Step {
+    Visit(NodeRef, Style),
+    AfterElement { is_list: bool, block: bool },
+}
 
-    fn node(&mut self, node: &Handle, style: &Style) {
-        match &node.data {
-            NodeData::Text { contents } => self.text(&contents.borrow(), style),
-            NodeData::Element { name, attrs, .. } => {
-                let tag: &str = &name.local;
-                let attr = |key: &str| {
-                    attrs
-                        .borrow()
-                        .iter()
-                        .find(|attr| &*attr.name.local == key)
-                        .map(|attr| attr.value.to_string())
-                };
-                let mut inner = style.clone();
-                match tag {
-                    "br" => return self.flush_line(style),
-                    "a" => inner.link = attr("href"),
-                    "b" | "strong" => inner.bold = true,
-                    "ul" | "ol" => inner.indent += LIST_INDENT,
-                    "script" | "style" | "head" | "title" => return,
-                    _ => {}
+impl Reader {
+    fn walk(&mut self, root: &NodeRef) {
+        let mut stack = vec![Step::Visit(root.clone(), Style::default())];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::AfterElement { is_list, block } => {
+                    if is_list {
+                        self.lists.pop();
+                    }
+                    if block {
+                        self.flush();
+                    }
                 }
-                let block = matches!(
-                    tag,
-                    "p" | "div"
-                        | "li"
-                        | "ul"
-                        | "ol"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "blockquote"
-                        | "pre"
-                        | "table"
-                        | "tr"
-                );
-                if block {
-                    self.flush();
-                }
-                if matches!(tag, "ul" | "ol") {
-                    self.lists.push((tag == "ol", 0));
-                }
-                if tag == "li" {
-                    let marker = match self.lists.last_mut() {
-                        Some((true, count)) => {
-                            *count += 1;
-                            format!("{count}. ")
+                Step::Visit(node, style) => {
+                    if let Some(contents) = dom::text(&node) {
+                        self.text(&contents, &style);
+                        continue;
+                    }
+                    let Some(tag) = dom::tag(&node) else {
+                        for child in dom::children(&node).into_iter().rev() {
+                            stack.push(Step::Visit(child, style.clone()));
                         }
-                        _ => "• ".to_owned(),
+                        continue;
                     };
-                    self.current.indent = inner.indent;
-                    self.current.runs.push(Run {
-                        text: marker,
-                        ..Run::default()
-                    });
-                }
-                self.children(node, &inner);
-                if matches!(tag, "ul" | "ol") {
-                    self.lists.pop();
-                }
-                if block {
-                    self.flush();
+                    let mut inner = style.clone();
+                    match tag {
+                        "br" => {
+                            self.flush_line(&style);
+                            continue;
+                        }
+                        "a" => inner.link = dom::attr(&node, "href"),
+                        "b" | "strong" => inner.bold = true,
+                        "ul" | "ol" => inner.indent += LIST_INDENT,
+                        "script" | "style" | "head" | "title" => continue,
+                        _ => {}
+                    }
+                    let block = matches!(
+                        tag,
+                        "p" | "div"
+                            | "li"
+                            | "ul"
+                            | "ol"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "blockquote"
+                            | "pre"
+                            | "table"
+                            | "tr"
+                    );
+                    if block {
+                        self.flush();
+                    }
+                    let is_list = matches!(tag, "ul" | "ol");
+                    if is_list {
+                        self.lists.push((tag == "ol", 0));
+                    }
+                    if tag == "li" {
+                        let marker = match self.lists.last_mut() {
+                            Some((true, count)) => {
+                                *count += 1;
+                                format!("{count}. ")
+                            }
+                            _ => "• ".to_owned(),
+                        };
+                        self.current.indent = inner.indent;
+                        self.current.runs.push(Run {
+                            text: marker,
+                            ..Run::default()
+                        });
+                    }
+                    if is_list || block {
+                        stack.push(Step::AfterElement { is_list, block });
+                    }
+                    for child in dom::children(&node).into_iter().rev() {
+                        stack.push(Step::Visit(child, inner.clone()));
+                    }
                 }
             }
-            _ => self.children(node, style),
         }
     }
 
@@ -260,5 +322,11 @@ mod tests {
         // Newlines become `<br/>`s after the first pattern, so the line-anchored ones only match
         // a whole description.
         assert_eq!(texts(&lines("Agenda\n-::~:~::-")), ["Agenda", "-::~:~::-"]);
+    }
+
+    #[test]
+    fn deeply_nested_html_does_not_overflow_the_stack() {
+        let deep = format!("{}Agenda{}", "<div>".repeat(5000), "</div>".repeat(5000));
+        assert_eq!(texts(&lines(&deep)), ["Agenda"]);
     }
 }

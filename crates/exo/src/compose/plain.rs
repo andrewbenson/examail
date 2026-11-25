@@ -2,25 +2,26 @@
 //! `jaytaylor/html2text`: blocks on their own lines, paragraphs and headings set off by a blank
 //! line, links as `text ( url )`, list items as `* `, quotes as `> `.
 
-use html5ever::{parse_document, tendril::TendrilSink};
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use exo_mail::dom::{self, NodeRef};
 
 /// `html` as plain text, with CRLF line ends.
 pub(crate) fn from_html(html: &str) -> String {
-    let dom = parse_document(RcDom::default(), Default::default()).one(html);
+    let document = dom::parse(html);
     let mut out = Writer::default();
-    out.node(&dom.document);
+    out.walk(&document);
+    dom::drop_tree(document);
     out.finish()
 }
 
 /// The text of `html` that the user wrote, leaving out quotes, the signature and quoted messages.
 pub(crate) fn authored(html: &str) -> String {
-    let dom = parse_document(RcDom::default(), Default::default()).one(html);
+    let document = dom::parse(html);
     let mut out = Writer {
         authored: true,
         ..Writer::default()
     };
-    out.node(&dom.document);
+    out.walk(&document);
+    dom::drop_tree(document);
     out.finish().replace("\r\n", "\n")
 }
 
@@ -47,100 +48,127 @@ struct Writer {
     pre: bool,
 }
 
+enum Step {
+    Visit(NodeRef),
+    AfterAnchor { start: usize, href: Option<String> },
+    Block(usize),
+    ExitQuote,
+    ExitPre(bool),
+    Space,
+}
+
 impl Writer {
-    fn node(&mut self, node: &Handle) {
-        match &node.data {
-            NodeData::Text { contents } => self.text(&contents.borrow()),
-            NodeData::Element { name, attrs, .. } => {
-                let tag: &str = &name.local;
-                let attr = |wanted: &str| {
-                    attrs
-                        .borrow()
-                        .iter()
-                        .find(|attr| &*attr.name.local == wanted)
-                        .map(|attr| attr.value.to_string())
-                };
-                if self.authored
-                    && (tag == "blockquote"
-                        || attr("class").is_some_and(|class| {
-                            class
-                                .split_whitespace()
-                                .any(|class| NOT_AUTHORED.contains(&class))
-                        }))
-                {
-                    return;
-                }
-                match tag {
-                    "head" | "style" | "script" | "title" => {}
-                    "br" => self.newline(),
-                    "hr" => {
-                        self.block(1);
-                        self.text("--------");
-                        self.block(1);
-                    }
-                    "img" => {
-                        if let Some(alt) = attr("alt").filter(|alt| !alt.trim().is_empty()) {
-                            self.text(&alt);
+    fn walk(&mut self, root: &NodeRef) {
+        let push_children = |stack: &mut Vec<Step>, node: &NodeRef| {
+            for child in dom::children(node).into_iter().rev() {
+                stack.push(Step::Visit(child));
+            }
+        };
+        let mut stack = vec![Step::Visit(root.clone())];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::AfterAnchor { start, href } => {
+                    let text = self
+                        .flat()
+                        .get(start..)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned();
+                    if let Some(href) = href {
+                        let href = href.strip_prefix("mailto:").unwrap_or(&href);
+                        if text.is_empty() {
+                            self.text(href);
+                        } else if text != href {
+                            self.text(&format!(" ( {href} )"));
                         }
                     }
-                    "a" => {
-                        let start = self.flat().len();
-                        self.children(node);
-                        let text = self.flat()[start..].trim().to_owned();
-                        if let Some(href) = attr("href").filter(|href| !href.is_empty()) {
-                            let href = href.strip_prefix("mailto:").unwrap_or(&href).to_owned();
-                            if text.is_empty() {
-                                self.text(&href);
-                            } else if text != href {
-                                self.text(&format!(" ( {href} )"));
+                }
+                Step::Block(blank) => self.block(blank),
+                Step::ExitQuote => {
+                    self.quote -= 1;
+                    self.block(1);
+                }
+                Step::ExitPre(was_pre) => {
+                    self.pre = was_pre;
+                    self.block(1);
+                }
+                Step::Space => self.text(" "),
+                Step::Visit(node) => {
+                    if let Some(contents) = dom::text(&node) {
+                        self.text(&contents);
+                        continue;
+                    }
+                    let Some(tag) = dom::tag(&node) else {
+                        push_children(&mut stack, &node);
+                        continue;
+                    };
+                    if self.authored
+                        && (tag == "blockquote"
+                            || NOT_AUTHORED
+                                .iter()
+                                .any(|class| dom::has_class(&node, class)))
+                    {
+                        continue;
+                    }
+                    match tag {
+                        "head" | "style" | "script" | "title" => {}
+                        "br" => self.newline(),
+                        "hr" => {
+                            self.block(1);
+                            self.text("--------");
+                            self.block(1);
+                        }
+                        "img" => {
+                            if let Some(alt) =
+                                dom::attr(&node, "alt").filter(|alt| !alt.trim().is_empty())
+                            {
+                                self.text(&alt);
                             }
                         }
+                        "a" => {
+                            let start = self.flat().len();
+                            let href = dom::attr(&node, "href").filter(|href| !href.is_empty());
+                            stack.push(Step::AfterAnchor { start, href });
+                            push_children(&mut stack, &node);
+                        }
+                        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "table" => {
+                            self.block(2);
+                            stack.push(Step::Block(2));
+                            push_children(&mut stack, &node);
+                        }
+                        "blockquote" => {
+                            self.block(1);
+                            self.quote += 1;
+                            stack.push(Step::ExitQuote);
+                            push_children(&mut stack, &node);
+                        }
+                        "pre" => {
+                            self.block(1);
+                            let was_pre = self.pre;
+                            self.pre = true;
+                            stack.push(Step::ExitPre(was_pre));
+                            push_children(&mut stack, &node);
+                        }
+                        "li" => {
+                            self.block(1);
+                            self.text("* ");
+                            stack.push(Step::Block(1));
+                            push_children(&mut stack, &node);
+                        }
+                        "div" | "ul" | "ol" | "tr" | "section" | "article" | "header"
+                        | "footer" | "body" | "html" => {
+                            self.block(1);
+                            stack.push(Step::Block(1));
+                            push_children(&mut stack, &node);
+                        }
+                        "td" | "th" => {
+                            stack.push(Step::Space);
+                            push_children(&mut stack, &node);
+                        }
+                        _ => push_children(&mut stack, &node),
                     }
-                    "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "table" => {
-                        self.block(2);
-                        self.children(node);
-                        self.block(2);
-                    }
-                    "blockquote" => {
-                        self.block(1);
-                        self.quote += 1;
-                        self.children(node);
-                        self.quote -= 1;
-                        self.block(1);
-                    }
-                    "pre" => {
-                        self.block(1);
-                        self.pre = true;
-                        self.children(node);
-                        self.pre = false;
-                        self.block(1);
-                    }
-                    "li" => {
-                        self.block(1);
-                        self.text("* ");
-                        self.children(node);
-                        self.block(1);
-                    }
-                    "div" | "ul" | "ol" | "tr" | "section" | "article" | "header" | "footer"
-                    | "body" | "html" => {
-                        self.block(1);
-                        self.children(node);
-                        self.block(1);
-                    }
-                    "td" | "th" => {
-                        self.children(node);
-                        self.text(" ");
-                    }
-                    _ => self.children(node),
                 }
             }
-            _ => self.children(node),
-        }
-    }
-
-    fn children(&mut self, node: &Handle) {
-        for child in node.children.borrow().iter() {
-            self.node(child);
         }
     }
 
@@ -252,5 +280,11 @@ mod tests {
     fn authored_text_leaves_out_revealed_signatures_and_quotes() {
         let html = "<div>See attached</div><div class=\"sh-signature\"><div>Maya</div></div><div class=\"sh-quoted-content\"><div>the deck</div></div>";
         assert_eq!(authored(html), "See attached");
+    }
+
+    #[test]
+    fn deeply_nested_html_does_not_overflow_the_stack() {
+        let deep = format!("{}deep{}", "<div>".repeat(5000), "</div>".repeat(5000));
+        assert_eq!(from_html(&deep), "deep");
     }
 }

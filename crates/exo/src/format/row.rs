@@ -118,12 +118,13 @@ pub fn snippet(
     if done {
         available -= 24.0;
     }
-    let cleaned = clean_snippet(&marked(snippet, marks, TAGS));
-    let length = max_characters(&cleaned, available);
-    let teaser = if utf16_len(&cleaned) > 3 {
-        format!("{}…", split_utf16(&cleaned, 3).0)
+    let marked_snippet = marked(snippet, marks, TAGS);
+    let cleaned = clean_snippet(&marked_snippet);
+    let length = max_characters(cleaned, available);
+    let teaser = if utf16_len(cleaned) > 3 {
+        format!("{}…", split_utf16(cleaned, 3).0)
     } else {
-        cleaned.clone()
+        cleaned.to_owned()
     };
     if available <= width(&teaser) || length == 0 {
         return None;
@@ -138,7 +139,7 @@ pub fn snippet(
 }
 
 /// The snippet up to the first quoted reply, signature rule or footer.
-pub fn clean_snippet(snippet: &str) -> String {
+pub(crate) fn clean_snippet(snippet: &str) -> &str {
     static CUTS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
         [
             r"[^a-zA-Z0-9]+You are receiving this",
@@ -151,9 +152,11 @@ pub fn clean_snippet(snippet: &str) -> String {
     let mut text = snippet.split("----").next().unwrap_or_default();
     text = text.split("____").next().unwrap_or_default();
     for cut in CUTS.iter() {
-        text = cut.split(text).next().unwrap_or_default();
+        if let Some(found) = cut.find(text) {
+            text = &text[..found.start()];
+        }
     }
-    text.to_owned()
+    text
 }
 
 /// One participant of a row.

@@ -48,10 +48,10 @@ pub(crate) struct History {
 /// redo.
 pub(crate) fn note(open: &mut Open) {
     let now = recipients(open);
-    match open.history.seen.replace(now.clone()) {
+    match open.header.history.seen.replace(now.clone()) {
         Some(seen) if seen != now => {
-            open.history.undo.push(seen);
-            open.history.redo.clear();
+            open.header.history.undo.push(seen);
+            open.header.history.redo.clear();
         }
         _ => {}
     }
@@ -59,16 +59,16 @@ pub(crate) fn note(open: &mut Open) {
 
 /// Takes `open`'s recipients as they are now without an undo step (Auto Bcc's changes).
 pub(crate) fn settle(open: &mut Open) {
-    open.history.seen = Some(recipients(open));
+    open.header.history.seen = Some(recipients(open));
 }
 
 /// ⌘Z in a recipient list. Returns whether there was a step to undo.
 pub(crate) fn undo(open: &mut Open) -> bool {
     note(open);
-    let Some(previous) = open.history.undo.pop() else {
+    let Some(previous) = open.header.history.undo.pop() else {
         return false;
     };
-    open.history.redo.push(recipients(open));
+    open.header.history.redo.push(recipients(open));
     set(open, previous);
     settle(open);
     true
@@ -77,10 +77,10 @@ pub(crate) fn undo(open: &mut Open) -> bool {
 /// ⌘⇧Z or ⌘Y in a recipient list.
 pub(crate) fn redo(open: &mut Open) -> bool {
     note(open);
-    let Some(next) = open.history.redo.pop() else {
+    let Some(next) = open.header.history.redo.pop() else {
         return false;
     };
-    open.history.undo.push(recipients(open));
+    open.header.history.undo.push(recipients(open));
     set(open, next);
     settle(open);
     true
@@ -585,7 +585,7 @@ pub(crate) fn start_drag(
     let chips = input.selected.clone();
     open.state.header_expanded = true;
     open.state.cc_bcc_shown = true;
-    open.chip_drag = Some(Drag {
+    open.header.chip_drag = Some(Drag {
         list,
         chips,
         grabbed,

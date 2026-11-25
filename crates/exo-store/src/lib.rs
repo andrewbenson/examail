@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Exo's offline-first data layer: one SQLite file per account caching Gmail, the sync engine
 //! that keeps it current, and the outbox that sends the user's triage actions.
 //!
@@ -53,6 +47,7 @@ mod parse;
 mod parts;
 mod provider;
 mod query;
+mod queue;
 mod quota;
 mod reminders;
 mod search;
@@ -86,7 +81,7 @@ pub use drafts::{
 pub use error::{Error, Failing, Result, Unusable};
 pub use evict::{Evicted, Eviction};
 pub use google_contacts::{GoogleContact, GoogleContacts, GoogleList};
-pub use ids::{Filter, ListId, ThreadId};
+pub use ids::{Filter, ListId, ThreadId, labels};
 pub use model::{
     Alias, Attachment, Attachments, Body, Contact, Cursor, Header, Label, LabelKind, ListCount,
     MessageDetail, RecentThread, ReminderStatus, ThreadDetail, ThreadPage, ThreadSummary,
@@ -104,8 +99,8 @@ pub use quota::Quota;
 pub use search::{GmailPage, Highlighted, Search, SearchPage, SearchResult};
 pub use settings::{
     AdditionalTimezone, AutoAdvance, CalendarAccount, CalendarEventNotifications,
-    CalendarNotifications, CalendarSetting, CalendarSettings, DeviceSettings, Document, Ntfy,
-    EmojiSkinTone, MeetingLinks, Notifications, Nudge, PreviousDropdown, PreviousReminder,
+    CalendarNotifications, CalendarSetting, CalendarSettings, DeviceSettings, Document,
+    EmojiSkinTone, MeetingLinks, Notifications, Ntfy, Nudge, PreviousDropdown, PreviousReminder,
     PreviousSchedule, PreviousSuggestion, QuickTips, ReminderSettings, RemoteContentBlocking,
     SearchHistoryItem, SearchHistoryKind, Settings, Snippet, SnippetAnalytics, SnippetSend,
     SplitsEngagement, Theme, TriggerCondition, TypingAssistance,

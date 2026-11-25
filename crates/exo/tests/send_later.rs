@@ -1,4 +1,4 @@
-//! Send later end to end on gmail-mock. ⌘⇧L's picker gives a draft its time and Send schedules
+//! Send later end to end on mock-servers. ⌘⇧L's picker gives a draft its time and Send schedules
 //! it. Until it goes, it's a Gmail draft, which its thread shows as scheduled and Scheduled
 //! lists. Undo or the time passing take it back.
 

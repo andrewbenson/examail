@@ -2,10 +2,9 @@
 //! with the HTML entities in its snippets decoded, written the way
 //! `JSON.stringify(thread, null, 4)` writes it.
 
-use std::fmt;
-
 use futures::future;
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::Serialize as _;
+use serde_json::{Serializer, Value, ser::PrettyFormatter};
 
 use crate::{
     error::Result, parse::unescape_html, quota::Lane, store::Store, sync::MESSAGES_AT_ONCE,
@@ -22,20 +21,20 @@ impl Store {
         let api = &self.inner.api;
         let get = |format| {
             api.call(Lane::Act, ATTEMPTS, move |gmail| {
-                gmail.thread(id, format, &[]).returning::<Json>()
+                gmail.thread(id, format, &[]).returning::<Value>()
             })
         };
         let mut thread = match get(gmail::Format::Full).await {
             Err(failure) if failure.is_too_large() => {
                 let mut thread = get(gmail::Format::Minimal).await?;
                 let mut messages = Vec::new();
-                for chunk in message_ids(&mut thread).chunks(MESSAGES_AT_ONCE) {
+                for chunk in message_ids(&thread).chunks(MESSAGES_AT_ONCE) {
                     messages.extend(
                         future::try_join_all(chunk.iter().map(|message| {
                             api.call(Lane::Act, ATTEMPTS, |gmail| {
                                 gmail
                                     .message(message, gmail::Format::Full, &[])
-                                    .returning::<Json>()
+                                    .returning::<Value>()
                             })
                         }))
                         .await?,
@@ -49,7 +48,7 @@ impl Store {
             fetched => fetched?,
         };
         normalize(&mut thread);
-        Ok(thread.to_string())
+        Ok(stringify(&thread))
     }
 }
 
@@ -57,190 +56,42 @@ impl Store {
 const ATTEMPTS: u32 = 3;
 
 /// A thread's `messages`.
-fn messages_mut(thread: &mut Json) -> Option<&mut Vec<Json>> {
-    let Json::Object(members) = thread else {
-        return None;
-    };
-    members.iter_mut().find_map(|(key, value)| match value {
-        Json::Array(messages) if key == "messages" => Some(messages),
-        _ => None,
-    })
+fn messages_mut(thread: &mut Value) -> Option<&mut Vec<Value>> {
+    thread.get_mut("messages")?.as_array_mut()
 }
 
 /// The `id` of each of a thread's messages.
-fn message_ids(thread: &mut Json) -> Vec<String> {
-    let messages = messages_mut(thread).map_or(&[][..], |messages| messages.as_slice());
-    messages
-        .iter()
-        .filter_map(|message| match message {
-            Json::Object(fields) => fields.iter().find_map(|(key, value)| match value {
-                Json::String(id) if key == "id" => Some(id.clone()),
-                _ => None,
-            }),
-            _ => None,
-        })
+fn message_ids(thread: &Value) -> Vec<String> {
+    thread
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("id")?.as_str().map(str::to_owned))
         .collect()
 }
 
-/// JSON with its members in the order they came, which `serde_json::Value` doesn't keep.
-#[derive(Clone, Debug, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    /// As written.
-    Number(String),
-    String(String),
-    Array(Vec<Self>),
-    Object(Vec<(String, Self)>),
-}
-
-impl<'de> Deserialize<'de> for Json {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonVisitor)
-    }
-}
-
-struct JsonVisitor;
-
-impl<'de> Visitor<'de> for JsonVisitor {
-    type Value = Json;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("JSON")
-    }
-
-    fn visit_unit<E>(self) -> std::result::Result<Json, E> {
-        Ok(Json::Null)
-    }
-
-    fn visit_bool<E>(self, value: bool) -> std::result::Result<Json, E> {
-        Ok(Json::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> std::result::Result<Json, E> {
-        Ok(Json::Number(value.to_string()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> std::result::Result<Json, E> {
-        Ok(Json::Number(value.to_string()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> std::result::Result<Json, E> {
-        Ok(Json::Number(value.to_string()))
-    }
-
-    fn visit_str<E>(self, value: &str) -> std::result::Result<Json, E> {
-        Ok(Json::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> std::result::Result<Json, E> {
-        Ok(Json::String(value))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Json, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Json::Array(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Json, A::Error> {
-        let mut members = Vec::new();
-        while let Some(member) = map.next_entry()? {
-            members.push(member);
-        }
-        Ok(Json::Object(members))
-    }
-}
-
 /// Decodes the HTML entities in each message's `snippet`.
-fn normalize(thread: &mut Json) {
-    let Json::Object(members) = thread else {
+fn normalize(thread: &mut Value) {
+    let Some(messages) = messages_mut(thread) else {
         return;
     };
-    let messages = members
-        .iter_mut()
-        .filter(|(key, _)| key == "messages")
-        .filter_map(|(_, value)| match value {
-            Json::Array(messages) => Some(messages),
-            _ => None,
-        });
-    for message in messages.flatten() {
-        let Json::Object(fields) = message else {
-            continue;
-        };
-        for (key, value) in fields.iter_mut() {
-            if let (true, Json::String(snippet)) = (key == "snippet", &mut *value) {
-                *snippet = unescape_html(snippet);
-            }
+    for message in messages {
+        if let Some(Value::String(snippet)) = message.get_mut("snippet") {
+            *snippet = unescape_html(snippet);
         }
     }
 }
 
-impl fmt::Display for Json {
-    /// `JSON.stringify(value, null, 4)`.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.write(formatter, 0)
-    }
-}
-
-impl Json {
-    fn write(&self, out: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
-        let indent = |out: &mut fmt::Formatter<'_>, depth: usize| {
-            write!(out, "{:width$}", "", width = 4 * depth)
-        };
-        match self {
-            Self::Null => out.write_str("null"),
-            Self::Bool(value) => write!(out, "{value}"),
-            Self::Number(value) => out.write_str(value),
-            Self::String(value) => quote(out, value),
-            Self::Array(items) if items.is_empty() => out.write_str("[]"),
-            Self::Object(members) if members.is_empty() => out.write_str("{}"),
-            Self::Array(items) => {
-                out.write_str("[\n")?;
-                for (at, item) in items.iter().enumerate() {
-                    indent(out, depth + 1)?;
-                    item.write(out, depth + 1)?;
-                    out.write_str(if at + 1 < items.len() { ",\n" } else { "\n" })?;
-                }
-                indent(out, depth)?;
-                out.write_str("]")
-            }
-            Self::Object(members) => {
-                out.write_str("{\n")?;
-                for (at, (key, value)) in members.iter().enumerate() {
-                    indent(out, depth + 1)?;
-                    quote(out, key)?;
-                    out.write_str(": ")?;
-                    value.write(out, depth + 1)?;
-                    out.write_str(if at + 1 < members.len() { ",\n" } else { "\n" })?;
-                }
-                indent(out, depth)?;
-                out.write_str("}")
-            }
-        }
-    }
-}
-
-/// A string as `JSON.stringify` quotes it: only quotes, backslashes and control characters
-/// escaped.
-fn quote(out: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
-    out.write_str("\"")?;
-    for ch in text.chars() {
-        match ch {
-            '"' => out.write_str("\\\"")?,
-            '\\' => out.write_str("\\\\")?,
-            '\u{8}' => out.write_str("\\b")?,
-            '\u{c}' => out.write_str("\\f")?,
-            '\n' => out.write_str("\\n")?,
-            '\r' => out.write_str("\\r")?,
-            '\t' => out.write_str("\\t")?,
-            control if u32::from(control) < 0x20 => write!(out, "\\u{:04x}", u32::from(control))?,
-            ch => write!(out, "{ch}")?,
-        }
-    }
-    out.write_str("\"")
+/// `JSON.stringify(value, null, 4)` with member order preserved.
+fn stringify(value: &Value) -> String {
+    let mut buf = Vec::new();
+    let mut serializer =
+        Serializer::with_formatter(&mut buf, PrettyFormatter::with_indent(b"    "));
+    value
+        .serialize(&mut serializer)
+        .expect("serializing JSON into memory doesn't fail");
+    String::from_utf8(buf).expect("serde_json writes UTF-8")
 }
 
 #[cfg(test)]
@@ -248,9 +99,9 @@ mod tests {
     use super::*;
 
     fn source(json: &str) -> String {
-        let mut thread: Json = serde_json::from_str(json).expect("valid JSON");
+        let mut thread: Value = serde_json::from_str(json).expect("valid JSON");
         normalize(&mut thread);
-        thread.to_string()
+        stringify(&thread)
     }
 
     #[test]

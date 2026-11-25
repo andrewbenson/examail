@@ -47,6 +47,25 @@ fn people(record: &exo_store::DraftRecord) -> People {
     }
 }
 
+use super::draft::PeopleSource;
+
+fn people_matches(
+    cached: &Option<PeopleSource>,
+    from: &Option<Address>,
+    to: &[Address],
+    cc: &[Address],
+    bcc: &[Address],
+) -> bool {
+    cached
+        .as_ref()
+        .is_some_and(|(cached_from, cached_to, cached_cc, cached_bcc)| {
+            cached_from == from
+                && cached_to.as_slice() == to
+                && cached_cc.as_slice() == cc
+                && cached_bcc.as_slice() == bcc
+        })
+}
+
 /// The words of `names` that a spellchecker may not know, which autocorrect leaves alone.
 fn name_words<'a>(names: impl Iterator<Item = &'a str>) -> impl Iterator<Item = String> {
     names
@@ -67,10 +86,9 @@ impl Mail {
         .collect()
     }
 
-    /// Call each frame, before anything draws. Gives the drafts' bodies and subjects their
-    /// spellcheckers. After a right-click in one of them last frame, with the word the click
-    /// selected now on screen, shows the menu and does what's chosen in it.
-    pub(crate) fn compose_spelling(&mut self, ctx: &egui::Context) {
+    /// Gives each open draft's body its spellchecker, greeting languages, recipient names, and
+    /// cached `People`.
+    pub(crate) fn compose_assist_spelling(&mut self) {
         let (autocorrect, autocomplete) =
             (self.autocorrect(), self.account.settings().autocomplete());
         let book = self
@@ -78,86 +96,78 @@ impl Mail {
             .book
             .as_ref()
             .map(|(contacts, _)| contacts.clone());
+        let draft_names = |record: &exo_store::DraftRecord| -> Vec<String> {
+            let people = book
+                .iter()
+                .flat_map(|book| book.iter().map(|contact| contact.name.as_deref()));
+            let recipients = [&record.to, &record.cc, &record.bcc]
+                .into_iter()
+                .flatten()
+                .map(|address| address.name.as_deref());
+            name_words(people.chain(recipients).flatten()).collect()
+        };
+        let from = book
+            .as_ref()
+            .map(|book| std::sync::Arc::as_ptr(book) as usize);
         for open in &mut self.compose.drafts {
-            if !open.editor.has_spelling()
-                && let Some(engine) = (self.spelling)()
-            {
-                open.editor.set_spelling(engine);
+            let had_spelling = open.editor.has_spelling();
+            let record = &open.record;
+            let names_from = &mut open.body.names_from;
+            spelling::assist(
+                &mut open.editor,
+                &*self.spelling,
+                autocorrect,
+                autocomplete,
+                || {
+                    *names_from = Some(from);
+                    draft_names(record)
+                },
+            );
+            if !had_spelling && open.editor.has_spelling() {
                 open.editor
                     .set_greeting_languages(desktop::spelling::greeting_languages());
             }
-            open.editor.set_people(people(&open.record));
-            spelling::check_field(&mut open.subject_spelling, &*self.spelling);
-            spelling::check_field(open.editor.link_spelling_mut(), &*self.spelling);
-            spelling::check_field(&mut open.name_spelling, &*self.spelling);
-            open.editor.set_autocorrect(autocorrect);
-            open.editor.set_autocomplete(autocomplete);
-            // The names of the people the draft may be to, which a spellchecker doesn't know.
-            // They come from the address book and the draft's own recipients, and are set again
-            // once the book is read.
-            let from = book
-                .as_ref()
-                .map(|book| std::sync::Arc::as_ptr(book) as usize);
-            if autocorrect && open.names_from != Some(from) {
-                open.names_from = Some(from);
-                let people = book
-                    .iter()
-                    .flat_map(|book| book.iter().map(|contact| contact.name.as_deref()));
-                let recipients = [&open.record.to, &open.record.cc, &open.record.bcc]
-                    .into_iter()
-                    .flatten()
-                    .map(|address| address.name.as_deref());
-                open.editor
-                    .set_names(name_words(people.chain(recipients).flatten()));
+            let people_changed = !people_matches(
+                &open.body.people_source,
+                &open.record.from,
+                &open.record.to,
+                &open.record.cc,
+                &open.record.bcc,
+            );
+            if people_changed {
+                open.editor.set_people(people(&open.record));
+                open.body.people_source = Some((
+                    open.record.from.clone(),
+                    open.record.to.clone(),
+                    open.record.cc.clone(),
+                    open.record.bcc.clone(),
+                ));
+            }
+            // Refresh the names autocorrect leaves alone once the address book or recipients change.
+            if autocorrect && (open.body.names_from != Some(from) || people_changed) {
+                open.body.names_from = Some(from);
+                open.editor.set_names(draft_names(&open.record));
             }
         }
-        if self.link_input_menu(ctx, |mail| {
-            mail.compose.focused_mut().map(|open| &mut open.editor)
-        }) {
-            return;
-        }
+    }
+
+    pub(crate) fn compose_body_editor_mut(&mut self) -> Option<&mut exo_editor::Editor> {
+        self.compose.focused_mut().map(|open| &mut open.editor)
+    }
+
+    /// Applies `choice` from a right-click `menu` in draft `id`'s body editor.
+    pub(crate) fn compose_editor_choice(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        menu: &exo_editor::ContextMenu,
+        choice: crate::page_menu::Choice,
+    ) {
         let now = ctx.input(|input| input.time);
-        let menu = self.compose.drafts.iter_mut().find_map(|open| {
-            let id = open.id.clone();
-            let (body, subject, name) = (
-                open.context_menu.take(),
-                open.subject_spelling.take_menu(),
-                open.name_spelling.take_menu(),
-            );
-            body.map(|menu| (id.clone(), Menu::Body, menu))
-                .or(subject.map(|menu| (id.clone(), Menu::Subject, menu)))
-                .or(name.map(|menu| (id, Menu::Name, menu)))
-        });
-        let Some((id, which, menu)) = menu else {
+        let Some(open) = self.compose.get_mut(id) else {
             return;
         };
-        let Some(choice) = self.editable_menu(&menu) else {
-            return;
-        };
-        let Some(open) = self.compose.get_mut(&id) else {
-            return;
-        };
-        let done = match which {
-            Menu::Body => spelling::editor_choice(ctx, &mut open.editor, &menu, choice),
-            Menu::Subject => spelling::field_choice(
-                ctx,
-                &mut open.subject_spelling,
-                &mut open.record.subject,
-                &menu,
-                choice,
-            ),
-            Menu::Name => match &mut open.snippet {
-                Some(snippet) => spelling::field_choice(
-                    ctx,
-                    &mut open.name_spelling,
-                    &mut snippet.name,
-                    &menu,
-                    choice,
-                ),
-                None => Done::Nothing,
-            },
-        };
-        match done {
+        match spelling::editor_choice(ctx, &mut open.editor, menu, choice) {
             Done::Edited => open.touch(now),
             Done::Open(url) => self.open_chosen(&url),
             Done::Nothing => {}
@@ -165,16 +175,22 @@ impl Mail {
     }
 }
 
-/// Which of a draft's widgets a menu is for.
-enum Menu {
-    Body,
-    Subject,
-    Name,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn people_cache_detects_recipient_changes() {
+        let mut to = Vec::new();
+        assert!(!people_matches(&None, &None, &to, &[], &[]));
+        let cached = Some((None, to.clone(), Vec::new(), Vec::new()));
+        assert!(people_matches(&cached, &None, &to, &[], &[]));
+        to.push(Address {
+            name: Some("Priya Raman".into()),
+            email: "priya@brightmoor.co".into(),
+        });
+        assert!(!people_matches(&cached, &None, &to, &[], &[]));
+    }
 
     #[test]
     fn people_are_named_by_first_and_last_name() {

@@ -145,13 +145,9 @@ pub(crate) fn kind(message: &MessageDetail) -> Attachments {
 /// Whether `attachment` is a calendar invite (`.ics`).
 pub(super) fn is_invite(attachment: &Attachment) -> bool {
     let mime = attachment.mime_type.to_ascii_lowercase();
-    mime == "text/calendar" || mime == "application/ics" || extension(&attachment.filename) == "ics"
-}
-
-fn extension(name: &str) -> String {
-    name.rsplit_once('.')
-        .map(|(_, extension)| extension.to_lowercase())
-        .unwrap_or_default()
+    mime == "text/calendar"
+        || mime == "application/ics"
+        || crate::attachment_files::extension(&attachment.filename).as_deref() == Some("ics")
 }
 
 /// One card's size for a message column `inner_width` wide, and how many fit on a row.
@@ -276,7 +272,9 @@ fn show_card(
     let bottom = exo_ui::attachment_bottom_row(card);
     if let Some(progress) = progress {
         exo_ui::paint_attachment_progress(ui, card, &attachment.filename, progress);
-    } else if !extension(&attachment.filename).is_empty() && response.hovered() {
+    } else if crate::attachment_files::extension(&attachment.filename).is_some()
+        && response.hovered()
+    {
         // The download icon is Classic's 13px glyph, 2px in from the padding at `top: 1px`. It's
         // at .4 while the card is hovered, and .7 with the pointer on the glyph itself.
         let icon = Rect::from_min_size(

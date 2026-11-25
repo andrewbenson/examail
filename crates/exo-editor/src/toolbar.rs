@@ -194,22 +194,42 @@ impl Editor {
         }
     }
 
-    /// ⌘O: opens the colour picker on the selection's colour.
+    /// ⌘O: opens the colour picker on the selection's colour. Does not push an undo snapshot until
+    /// a colour change is confirmed.
     pub fn begin_color(&mut self) {
         let index = Color::ALL
             .iter()
             .position(|color| *color == self.color())
             .unwrap_or(0);
-        self.save_undo();
         self.view.toolbar.mode = Mode::Color {
             index,
             original: Box::new((self.doc.clone(), self.selection)),
         };
     }
 
-    /// Whether the link input or the colour picker is open.
-    pub fn formatter_open(&self) -> bool {
-        self.view.toolbar.is_open()
+    /// Commits any live colour preview by recording a single undo snapshot of the pre-picker
+    /// `original` document.
+    pub(crate) fn commit_color(&mut self, original: (Document, Selection)) {
+        if self.doc != original.0 {
+            self.undo.save(&original.0, original.1);
+            self.undo.changed();
+        }
+    }
+
+    /// Closes any open toolbar sub-mode, committing an in-progress colour preview if it changed
+    /// the document.
+    pub(crate) fn close_toolbar(&mut self) {
+        if let Mode::Color { original, .. } = std::mem::take(&mut self.view.toolbar.mode) {
+            self.commit_color(*original);
+        }
+    }
+
+    /// Cancels any open toolbar sub-mode, rolling back an in-progress colour preview without
+    /// touching the undo stack.
+    pub(crate) fn cancel_toolbar(&mut self) {
+        if let Mode::Color { original, .. } = std::mem::take(&mut self.view.toolbar.mode) {
+            self.restore(original.0, original.1);
+        }
     }
 
     /// Draws the toolbar under the selection (whose bounds are `selection`) when it should
@@ -558,8 +578,12 @@ impl Editor {
             return;
         }
         if let Some(swatch) = picked {
+            let (doc, selection) = *original;
             self.view.toolbar.reset();
-            self.apply_color(Color::ALL[swatch]);
+            self.doc = doc.clone();
+            self.selection = selection;
+            self.preview_color(Color::ALL[swatch]);
+            self.commit_color((doc, selection));
             return;
         }
         if left || right {
@@ -568,10 +592,11 @@ impl Editor {
             } else {
                 (index + 1) % count
             };
-            self.apply_color(Color::ALL[index]);
+            self.preview_color(Color::ALL[index]);
         }
         if confirm {
             self.view.toolbar.reset();
+            self.commit_color(*original);
             return;
         }
         self.view.toolbar.mode = Mode::Color { index, original };
@@ -602,11 +627,7 @@ impl Editor {
     ) -> Option<PopoverClick> {
         let ctx = ui.ctx().clone();
         let id = exo_ui::id(&ctx, "exo_editor::link_popover");
-        let shown = href
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let shown = shown.strip_prefix("www.").unwrap_or(shown);
-        let shown = shown.strip_suffix('/').unwrap_or(shown);
+        let shown = popover_url(href);
         let bounds = ui.clip_rect();
         let color = exo_ui::tooltip_text_color(&ctx);
         let mut job =
@@ -759,4 +780,169 @@ pub(crate) fn anchor(rects: &[Rect]) -> Rect {
         .iter()
         .copied()
         .fold(Rect::NOTHING, |acc, rect| acc.union(rect))
+}
+
+fn popover_url(href: &str) -> &str {
+    let shown = exo_mail::strip_ascii_prefix(href, "https://")
+        .or_else(|| exo_mail::strip_ascii_prefix(href, "http://"))
+        .unwrap_or(href);
+    let shown = exo_mail::strip_ascii_prefix(shown, "www.").unwrap_or(shown);
+    shown.strip_suffix('/').unwrap_or(shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Event, Key, Modifiers, Rect, UiBuilder, pos2, vec2};
+    use egui_kittest::Harness;
+
+    use super::popover_url;
+    use crate::{Editor, EditorStyle, Pos, Selection};
+
+    struct State {
+        editor: Editor,
+        ready: bool,
+    }
+
+    fn editor_harness(editor: Editor) -> Harness<'static, State> {
+        let mut harness = Harness::builder()
+            .with_size(vec2(400.0, 200.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if !std::mem::replace(&mut state.ready, true) {
+                        exo_ui::install(ui.ctx()).expect("the system fonts load");
+                        return;
+                    }
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .max_rect(Rect::from_min_size(pos2(20.0, 20.0), vec2(320.0, 120.0))),
+                        |ui| {
+                            state.editor.ui(ui, &EditorStyle::default());
+                        },
+                    );
+                },
+                State {
+                    editor,
+                    ready: false,
+                },
+            );
+        harness.run_steps(2);
+        harness
+    }
+
+    fn press_key(harness: &mut Harness<'_, State>, key: Key) {
+        harness.input_mut().events.push(Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        harness.run_steps(1);
+    }
+
+    fn focus_editor(harness: &mut Harness<'_, State>) {
+        let at = pos2(30.0, 30.0);
+        harness.input_mut().events.push(Event::PointerMoved(at));
+        harness.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        harness.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        });
+        harness.run_steps(1);
+    }
+
+    #[test]
+    fn formats_popover_urls_case_insensitively() {
+        assert_eq!(
+            popover_url("HTTPS://WWW.example.com/docs/"),
+            "example.com/docs"
+        );
+        assert_eq!(popover_url("HTTP://example.com/"), "example.com");
+    }
+
+    #[test]
+    fn color_picker_preview_and_escape_leave_undo_stack_clean() {
+        let mut editor = Editor::from_html("<div>hello</div>");
+        editor.set_selection(Selection::caret(Pos::new(0, 5)));
+        editor.type_text("!");
+        assert_eq!(editor.html(), "<div>hello!<br></div>");
+
+        let mut harness = editor_harness(editor);
+        // Focus the editor widget first so we also verify the editor doesn't swallow picker keys.
+        focus_editor(&mut harness);
+        harness
+            .state_mut()
+            .editor
+            .set_selection(Selection::new(Pos::new(0, 0), Pos::new(0, 5)));
+        harness.run_steps(1);
+        harness.state_mut().editor.begin_color();
+        harness.run_steps(1);
+        // Step through two swatches as live preview.
+        press_key(&mut harness, Key::ArrowRight);
+        assert!(
+            harness.state().editor.html().contains("rgb(222, 84, 84)"),
+            "live preview applies Lava Red: {}",
+            harness.state().editor.html()
+        );
+        press_key(&mut harness, Key::ArrowRight);
+        assert!(
+            harness.state().editor.html().contains("rgb(233, 150, 56)"),
+            "live preview advances to Irascible Orange: {}",
+            harness.state().editor.html()
+        );
+        // Escape rolls back without polluting the undo stack.
+        press_key(&mut harness, Key::Escape);
+        assert_eq!(harness.state().editor.html(), "<div>hello!<br></div>");
+        assert!(!harness.state().editor.can_redo());
+
+        // Subsequent undo reverts the edit before the picker (`!`), not a cancelled preview.
+        harness.state_mut().editor.undo();
+        assert_eq!(harness.state().editor.html(), "<div>hello<br></div>");
+        // Redo restores the pre-picker edit cleanly without reapplying the cancelled colour.
+        harness.state_mut().editor.redo();
+        assert_eq!(harness.state().editor.html(), "<div>hello!<br></div>");
+    }
+
+    #[test]
+    fn color_picker_confirm_records_a_single_undo_snapshot() {
+        let mut editor = Editor::from_html("<div>hello</div>");
+        editor.set_selection(Selection::caret(Pos::new(0, 5)));
+        editor.type_text("!");
+
+        let mut harness = editor_harness(editor);
+        focus_editor(&mut harness);
+        harness
+            .state_mut()
+            .editor
+            .set_selection(Selection::new(Pos::new(0, 0), Pos::new(0, 5)));
+        harness.run_steps(1);
+        harness.state_mut().editor.begin_color();
+        harness.run_steps(1);
+        press_key(&mut harness, Key::ArrowRight);
+        press_key(&mut harness, Key::ArrowRight);
+        press_key(&mut harness, Key::Enter);
+        let colored = harness.state().editor.html();
+        assert!(colored.contains("rgb(233, 150, 56)"), "{colored}");
+
+        // One undo skips intermediate previews and restores the pre-picker state.
+        harness.state_mut().editor.undo();
+        assert_eq!(harness.state().editor.html(), "<div>hello!<br></div>");
+        // Second undo reverts the typing before the picker.
+        harness.state_mut().editor.undo();
+        assert_eq!(harness.state().editor.html(), "<div>hello<br></div>");
+        // Redoing steps back through the pre-picker state then the confirmed colour.
+        harness.state_mut().editor.redo();
+        assert_eq!(harness.state().editor.html(), "<div>hello!<br></div>");
+        harness.state_mut().editor.redo();
+        assert_eq!(harness.state().editor.html(), colored);
+    }
 }

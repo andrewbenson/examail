@@ -20,7 +20,8 @@ use regex::Regex;
 use toasty::Executor;
 use toasty::stmt::Value;
 
-use crate::db::{AttachmentRow, BodyRow, DraftRow, LabelRow, ListCursor, Mailbox};
+use crate::db::{AttachmentRow, BodyRow, IN_LIST_CHUNK, LabelRow, ListCursor, Mailbox, query_rows};
+use crate::drafts::EditableDraft;
 use crate::error::Result;
 use crate::ids::ListId;
 use crate::ids::labels::{INBOX, SH_ALL, SH_IMPORTANT, SH_OTHER, TRASH};
@@ -30,7 +31,7 @@ use crate::provider;
 use crate::query::{FTS_ANCHOR, LabelIndex, Recheck, SearchQuery, tokenize_email};
 use crate::quota::Lane;
 use crate::split::{Me, important_definition};
-use crate::store::{Store, load_views, reindex};
+use crate::store::{Store, load_attachments_by_thread, load_views, reindex};
 use crate::view::{Router, ThreadView};
 
 /// `snippet()`'s column numbers.
@@ -55,11 +56,7 @@ const GMAIL_PAGE: u32 = 100;
 /// A thread's row id, which is a stable 64-bit hash of its id (FNV-1a), so updating a thread's
 /// row is a lookup by rowid.
 fn row_id(thread: &str) -> i64 {
-    let hash = thread
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-        });
+    let hash = gmail::mime::fnv1a(thread.as_bytes());
     i64::from_ne_bytes(hash.to_ne_bytes())
 }
 
@@ -98,13 +95,15 @@ pub(crate) async fn index(
         })
         .copied()
         .collect();
-    let with_body: BTreeSet<String> =
-        BodyRow::filter(BodyRow::fields().message_id().in_list(others.as_slice()))
-            .select(BodyRow::fields().message_id())
-            .exec(exec)
-            .await?
-            .into_iter()
-            .collect();
+    let mut with_body = BTreeSet::new();
+    for chunk in others.chunks(IN_LIST_CHUNK) {
+        with_body.extend(
+            BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
+                .select(BodyRow::fields().message_id())
+                .exec(exec)
+                .await?,
+        );
+    }
     let bodied: Vec<&str> = others
         .into_iter()
         .filter(|id| with_body.contains(*id))
@@ -119,14 +118,13 @@ pub(crate) async fn index(
         )
         .collect::<Vec<_>>()
         .join(" ");
-    let stored = toasty::sql::query("SELECT messages, content FROM search_fts WHERE rowid = ?1")
-        .bind(row)
-        .exec(exec)
-        .await?;
-    let content = match stored.first().map(fields) {
-        Some([Value::String(indexed), Value::String(content)]) if *indexed == messages => {
-            content.clone()
-        }
+    let stored = query_rows::<(String, String)>(
+        exec,
+        toasty::sql::query("SELECT messages, content FROM search_fts WHERE rowid = ?1").bind(row),
+    )
+    .await?;
+    let content = match stored.into_iter().next() {
+        Some((indexed, content)) if indexed == messages => content,
         _ => content(exec, view, &bodied, &drafts).await?,
     };
     let contacts = |field: fn(&crate::db::MessageRow) -> Vec<&Mailbox>| {
@@ -215,14 +213,6 @@ pub(crate) async fn index(
     Ok(())
 }
 
-/// The fields of a raw query's row.
-fn fields(row: &Value) -> &[Value] {
-    match row {
-        Value::Record(record) => &record.fields[..],
-        _ => &[],
-    }
-}
-
 /// The text of every message (`content`), received mail first, then drafts' text. The messages
 /// in `ids` have their bodies stored. `drafts` are being written, and their text is as compose
 /// last saved it.
@@ -230,15 +220,17 @@ async fn content(
     exec: &mut dyn Executor,
     view: &ThreadView,
     ids: &[&str],
-    drafts: &[DraftRow],
+    drafts: &[EditableDraft],
 ) -> Result<String> {
-    let bodies: HashMap<String, BodyRow> =
-        BodyRow::filter(BodyRow::fields().message_id().in_list(ids))
+    let mut bodies: HashMap<String, BodyRow> = HashMap::new();
+    for chunk in ids.chunks(IN_LIST_CHUNK) {
+        for body in BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
             .exec(exec)
             .await?
-            .into_iter()
-            .map(|body| (body.message_id.clone(), body))
-            .collect();
+        {
+            bodies.insert(body.message_id.clone(), body);
+        }
+    }
     let bodies = &bodies;
     let text = |draft: bool| {
         view.messages
@@ -258,7 +250,7 @@ async fn content(
         .chain(
             drafts
                 .iter()
-                .map(|draft| whole_text(Some(&draft.record.0.body), None)),
+                .map(|draft| whole_text(Some(&draft.body), None)),
         )
         .collect();
     Ok(format!(
@@ -282,7 +274,7 @@ fn body_text(body: &BodyRow) -> String {
 pub(crate) fn whole_text(html: Option<&str>, text: Option<&str>) -> String {
     static HIDDEN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?is)<(style|script|head|title)\b.*?</(style|script|head|title)\s*>|<!--.*?-->",
+            r"(?is)<style\b[^>]*>.*?</style\s*>|<script\b[^>]*>.*?</script\s*>|<head\b[^>]*>.*?</head\s*>|<title\b[^>]*>.*?</title\s*>|<!--.*?-->",
         )
         .expect("valid regex")
     });
@@ -346,10 +338,16 @@ impl Highlighted {
         Self::bold_matches(text, patterns)
     }
 
-    /// `text` with what `rechecks` match in bold, and nothing else, which redoes the index's
-    /// highlights.
-    fn matching(text: &str, rechecks: &[Recheck]) -> Self {
-        Self::bold_matches(text, rechecks.iter().map(|recheck| recheck.regex.clone()))
+    /// `text` with what positive `rechecks` match in bold, and nothing else, which redoes the
+    /// index's highlights. `subject_only` rechecks only apply when `for_subject` is set.
+    fn matching(text: &str, rechecks: &[Recheck], for_subject: bool) -> Self {
+        Self::bold_matches(
+            text,
+            rechecks
+                .iter()
+                .filter(|recheck| !recheck.negated && (for_subject || !recheck.subject_only))
+                .map(|recheck| recheck.regex.clone()),
+        )
     }
 
     /// `text` with every match of `patterns` in bold, overlapping ones merged.
@@ -582,24 +580,20 @@ impl Store {
         for param in params {
             statement = statement.bind(param);
         }
-        let rows = statement.exec(&mut db).await?;
+        let rows =
+            query_rows::<(String, Option<i64>, Option<String>, Option<String>)>(&mut db, statement)
+                .await?;
         let mut found: Vec<(String, Option<Highlighted>, Option<Highlighted>)> = Vec::new();
         let highlightable = !query.highlightable_tokens().is_empty();
-        for row in &rows {
-            let [Value::String(thread), _, subject, snippet] = fields(row) else {
-                continue;
-            };
-            let subject = match subject {
-                Value::String(subject) if highlightable => {
-                    Some(Highlighted::from_marked(subject)).filter(Highlighted::has_bold)
-                }
-                _ => None,
-            };
-            let snippet = match snippet {
-                Value::String(snippet) if highlightable => pick_snippet(snippet),
-                _ => None,
-            };
-            found.push((thread.clone(), subject, snippet));
+        for (thread, _, subject, snippet) in rows {
+            let subject = subject
+                .filter(|_| highlightable)
+                .map(|subject| Highlighted::from_marked(&subject))
+                .filter(Highlighted::has_bold);
+            let snippet = snippet
+                .filter(|_| highlightable)
+                .and_then(|snippet| pick_snippet(&snippet));
+            found.push((thread, subject, snippet));
         }
         let more_local = found.len() > limit;
         found.truncate(limit);
@@ -610,17 +604,7 @@ impl Store {
             .chain(search.gmail.iter().map(|hit| hit.thread.clone()))
             .collect();
         let mut views = load_views(&mut db, &ids).await?;
-        let messages: Vec<String> = views
-            .values()
-            .flat_map(|view| view.all_messages().map(|m| m.row.id.clone()))
-            .collect();
-        let attachments = AttachmentRow::filter(
-            AttachmentRow::fields()
-                .message_id()
-                .in_list(messages.as_slice()),
-        )
-        .exec(&mut db)
-        .await?;
+        let attachments_by_thread = load_attachments_by_thread(&mut db, &views).await?;
         let included = query.included_labels(&labels);
         let keeps_trash = query.shows_label("trash");
         let (rechecks, rehighlight) = query.rechecks();
@@ -641,8 +625,11 @@ impl Store {
             let Some(view) = views.get_mut(&id) else {
                 continue;
             };
+            let attachments = attachments_by_thread
+                .get(&id)
+                .map_or(&[][..], Vec::as_slice);
             if query.checks_contacts()
-                && query.is_match(view, &attachments, &labels, me) == Some(false)
+                && query.is_match(view, attachments, &labels, me) == Some(false)
             {
                 continue;
             }
@@ -657,9 +644,22 @@ impl Store {
                     continue;
                 }
                 if rehighlight {
-                    snippet = Highlighted::matching(&snippet.text, &rechecks);
-                    subject = subject
-                        .map(|subject| Highlighted::matching(&subject.text, &rechecks))
+                    snippet = Highlighted::matching(&snippet.text, &rechecks, false);
+                    let target = subject
+                        .as_ref()
+                        .map(|subject| subject.text.clone())
+                        .unwrap_or_else(|| view.subject());
+                    subject = (!target.is_empty())
+                        .then(|| Highlighted::matching(&target, &rechecks, true))
+                        .filter(Highlighted::has_bold);
+                } else if subject.is_none()
+                    && rechecks
+                        .iter()
+                        .any(|recheck| recheck.subject_only && !recheck.negated)
+                {
+                    let target = view.subject();
+                    subject = (!target.is_empty())
+                        .then(|| Highlighted::matching(&target, &rechecks, true))
                         .filter(Highlighted::has_bold);
                 }
             }
@@ -675,7 +675,7 @@ impl Store {
                     &list,
                     first.sort,
                     &router,
-                    &attachments,
+                    attachments,
                     &included,
                     keeps_trash,
                 ),
@@ -691,7 +691,10 @@ impl Store {
             let Some(view) = views.get_mut(&hit.thread) else {
                 continue;
             };
-            if view.messages.is_empty() || query.excludes(view, &attachments, &labels, me) {
+            let attachments = attachments_by_thread
+                .get(&hit.thread)
+                .map_or(&[][..], Vec::as_slice);
+            if view.messages.is_empty() || query.excludes(view, attachments, &labels, me) {
                 continue;
             }
             seen.insert(hit.thread.clone());
@@ -716,7 +719,7 @@ impl Store {
                     &list,
                     first.sort,
                     &router,
-                    &attachments,
+                    attachments,
                     &included,
                     keeps_trash,
                 ),
@@ -761,6 +764,7 @@ impl Store {
             .to_gmail(&labels, &router.me.addresses, &important_definition(&me));
         let query = ListQuery {
             q: Some(q),
+            include_spam_trash: search.query.includes_spam_trash(),
             max_results: Some(if search.next_page.is_some() {
                 GMAIL_PAGE
             } else {
@@ -823,10 +827,10 @@ pub(crate) async fn label_index(exec: &mut dyn Executor) -> Result<LabelIndex> {
     ))
 }
 
-/// Whether a local result passes the check of its phrases and stemmed words. It passes when any
-/// of them is in its subject as the index highlighted it (`searched`), its subject, or (unless
-/// it's a `subject:`) its excerpt or a message's body as the index has it (its visible text,
-/// once worked out). A negated one counts when it's in none of them.
+/// Whether a local result passes the check of every one of its phrases and stemmed words. Each
+/// positive recheck must appear in its subject as the index highlighted it (`searched`), its
+/// subject, or (unless it's a `subject:`) its excerpt or a message's body as the index has it
+/// (its visible text, once worked out). Each negated recheck must appear in none of them.
 async fn recheck(
     exec: &mut dyn Executor,
     view: &ThreadView,
@@ -843,25 +847,39 @@ async fn recheck(
             found = regex.is_match(excerpt);
             if !found {
                 if bodies.is_none() {
-                    let ids: Vec<&str> = view.messages.iter().map(|m| m.row.id.as_str()).collect();
-                    let rows =
-                        BodyRow::filter(BodyRow::fields().message_id().in_list(ids.as_slice()))
+                    let drafts = crate::drafts::editable(exec, &view.id).await?;
+                    let ids: Vec<&str> = view
+                        .messages
+                        .iter()
+                        .map(|m| m.row.id.as_str())
+                        .filter(|id| {
+                            !drafts
+                                .iter()
+                                .any(|draft| draft.message_id.as_deref() == Some(*id))
+                        })
+                        .collect();
+                    let mut texts: Vec<String> = Vec::new();
+                    for chunk in ids.chunks(IN_LIST_CHUNK) {
+                        let rows = BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
                             .exec(exec)
                             .await?;
-                    bodies = Some(
-                        rows.into_iter()
-                            .filter_map(|body| body.visible.or(body.html).or(body.text))
-                            .collect(),
+                        texts.extend(rows.iter().map(body_text));
+                    }
+                    texts.extend(
+                        drafts
+                            .iter()
+                            .map(|draft| whole_text(Some(&draft.body), None)),
                     );
+                    bodies = Some(texts);
                 }
                 found = bodies.iter().flatten().any(|body| regex.is_match(body));
             }
         }
-        if found != recheck.negated {
-            return Ok(true);
+        if found == recheck.negated {
+            return Ok(false);
         }
     }
-    Ok(false)
+    Ok(true)
 }
 
 /// Of the excerpt's pieces (split at ellipses and between messages), the one with the most
@@ -919,4 +937,251 @@ fn summary(
             })
     });
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drafts::{Draft, DraftAction, DraftRecord};
+    use crate::ids::ThreadId;
+
+    #[tokio::test]
+    async fn recheck_uses_stripped_html_and_editable_drafts_and_quotes_keyword_prefixes() {
+        let dir =
+            std::env::temp_dir().join(format!("exo-store-search-recheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        let filler = "alpha ".repeat(80);
+        let html = format!(
+            "<style>.hiddenword {{ color: blue; }}</style><div>{filler}<b>crystal</b> &amp; clear</div>"
+        );
+        let msg = gmail::Message {
+            id: Some("m1".into()),
+            thread_id: Some("t1".into()),
+            internal_date: Some(1_794_900_000_000),
+            label_ids: vec![INBOX.into()],
+            payload: Some(gmail::MessagePart {
+                mime_type: Some("text/html".into()),
+                headers: vec![
+                    gmail::MessagePartHeader {
+                        name: "Subject".into(),
+                        value: "Deck".into(),
+                    },
+                    gmail::MessagePartHeader {
+                        name: "From".into(),
+                        value: "Priya <priya@brightmoor.co>".into(),
+                    },
+                ],
+                body: Some(gmail::MessagePartBody {
+                    data: Some(html.into_bytes()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            let parsed = crate::parse::parse(&msg, true).expect("parses");
+            provider::save_message(write.exec(), parsed)
+                .await
+                .expect("saves");
+            reindex(write.exec(), "t1", &store.inner.router())
+                .await
+                .expect("indexes");
+            write.commit().await.expect("commits");
+        }
+
+        // `OR*` / `AND*` / `NOT*` / `NEAR*` (both free text and column values) don't crash FTS5.
+        for q in [
+            "OR*",
+            "AND*",
+            "NOT*",
+            "NEAR*",
+            "label:OR*",
+            "label:AND*",
+            "label:NOT*",
+            "label:NEAR*",
+        ] {
+            let mut s = Search::new(q);
+            store.search(&mut s, 20, false, 10).await.expect("fts5 ok");
+        }
+
+        // Raw HTML tags/styles don't break phrase matching, and entities (`&amp;`) are decoded.
+        let mut hit = Search::new("\"crystal & clear\"");
+        let page = store.search(&mut hit, 20, false, 10).await.expect("search");
+        assert_eq!(page.results.len(), 1);
+
+        // Editable draft text also passes `recheck`.
+        store
+            .save_draft(Draft {
+                id: "draft00000000000001".into(),
+                thread: Some(ThreadId::new("t1")),
+                adopted: None,
+                record: DraftRecord {
+                    action: DraftAction::Reply,
+                    from: None,
+                    to: Vec::new(),
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Re: Deck".into(),
+                    body: format!("<div>{filler}velvet giraffe draft</div>"),
+                    quoted_content: None,
+                    quoted_inlined: false,
+                    in_reply_to: None,
+                    in_reply_to_rfc822: None,
+                    references: Vec::new(),
+                    rfc822_id: "d1@exo".into(),
+                    fingerprint: String::new(),
+                    attachments: Vec::new(),
+                    send_later: None,
+                    reminder: None,
+                },
+                raw: String::new(),
+                complete: true,
+                sending: false,
+            })
+            .await
+            .expect("saves draft");
+
+        let mut draft_hit = Search::new("\"velvet giraffe\"");
+        let page = store
+            .search(&mut draft_hit, 20, false, 10)
+            .await
+            .expect("search");
+        assert_eq!(page.results.len(), 1);
+
+        // Multiple rechecks are ANDed: a failing positive or negated phrase must reject the thread.
+        let mut both_missing = Search::new("\"crystal & clear\" \"not present\"");
+        assert!(
+            store
+                .search(&mut both_missing, 20, false, 10)
+                .await
+                .expect("search")
+                .results
+                .is_empty(),
+            "every positive recheck must pass"
+        );
+        // Stemmed mismatch on second phrase ("crystals" stems to "crystal" in FTS5, so FTS5
+        // returns t1, and recheck must enforce AND across both phrases).
+        let mut second_stemmed_mismatch = Search::new("\"crystal & clear\" \"velvets giraffe\"");
+        assert!(
+            store
+                .search(&mut second_stemmed_mismatch, 20, false, 10)
+                .await
+                .expect("search")
+                .results
+                .is_empty(),
+            "second recheck mismatch must reject even when first passes"
+        );
+        // Negated recheck must reject when found (using a phrase whose tokens aren't already
+        // dropped by FTS5, e.g. `-subject:"Deck"` or `"crystal & clear" -"crystal"`).
+        let mut negated_subject = Search::new("\"crystal & clear\" -subject:\"Deck\"");
+        assert!(
+            store
+                .search(&mut negated_subject, 20, false, 10)
+                .await
+                .expect("search")
+                .results
+                .is_empty()
+        );
+        // Negated recheck that passes must NOT be bolded in highlights.
+        let mut neg_other = Search::new("\"crystal & clear\" -subject:\"velvet\"");
+        let page = store
+            .search(&mut neg_other, 20, false, 10)
+            .await
+            .expect("search");
+        assert_eq!(page.results.len(), 1);
+        let snippet = page.results[0].snippet.as_ref().expect("snippet");
+        let bold_words: Vec<&str> = snippet
+            .bold
+            .iter()
+            .map(|r| &snippet.text[r.clone()])
+            .collect();
+        assert!(!bold_words.contains(&"velvet"));
+
+        // Quoted `subject:"..."` uses an FTS5 subquery, so outer snippet() has no subject marks;
+        // rehighlight must still highlight `view.subject()`.
+        let msg2 = gmail::Message {
+            id: Some("m2".into()),
+            thread_id: Some("t2".into()),
+            internal_date: Some(1_794_900_000_100),
+            label_ids: vec![INBOX.into()],
+            payload: Some(gmail::MessagePart {
+                mime_type: Some("text/plain".into()),
+                headers: vec![
+                    gmail::MessagePartHeader {
+                        name: "Subject".into(),
+                        value: "Quarterly Q4 Plan Review".into(),
+                    },
+                    gmail::MessagePartHeader {
+                        name: "From".into(),
+                        value: "Priya <priya@brightmoor.co>".into(),
+                    },
+                    gmail::MessagePartHeader {
+                        name: "Cc".into(),
+                        value: "\"Ada Lovelace\" <ada@example.com>".into(),
+                    },
+                ],
+                body: Some(gmail::MessagePartBody {
+                    data: Some(b"Review notes for q4 plan".to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            let parsed = crate::parse::parse(&msg2, true).expect("parses");
+            provider::save_message(write.exec(), parsed)
+                .await
+                .expect("saves");
+            reindex(write.exec(), "t2", &store.inner.router())
+                .await
+                .expect("indexes");
+            write.commit().await.expect("commits");
+        }
+        let mut subj_q = Search::new("subject:\"q4 plan\"");
+        let page = store
+            .search(&mut subj_q, 20, false, 10)
+            .await
+            .expect("search");
+        assert_eq!(page.results.len(), 1);
+        let subj = page.results[0]
+            .subject
+            .as_ref()
+            .expect("quoted subject highlights view.subject()");
+        let subj_bold: Vec<&str> = subj.bold.iter().map(|r| &subj.text[r.clone()]).collect();
+        assert_eq!(subj_bold, ["Q4 Plan"]);
+        // Quoted `to:` searches across to, cc, and bcc in FTS5.
+        let mut cc_q = Search::new("to:\"Ada Lovelace\"");
+        let page = store
+            .search(&mut cc_q, 20, false, 10)
+            .await
+            .expect("search");
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].thread.id, ThreadId::new("t2"));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whole_text_strips_matching_hidden_tags_without_eating_body_when_head_unclosed() {
+        let html = "<head><title>Hidden Title</title><body><p>Visible &mdash; body</p><style>.x{color:red}</style><script>alert(1)</script><!-- comment --></body>";
+        assert_eq!(
+            whole_text(Some(html), None),
+            "Visible \u{2014} body",
+            "omitted </head> must not eat body up to </style>"
+        );
+    }
 }

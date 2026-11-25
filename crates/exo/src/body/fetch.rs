@@ -60,7 +60,7 @@ pub(crate) fn named<'a>(
     let cid = cid.to_lowercase();
     inline
         .get(&cid)
-        .or_else(|| inline.get(&percent_decode(&cid)))
+        .or_else(|| inline.get(&exo_mail::percent_decode_lossy(&cid)))
 }
 
 impl exo_mail::Fetch for Fetcher {
@@ -88,37 +88,16 @@ impl exo_mail::Fetch for Fetcher {
     }
 }
 
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let hex = |offset: usize| {
-            bytes
-                .get(at + offset)
-                .and_then(|byte| (*byte as char).to_digit(16))
-        };
-        match (bytes[at], hex(1), hex(2)) {
-            (b'%', Some(high), Some(low)) => {
-                out.push((high * 16 + low) as u8);
-                at += 3;
-            }
-            (byte, _, _) => {
-                out.push(byte);
-                at += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use exo_mail::percent_decode_lossy;
 
     #[test]
     fn decodes_percent_escapes_in_content_ids() {
-        assert_eq!(percent_decode("image001.png%4001d9"), "image001.png@01d9");
-        assert_eq!(percent_decode("plain@cid"), "plain@cid");
+        assert_eq!(
+            percent_decode_lossy("image001.png%4001d9"),
+            "image001.png@01d9"
+        );
+        assert_eq!(percent_decode_lossy("plain@cid"), "plain@cid");
     }
 }

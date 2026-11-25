@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use toasty::Executor;
 
 use crate::db::{self, DraftRow, GIVEN_REMINDERS, ReminderRow};
@@ -22,6 +23,66 @@ use crate::mutation::{Mutation, Plan, change};
 use crate::outbox::enqueue;
 use crate::store::{Inner, Store, load_view, reindex};
 use crate::view::ThreadView;
+
+/// Persisted record of the reminder a held send put on its thread, kept in `kv[GIVEN_REMINDERS]`
+/// so [`Inner::take_back_reminder`] can roll it back even after an app restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GivenReminder {
+    pub reminder: DraftReminder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<SavedReminder>,
+}
+
+/// Serializable snapshot of a [`ReminderRow`] displaced by a held send's reminder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedReminder {
+    pub at: Timestamp,
+    pub keep_on_reply: bool,
+    pub message_ids: Vec<String>,
+    pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at: Option<Timestamp>,
+    #[serde(default)]
+    pub aborted: bool,
+}
+
+impl From<&ReminderRow> for SavedReminder {
+    fn from(row: &ReminderRow) -> Self {
+        Self {
+            at: row.at,
+            keep_on_reply: row.keep_on_reply,
+            message_ids: row.message_ids.clone(),
+            created_at: row.created_at,
+            fired_at: row.fired_at,
+            aborted: row.aborted,
+        }
+    }
+}
+
+impl SavedReminder {
+    fn into_row(self, thread_id: String) -> ReminderRow {
+        ReminderRow {
+            thread_id,
+            at: self.at,
+            keep_on_reply: self.keep_on_reply,
+            message_ids: self.message_ids,
+            created_at: self.created_at,
+            fired_at: self.fired_at,
+            aborted: self.aborted,
+        }
+    }
+}
+
+/// Backward-compatible decoder for `kv[GIVEN_REMINDERS]`: older builds stored bare
+/// [`DraftReminder`] values without `thread_id` or `previous`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredGiven {
+    Full(GivenReminder),
+    Legacy(DraftReminder),
+}
 
 /// Makes the reminder change that `mutation` makes to the thread of `view`. Returns what the
 /// thread had before, for undo, or `None` for a mutation that doesn't touch reminders.
@@ -309,6 +370,15 @@ impl Store {
         }
         let fetched = inner.fetch_stale(crate::quota::Lane::Sync, &listed).await?;
         let mut write = inner.begin(&mut db).await?;
+        // Re-check inside the write transaction so concurrent calls cannot enqueue duplicate
+        // `ReturnFromReminder` mutations.
+        if db::kv_get::<bool>(write.exec(), db::ORPHANED_SNOOZES)
+            .await?
+            .is_none()
+        {
+            write.commit().await?;
+            return Ok(Vec::new());
+        }
         for rows in &fetched {
             if let Some(id) = crate::provider::save_rows(write.exec(), rows).await? {
                 reindex(write.exec(), &id, &router).await?;
@@ -376,13 +446,17 @@ impl Inner {
         else {
             return Ok(false);
         };
-        if given(&mut db).await?.get(id) == Some(&reminder) {
+        let existing = given(&mut db).await?;
+        if existing.get(id).map(|entry| entry.reminder) == Some(reminder) {
             return Ok(false);
         }
+        let had_earlier_in_kv = existing.contains_key(id);
+        let inherited_previous = existing.get(id).and_then(|entry| entry.previous.clone());
         // If a reminder was given before in this session (a send called off by Edit Message and
         // scheduled again), that one comes off first, so undo puts back what the thread had
         // before either.
         let earlier = self.given.lock().expect("never poisoned").remove(id);
+        let had_session_undo = earlier.is_some();
         if let Some(earlier) = earlier {
             self.undo(earlier).await?;
         }
@@ -391,12 +465,17 @@ impl Inner {
             keep_on_reply: reminder.keep_on_reply,
             snooze: false,
         };
-        let undo = match self.apply(&[ThreadId::new(thread)], mutation).await {
+        let undo = match self.apply(&[ThreadId::new(thread.clone())], mutation).await {
             Ok(undo) => undo,
             // The thread isn't stored yet, or the first sync hasn't made the reminder labels, so
             // the reminder waits until later.
             Err(Error::UnknownThread(_) | Error::NotSynced(_)) => return Ok(false),
             Err(error) => return Err(error),
+        };
+        let previous = if had_earlier_in_kv && !had_session_undo {
+            inherited_previous
+        } else {
+            undo.prior_reminder().map(SavedReminder::from)
         };
         let mut write = self.begin(&mut db).await?;
         let mut given = given(write.exec()).await?;
@@ -407,7 +486,14 @@ impl Inner {
             .into_iter()
             .collect();
         given.retain(|draft, _| drafts.contains(draft));
-        given.insert(id.to_owned(), reminder);
+        given.insert(
+            id.to_owned(),
+            GivenReminder {
+                reminder,
+                thread_id: Some(thread),
+                previous,
+            },
+        );
         db::kv_set(write.exec(), GIVEN_REMINDERS, &given).await?;
         write.commit().await?;
         self.given
@@ -418,21 +504,89 @@ impl Inner {
     }
 
     /// Undo send for held send `id`. The reminder it put on its thread comes off, and the one
-    /// the thread had comes back.
+    /// the thread had comes back. Works across app restarts using the persisted entry in
+    /// `kv[GIVEN_REMINDERS]` when the in-memory [`Undo`](crate::Undo) is gone.
     pub(crate) async fn take_back_reminder(&self, id: &str) -> Result<()> {
         let _giving = self.giving.lock().await;
         let undo = self.given.lock().expect("never poisoned").remove(id);
         let mut db = self.db.clone();
         let mut write = self.begin(&mut db).await?;
         let mut given = given(write.exec()).await?;
-        if given.remove(id).is_some() {
+        let removed = given.remove(id);
+        if removed.is_some() {
             db::kv_set(write.exec(), GIVEN_REMINDERS, &given).await?;
         }
         write.commit().await?;
-        match undo {
-            Some(undo) => self.undo(undo).await,
-            None => Ok(()),
+        if let Some(undo) = undo {
+            return self.undo(undo).await;
         }
+        let Some(entry) = removed else {
+            return Ok(());
+        };
+        let thread = match entry.thread_id {
+            Some(thread) => Some(thread),
+            None => DraftRow::filter_by_id(id)
+                .select(DraftRow::fields().thread_id())
+                .first()
+                .exec(&mut db)
+                .await?
+                .flatten(),
+        };
+        let Some(thread) = thread else {
+            return Ok(());
+        };
+        self.take_back_persisted(&thread, entry.previous).await
+    }
+
+    /// Rolls back a held send's reminder after a restart when the session's `Undo` is gone:
+    /// cancels the reminder when the thread had none before, or restores `previous`.
+    async fn take_back_persisted(
+        &self,
+        thread: &str,
+        previous: Option<SavedReminder>,
+    ) -> Result<()> {
+        let Some(previous) = previous else {
+            return match self
+                .apply(
+                    &[ThreadId::new(thread.to_owned())],
+                    Mutation::CancelReminder { to_inbox: false },
+                )
+                .await
+            {
+                Ok(_) | Err(Error::UnknownThread(_) | Error::NotSynced(_)) => Ok(()),
+                Err(error) => Err(error),
+            };
+        };
+        let router = self.router();
+        let mut db = self.db.clone();
+        let mut write = self.begin(&mut db).await?;
+        let Some(view) = load_view(write.exec(), thread).await? else {
+            return write.commit().await;
+        };
+        let mutation = if previous.fired_at.is_some() || previous.aborted {
+            Mutation::CancelReminder { to_inbox: false }
+        } else {
+            Mutation::Remind {
+                at: previous.at,
+                keep_on_reply: previous.keep_on_reply,
+                snooze: false,
+            }
+        };
+        match mutation.plan(&view, &router.me) {
+            Ok(Some((forward, _))) => {
+                enqueue(write.exec(), &view, &forward, &mutation, false, &router.me).await?;
+            }
+            Ok(None) | Err(Error::NotSynced(_)) => {}
+            Err(error) => return Err(error),
+        }
+        restore(
+            write.exec(),
+            &view.id,
+            Some(previous.into_row(view.id.clone())),
+        )
+        .await?;
+        reindex(write.exec(), &view.id, &router).await?;
+        write.publish().await
     }
 
     /// Gives `thread` the reminder a draft carried, once Gmail has sent the draft into the
@@ -478,9 +632,25 @@ impl Inner {
     }
 }
 
-/// The held sends whose reminder is on their thread, and the reminder each one gave.
-pub(crate) async fn given(exec: &mut dyn Executor) -> Result<HashMap<String, DraftReminder>> {
-    Ok(db::kv_get(exec, GIVEN_REMINDERS).await?.unwrap_or_default())
+/// The held sends whose reminder is on their thread, and what each one gave (with thread id and
+/// replaced reminder so taking it back survives an app restart).
+pub(crate) async fn given(exec: &mut dyn Executor) -> Result<HashMap<String, GivenReminder>> {
+    let raw: HashMap<String, StoredGiven> =
+        db::kv_get(exec, GIVEN_REMINDERS).await?.unwrap_or_default();
+    Ok(raw
+        .into_iter()
+        .map(|(id, stored)| {
+            let entry = match stored {
+                StoredGiven::Full(full) => full,
+                StoredGiven::Legacy(reminder) => GivenReminder {
+                    reminder,
+                    thread_id: None,
+                    previous: None,
+                },
+            };
+            (id, entry)
+        })
+        .collect())
 }
 
 /// The reminders that haven't brought their thread back or been cancelled by a reply.
@@ -488,4 +658,204 @@ pub(crate) async fn waiting(exec: &mut dyn Executor) -> Result<Vec<ReminderRow>>
     let mut rows = ReminderRow::all().exec(exec).await?;
     rows.retain(|row| row.fired_at.is_none() && !row.aborted);
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drafts::{Draft, DraftAction, DraftRecord};
+    use crate::ids::labels::INBOX;
+    use crate::view::Identity;
+
+    fn sample_record(reminder: Option<DraftReminder>) -> DraftRecord {
+        DraftRecord {
+            action: DraftAction::Reply,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Follow up".into(),
+            body: "<div>ping</div>".into(),
+            quoted_content: None,
+            quoted_inlined: false,
+            in_reply_to: None,
+            in_reply_to_rfc822: None,
+            references: Vec::new(),
+            rfc822_id: "d1@exo".into(),
+            fingerprint: String::new(),
+            attachments: Vec::new(),
+            send_later: None,
+            reminder,
+        }
+    }
+
+    async fn seed_store(name: &str) -> (std::path::PathBuf, Store) {
+        let dir =
+            std::env::temp_dir().join(format!("exo-store-reminders-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let identity = Identity {
+            addresses: vec!["maya@brightmoor.co".into()],
+            snoozed_label: Some("Label_Snoozed".into()),
+            reminder_unread_label: Some("Label_RU".into()),
+            ..Identity::default()
+        };
+        let mut db = store.inner.db.clone();
+        let mut write = store.inner.begin(&mut db).await.expect("tx");
+        db::kv_set(write.exec(), db::IDENTITY, &identity)
+            .await
+            .expect("sets identity");
+        let msg = gmail::Message {
+            id: Some("m1".into()),
+            thread_id: Some("t1".into()),
+            internal_date: Some(1_794_900_000_000),
+            label_ids: vec![INBOX.into()],
+            payload: Some(gmail::MessagePart {
+                headers: vec![
+                    gmail::MessagePartHeader {
+                        name: "Subject".into(),
+                        value: "Follow up".into(),
+                    },
+                    gmail::MessagePartHeader {
+                        name: "From".into(),
+                        value: "Priya <priya@brightmoor.co>".into(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parsed = crate::parse::parse(&msg, false).expect("parses");
+        crate::provider::save_message(write.exec(), parsed)
+            .await
+            .expect("saves");
+        write.commit().await.expect("commits");
+        *store.inner.identity.write().expect("lock") = identity;
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn take_back_reminder_works_after_restart_without_and_with_prior_reminder() {
+        let (dir, store) = seed_store("restart").await;
+        let t1 = ThreadId::new("t1");
+        let first_at: Timestamp = "2026-12-01T10:00:00Z".parse().expect("ts");
+        let draft_at: Timestamp = "2026-12-05T10:00:00Z".parse().expect("ts");
+
+        // 1. Thread with NO prior reminder: hold send with reminder, simulate restart, undo send.
+        store
+            .save_draft(Draft {
+                id: "draft001".into(),
+                thread: Some(t1.clone()),
+                adopted: None,
+                record: sample_record(Some(DraftReminder {
+                    at: draft_at,
+                    keep_on_reply: false,
+                    automatic: false,
+                })),
+                raw: String::new(),
+                complete: true,
+                sending: true,
+            })
+            .await
+            .expect("saves");
+        store
+            .send_draft("draft001", draft_at)
+            .await
+            .expect("holds send");
+        assert_eq!(store.next_reminder().await.expect("next"), Some(draft_at));
+
+        // Reopen store (simulates app restart: in-memory `self.given` is empty).
+        drop(store);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("reopens");
+        assert!(store.undo_send("draft001").await.expect("undo send"));
+        assert_eq!(
+            store.next_reminder().await.expect("next"),
+            None,
+            "reminder cancelled across restart when no prior reminder existed"
+        );
+        let mut db = store.inner.db.clone();
+        let view = load_view(&mut db, "t1").await.expect("load").expect("t1");
+        assert!(!view.has("Label_Snoozed"), "snoozed label removed");
+
+        // 2. Thread WITH a prior reminder: hold send replaces it; restart + undo restores prior.
+        store
+            .apply(
+                std::slice::from_ref(&t1),
+                Mutation::Remind {
+                    at: first_at,
+                    keep_on_reply: true,
+                    snooze: false,
+                },
+            )
+            .await
+            .expect("sets prior reminder");
+        store
+            .send_draft("draft001", draft_at)
+            .await
+            .expect("holds send");
+        assert_eq!(store.next_reminder().await.expect("next"), Some(draft_at));
+
+        drop(db);
+        drop(store);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("reopens");
+        assert!(store.undo_send("draft001").await.expect("undo send"));
+        assert_eq!(
+            store.next_reminder().await.expect("next"),
+            Some(first_at),
+            "prior reminder restored across restart"
+        );
+        let mut db = store.inner.db.clone();
+        let restored = ReminderRow::filter_by_thread_id("t1")
+            .first()
+            .exec(&mut db)
+            .await
+            .expect("reads")
+            .expect("prior row restored");
+        assert!(restored.keep_on_reply);
+
+        // 3. Legacy GIVEN_REMINDERS format (bare DraftReminder without thread_id/previous) still
+        // deserializes cleanly and falls back to the draft row's thread_id.
+        let legacy = serde_json::json!({
+            "draft001": { "at": draft_at.to_string() }
+        });
+        let mut write = store.inner.begin(&mut db).await.expect("tx");
+        db::kv_set(write.exec(), GIVEN_REMINDERS, &legacy)
+            .await
+            .expect("writes legacy");
+        write.commit().await.expect("commits");
+        let parsed = given(&mut db).await.expect("reads legacy");
+        assert_eq!(parsed["draft001"].reminder.at, draft_at);
+        assert_eq!(parsed["draft001"].thread_id, None);
+        store
+            .inner
+            .take_back_reminder("draft001")
+            .await
+            .expect("takes back legacy");
+        assert_eq!(store.next_reminder().await.expect("next"), None);
+
+        drop(db);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -6,11 +6,13 @@
 //! title. The actions sit in a 28px row 8px below the text, floated right past the padding
 //! (`margin-right: -12px`), with the second one 8px left of the first.
 
-use egui::{Color32, CornerRadius, Rect, Sense, Ui, pos2, vec2};
+use egui::{Area, Color32, CornerRadius, Order, Rect, Sense, Ui, pos2, vec2};
 
 use crate::{BoxShadow, Family, Font, TextStyle, WBR, form, motion, pixel_snap};
 
 const WIDTH: f32 = 340.0;
+/// The modal backdrop's `rgba(0, 0, 0, .5)`.
+const BACKDROP: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 128);
 const PADDING_TOP: f32 = 12.0;
 const PADDING_RIGHT: f32 = 24.0;
 const PADDING_BOTTOM: f32 = 20.0;
@@ -203,6 +205,106 @@ pub struct Alert<'a> {
 }
 
 impl Alert<'_> {
+    /// Moves `selected` by `step` across `count` right-to-left actions (`+1` moves visually left,
+    /// `-1` moves visually right), wrapping with `rem_euclid` when `wrap` is set and clamping
+    /// otherwise.
+    pub fn move_selection(selected: usize, count: usize, step: isize, wrap: bool) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let next = selected as isize + step;
+        let bound = count as isize;
+        if wrap {
+            next.rem_euclid(bound) as usize
+        } else {
+            next.clamp(0, bound - 1) as usize
+        }
+    }
+
+    /// Draws `content` in a modal [`Order::Tooltip`] layer over `area` dimmed to `rgba(0,0,0,.5)`,
+    /// swallowing clicks behind it. Returns `(inner, backdrop_clicked)`.
+    pub fn modal<R>(
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+        content: impl FnOnce(&mut Ui) -> R,
+    ) -> (R, bool) {
+        let id = crate::id(ctx, ("exo_ui::alert", id));
+        Area::new(id)
+            .order(Order::Tooltip)
+            .fixed_pos(area.min)
+            .show(ctx, |ui| {
+                let backdrop = ui.allocate_rect(area, Sense::click());
+                ui.painter().rect_filled(area, 0.0, BACKDROP);
+                let inner = content(ui);
+                (inner, backdrop.clicked())
+            })
+            .inner
+    }
+
+    /// [`Alert::show`] over a dimmed modal backdrop in `area`. Returns the action clicked and
+    /// whether the backdrop outside the card was clicked.
+    pub fn show_modal(
+        &self,
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+    ) -> (Option<usize>, bool) {
+        Self::modal(ctx, id, area, |ui| self.show(ui, area))
+    }
+
+    /// [`Alert::show_options`] over a dimmed modal backdrop in `area`.
+    pub fn show_options_modal(
+        &self,
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+        options: &[&str],
+        chosen: &mut usize,
+    ) -> (Option<usize>, bool) {
+        Self::modal(ctx, id, area, |ui| {
+            self.show_options(ui, area, options, chosen)
+        })
+    }
+
+    /// [`Alert::show_runs`] over a dimmed modal backdrop in `area`.
+    pub fn show_runs_modal(
+        &self,
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+        runs: &[AlertRun<'_>],
+    ) -> (Option<AlertClick>, bool) {
+        Self::modal(ctx, id, area, |ui| self.show_runs(ui, area, runs))
+    }
+
+    /// [`Alert::show_runs_with`] over a dimmed modal backdrop in `area`.
+    pub fn show_runs_modal_with(
+        &self,
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+        runs: &[AlertRun<'_>],
+        extra_height: f32,
+        extra: impl FnOnce(&mut Ui, Rect),
+    ) -> (Option<AlertClick>, bool) {
+        Self::modal(ctx, id, area, |ui| {
+            self.show_runs_with(ui, area, runs, extra_height, extra)
+        })
+    }
+
+    /// [`Alert::show_body`] over a dimmed modal backdrop in `area`.
+    pub fn show_body_modal(
+        &self,
+        ctx: &egui::Context,
+        id: impl egui::AsId,
+        area: Rect,
+        height: f32,
+        body: impl FnOnce(&mut Ui, Rect),
+    ) -> (Option<usize>, bool) {
+        Self::modal(ctx, id, area, |ui| self.show_body(ui, area, height, body))
+    }
+
     /// Paints the alert centered in `area` (the window below the tab bar). Returns the action
     /// clicked, if any.
     pub fn show(&self, ui: &mut Ui, area: Rect) -> Option<usize> {
@@ -405,46 +507,83 @@ impl Alert<'_> {
         })
     }
 
-    /// [`Alert::show`] with its text as `runs`, wrapped as the alert's own text wraps, the bold
-    /// runs bold and the links in their colour. Returns the action clicked, or the link.
+    /// [`Alert::show`] with its text as `runs`, wrapped as the alert's own text wraps (with
+    /// [`PARAGRAPH`] separating `<p>`s by 8px and `\n` as `<br>`), the bold runs bold and the
+    /// links in their colour. Returns the action clicked, or the link.
     pub fn show_runs(&self, ui: &mut Ui, area: Rect, runs: &[AlertRun<'_>]) -> Option<AlertClick> {
-        let lines = wrap_runs(ui.ctx(), runs, self.content_width());
-        let height = lines.len() as f32 * TEXT.line_height;
+        self.show_runs_with(ui, area, runs, 0.0, |_, _| {})
+    }
+
+    /// [`Alert::show_runs`] with `extra` painting an additional `extra_height`-tall block directly
+    /// under the last paragraph, before the actions row (for an opt-out checkbox or subtext).
+    pub fn show_runs_with(
+        &self,
+        ui: &mut Ui,
+        area: Rect,
+        runs: &[AlertRun<'_>],
+        extra_height: f32,
+        extra: impl FnOnce(&mut Ui, Rect),
+    ) -> Option<AlertClick> {
+        let paragraphs = wrap_runs_paragraphs(ui.ctx(), runs, self.content_width());
+        let lines: usize = paragraphs.iter().map(Vec::len).sum();
+        let paragraphs_height = lines as f32 * TEXT.line_height
+            + paragraphs.len().saturating_sub(1) as f32 * TEXT_MARGIN;
+        let height = paragraphs_height + extra_height;
         let mut link = None;
         let action = self.paint(ui, area, height, |ui, text| {
-            for (index, line) in lines.iter().enumerate() {
-                let y = text.top() + index as f32 * TEXT.line_height;
-                let mut x = text.left();
-                for (run, segment) in line {
-                    let ink = if matches!(runs[*run], AlertRun::Link(_)) {
-                        LINK_INK
-                    } else {
-                        TEXT_INK
-                    };
-                    let width =
-                        runs[*run]
-                            .style()
-                            .paint_line(ui.painter(), pos2(x, y), segment, ink, None);
-                    if matches!(runs[*run], AlertRun::Link(_)) {
-                        let place = runs[..*run]
-                            .iter()
-                            .filter(|run| matches!(run, AlertRun::Link(_)))
-                            .count();
-                        let rect = Rect::from_min_size(pos2(x, y), vec2(width, TEXT.line_height));
-                        let response = ui
-                            .interact(
-                                rect,
-                                ui.id().with(("alert-link", self.title, index, *run)),
-                                Sense::click(),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if response.clicked() {
-                            link = Some(place);
+            let mut y = text.top();
+            for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
+                if paragraph_index > 0 {
+                    y += TEXT_MARGIN;
+                }
+                for (index, line) in paragraph.iter().enumerate() {
+                    let mut x = text.left();
+                    for (run, segment) in line {
+                        let ink = if matches!(runs[*run], AlertRun::Link(_)) {
+                            LINK_INK
+                        } else {
+                            TEXT_INK
+                        };
+                        let width = runs[*run].style().paint_line(
+                            ui.painter(),
+                            pos2(x, y),
+                            segment,
+                            ink,
+                            None,
+                        );
+                        if matches!(runs[*run], AlertRun::Link(_)) {
+                            let place = runs[..*run]
+                                .iter()
+                                .filter(|run| matches!(run, AlertRun::Link(_)))
+                                .count();
+                            let rect =
+                                Rect::from_min_size(pos2(x, y), vec2(width, TEXT.line_height));
+                            let response = ui
+                                .interact(
+                                    rect,
+                                    ui.id().with((
+                                        "alert-link",
+                                        self.title,
+                                        paragraph_index,
+                                        index,
+                                        *run,
+                                    )),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if response.clicked() {
+                                link = Some(place);
+                            }
                         }
+                        x += width;
                     }
-                    x += width;
+                    y += TEXT.line_height;
                 }
             }
+            extra(
+                ui,
+                Rect::from_min_size(pos2(text.left(), y), vec2(text.width(), extra_height)),
+            );
         });
         action
             .map(AlertClick::Action)
@@ -569,6 +708,12 @@ impl Alert<'_> {
         // Centering can land on a half pixel, and Chromium paints the alert's layer at the whole
         // pixel below it, text and all.
         let card = pixel_snap(Rect::from_center_size(area.center(), vec2(WIDTH, height)));
+        // The card swallows clicks so they don't reach a modal alert's backdrop.
+        let _ = ui.interact(
+            card,
+            ui.id().with(("alert-card", self.title)),
+            Sense::click(),
+        );
 
         let painter = ui.painter();
         for shadow in SHADOWS {
@@ -691,37 +836,54 @@ struct Word {
     pieces: Vec<(usize, String)>,
 }
 
-/// `runs` wrapped as [`pretty_wrap`] wraps plain text: at `<br>`s and spaces, whitespace
-/// collapsed, with `text-wrap: pretty`'s rule for each part between `<br>`s. Each line is its
-/// segments, by run, with the spaces between its words in the run they're in.
-fn wrap_runs(ctx: &egui::Context, runs: &[AlertRun<'_>], width: f32) -> Vec<Vec<(usize, String)>> {
-    // The words of each part between `<br>`s.
-    let mut parts: Vec<Vec<Word>> = vec![Vec::new()];
+/// `runs` split into `<p>` paragraphs at [`PARAGRAPH`] and wrapped as [`pretty_wrap`] wraps plain
+/// text: at `<br>`s (`\n`) and spaces, whitespace collapsed, with `text-wrap: pretty`'s rule for
+/// each part between `<br>`s. Each line is its segments, by run, with the spaces between its words
+/// in the run they're in.
+fn wrap_runs_paragraphs(
+    ctx: &egui::Context,
+    runs: &[AlertRun<'_>],
+    width: f32,
+) -> Vec<Vec<Vec<(usize, String)>>> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let mut paragraphs: Vec<Vec<Vec<Word>>> = vec![vec![Vec::new()]];
     let mut space = None;
     let mut glued = false;
     for (run, text) in runs.iter().enumerate() {
-        for (line, part) in text.text().split('\n').enumerate() {
-            if line > 0 {
-                parts.push(Vec::new());
+        for (paragraph_index, paragraph) in text.text().split(PARAGRAPH).enumerate() {
+            if paragraph_index > 0 {
+                paragraphs.push(vec![Vec::new()]);
                 (space, glued) = (None, false);
             }
-            for (at, piece) in part.split(' ').enumerate() {
-                if at > 0 {
-                    space = Some(run);
-                    glued = false;
+            for (line, part) in paragraph.split('\n').enumerate() {
+                if line > 0 {
+                    paragraphs.last_mut().expect("a paragraph").push(Vec::new());
+                    (space, glued) = (None, false);
                 }
-                if piece.is_empty() {
-                    continue;
+                for (at, piece) in part.split(' ').enumerate() {
+                    if at > 0 {
+                        space = Some(run);
+                        glued = false;
+                    }
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let words = paragraphs
+                        .last_mut()
+                        .expect("a paragraph")
+                        .last_mut()
+                        .expect("a part");
+                    match words.last_mut() {
+                        Some(word) if glued => word.pieces.push((run, piece.to_owned())),
+                        _ => words.push(Word {
+                            space: space.take(),
+                            pieces: vec![(run, piece.to_owned())],
+                        }),
+                    }
+                    glued = true;
                 }
-                let words = parts.last_mut().expect("a part");
-                match words.last_mut() {
-                    Some(word) if glued => word.pieces.push((run, piece.to_owned())),
-                    _ => words.push(Word {
-                        space: space.take(),
-                        pieces: vec![(run, piece.to_owned())],
-                    }),
-                }
-                glued = true;
             }
         }
     }
@@ -747,37 +909,42 @@ fn wrap_runs(ctx: &egui::Context, runs: &[AlertRun<'_>], width: f32) -> Vec<Vec<
             .map(|(run, segment)| runs[*run].style().width(ctx, segment))
             .sum()
     };
-    let mut lines = Vec::new();
-    for part in &parts {
-        let mut wrapped: Vec<Vec<&Word>> = vec![Vec::new()];
-        for word in part {
-            let line = wrapped.last_mut().expect("a line");
-            line.push(word);
-            if line.len() > 1 && measure(line) > width {
-                line.pop();
-                wrapped.push(vec![word]);
+    paragraphs
+        .iter()
+        .map(|parts| {
+            let mut lines = Vec::new();
+            for part in parts {
+                let mut wrapped: Vec<Vec<&Word>> = vec![Vec::new()];
+                for word in part {
+                    let line = wrapped.last_mut().expect("a line");
+                    line.push(word);
+                    if line.len() > 1 && measure(line) > width {
+                        line.pop();
+                        wrapped.push(vec![word]);
+                    }
+                }
+                // `text-wrap: pretty`: a last line of one word takes the word before it, when they fit.
+                if let [.., before, last] = wrapped.as_mut_slice()
+                    && last.len() == 1
+                    && before.len() > 1
+                {
+                    let mut joined = vec![before[before.len() - 1]];
+                    joined.extend(last.iter());
+                    if measure(&joined) <= width {
+                        before.pop();
+                        *last = joined;
+                    }
+                }
+                lines.extend(wrapped.iter().map(|words| segments(words)));
             }
-        }
-        // `text-wrap: pretty`: a last line of one word takes the word before it, when they fit.
-        if let [.., before, last] = wrapped.as_mut_slice()
-            && last.len() == 1
-            && before.len() > 1
-        {
-            let mut joined = vec![before[before.len() - 1]];
-            joined.extend(last.iter());
-            if measure(&joined) <= width {
-                before.pop();
-                *last = joined;
-            }
-        }
-        lines.extend(wrapped.iter().map(|words| segments(words)));
-    }
-    lines
+            lines
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ALERT_TEXT_WIDTH, AlertRun, wbrise, wrap_runs};
+    use super::{ALERT_TEXT_WIDTH, Alert, AlertRun, PARAGRAPH, wbrise, wrap_runs_paragraphs};
 
     #[test]
     fn runs_wrap_as_one_text_with_words_across_runs_kept_whole() {
@@ -796,7 +963,10 @@ mod tests {
         ];
         let mut lines = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            lines = wrap_runs(ui.ctx(), &runs, ALERT_TEXT_WIDTH);
+            lines = wrap_runs_paragraphs(ui.ctx(), &runs, ALERT_TEXT_WIDTH)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
         });
         output.textures_delta.clear();
         let text: Vec<String> = lines
@@ -823,6 +993,29 @@ mod tests {
                 (3, "Add invitations to".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn runs_split_into_paragraphs_and_selection_wraps_or_clamps() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("the system fonts load");
+        let separator = PARAGRAPH.to_string();
+        let runs = [
+            AlertRun::Text("Out on "),
+            AlertRun::Strong("Friday, November 20."),
+            AlertRun::Text(&separator),
+            AlertRun::Text("Send automatic replies?"),
+        ];
+        let mut paragraphs = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paragraphs = wrap_runs_paragraphs(ui.ctx(), &runs, ALERT_TEXT_WIDTH);
+        });
+        output.textures_delta.clear();
+        assert_eq!(paragraphs.len(), 2);
+        assert_eq!(Alert::move_selection(0, 2, -1, true), 1);
+        assert_eq!(Alert::move_selection(0, 2, -1, false), 0);
+        assert_eq!(Alert::move_selection(0, 3, 1, true), 1);
+        assert_eq!(Alert::move_selection(0, 3, -1, true), 2);
     }
 
     #[test]

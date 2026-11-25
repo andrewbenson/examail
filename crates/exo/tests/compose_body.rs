@@ -1,4 +1,4 @@
-//! The compose body's keys and helpers on gmail-mock: moving on to the quote's `…`, the link
+//! The compose body's keys and helpers on mock-servers: moving on to the quote's `…`, the link
 //! popover, pasting.
 
 mod support;

@@ -1,5 +1,5 @@
 //! Compose end to end: drafts saved to Gmail, sending with undo, discarding, replies in their
-//! thread, and pasting a copied message, on gmail-mock.
+//! thread, and pasting a copied message, on mock-servers.
 
 mod support;
 
@@ -1065,10 +1065,10 @@ fn a_draft_goes_to_gmail_at_most_every_5_s_and_its_last_edit_once_they_are_up() 
     );
 }
 
-/// An account alone on a fresh gmail-mock, its store in a folder named after `name`.
+/// An account alone on a fresh mock-servers, its store in a folder named after `name`.
 struct LoneAccount {
     runtime: tokio::runtime::Runtime,
-    server: gmail_mock::MockServer,
+    server: mock_servers::MockServer,
     dir: std::path::PathBuf,
 }
 
@@ -1076,7 +1076,9 @@ impl LoneAccount {
     fn new(name: &str) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let server = runtime
-            .block_on(gmail_mock::MockServer::start(gmail_mock::Config::default()))
+            .block_on(mock_servers::MockServer::start(
+                mock_servers::Config::default(),
+            ))
             .expect("mock starts");
         let dir = std::env::temp_dir().join(format!("exo-{name}-{}", std::process::id()));
         Self {
@@ -1088,7 +1090,7 @@ impl LoneAccount {
 
     /// Opens the account, as launching Exo does.
     fn open(&self) -> exo::account::Account {
-        let tokens = std::sync::Arc::new(gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()));
+        let tokens = std::sync::Arc::new(gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()));
         let credentials = exo::account::Credentials {
             email: "maya@brightmoor.co".into(),
             endpoints: self.server.endpoints(),
@@ -1157,7 +1159,7 @@ impl LoneAccount {
     fn draft_text(&self, rfc822_id: &str) -> String {
         let gmail = gmail::Client::new(
             self.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         );
         let query = DraftQuery {
             q: Some(format!("rfc822msgid:{rfc822_id}")),
@@ -1191,7 +1193,7 @@ impl LoneAccount {
     fn draft_message(&self, rfc822_id: &str) -> Option<String> {
         let gmail = gmail::Client::new(
             self.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         );
         let query = DraftQuery {
             q: Some(format!("rfc822msgid:{rfc822_id}")),
@@ -1211,7 +1213,7 @@ impl LoneAccount {
     fn sent(&self, rfc822_id: &str) -> usize {
         let gmail = gmail::Client::new(
             self.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         );
         let query = ListQuery {
             q: Some(format!("rfc822msgid:{rfc822_id}")),
@@ -1225,7 +1227,7 @@ impl LoneAccount {
             .len()
     }
 
-    /// Arms a gmail-mock fault, or with `None` clears every one.
+    /// Arms a mock server fault, or with `None` clears every one.
     fn fault(&self, fault: Option<serde_json::Value>) {
         let url = self.server.url().join("/__mock/faults").expect("a URL");
         let client = reqwest::Client::new();
@@ -1441,7 +1443,7 @@ fn a_draft_saved_without_its_files_goes_to_gmail_once_they_can_be_had() {
     // A message with a file, to forward.
     let gmail = gmail::Client::new(
         lone.server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let (message, part) = lone.runtime.block_on(async {
         let query = ListQuery {

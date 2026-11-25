@@ -4,9 +4,8 @@
 //! the recipients are as they were and the line goes, to come back on the next press.
 
 use exo_commands::{Command, Commands, Hint, Region};
+use exo_mail::dom::{self, NodeRef};
 use exo_store::{Address, DraftAction, MessageDetail};
-use html5ever::{parse_document, serialize, tendril::TendrilSink};
-use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 
 use super::{Action, Field, Open, auto_bcc, contacts};
 use crate::commands;
@@ -18,12 +17,8 @@ const NAME: &str = "Exo-Intro-Name";
 const FOREIGN_SNIPPET: &str = "Superhuman-Intro-Snippet";
 const FOREIGN_NAME: &str = "Superhuman-Intro-Name";
 
-fn is_name(node: &Handle) -> bool {
-    attribute(node, "class").is_some_and(|class| {
-        class
-            .split_whitespace()
-            .any(|class| class == NAME || class == FOREIGN_NAME)
-    })
+fn is_name(node: &NodeRef) -> bool {
+    dom::has_class(node, NAME) || dom::has_class(node, FOREIGN_NAME)
 }
 
 /// Where a draft's cycle is.
@@ -67,13 +62,13 @@ pub(crate) fn cycle(
     now: f64,
 ) -> bool {
     let current = recipients(open);
-    open.intro.reset_if_changed(&current);
+    open.delivery.intro.reset_if_changed(&current);
     let everyone = |open: &Open| open.recipients().count();
     if everyone(open) < 2 {
         return false;
     }
     // The next of the original To and Cc, or no one after the last.
-    let cycle = &mut open.intro;
+    let cycle = &mut open.delivery.intro;
     match cycle.index {
         None => {
             cycle.index = Some(0);
@@ -112,14 +107,14 @@ pub(crate) fn cycle(
     let first_name = moved
         .as_ref()
         .and_then(|person| contacts::best_known_first_name(person, book));
-    let index = open.intro.index;
+    let index = open.delivery.intro.index;
     insert_snippet(open, first_name.as_deref(), index, intro);
     // The recipients and body change together (the recipient undo step belongs to
     // `chips::History`).
     open.record.to = to;
     open.record.cc = cc;
     open.record.bcc = bcc;
-    open.intro.left = Some(recipients(open));
+    open.delivery.intro.left = Some(recipients(open));
     auto_bcc::settle(open);
     open.touch(now);
     true
@@ -129,161 +124,83 @@ pub(crate) fn cycle(
 /// instead, or goes when no one's moved. It's then kept aside for the next press, which puts it
 /// back when it starts the cycle again. A body with anything else in it is left alone.
 fn insert_snippet(open: &mut Open, first_name: Option<&str>, index: Option<usize>, intro: &str) {
-    let dom = parse_document(RcDom::default(), Default::default()).one(open.editor.html());
-    let Some(body) = find(&dom.document, |name, _| name == "body") else {
+    let document = dom::parse(&open.editor.html());
+    let Some(body) = dom::body(&document) else {
+        dom::drop_tree(document);
         return;
     };
     let mut snippet = find_snippet(&body);
     if snippet.is_none()
         && index == Some(0)
-        && let Some(kept) = open.intro.last_snippet.take()
+        && let Some(kept) = open.delivery.intro.last_snippet.take()
+        && let Some(node) = fragment(&kept)
     {
-        let node = fragment(&kept);
-        prepend(&body, &node);
+        dom::prepend(&body, &node);
         snippet = Some(node);
     }
     match (snippet, first_name) {
         (Some(snippet), Some(name)) => set_names(&snippet, name),
         (Some(snippet), None) => {
-            open.intro.last_snippet = Some(outer_html(&snippet));
-            detach(&snippet);
+            open.delivery.intro.last_snippet = Some(dom::outer_html(&snippet));
+            dom::detach(&snippet);
+            dom::drop_tree(snippet);
         }
-        (None, _) if text(&body).trim().is_empty() => {
-            let line = escape(intro)
+        (None, _) if dom::text_content(&body).trim().is_empty() => {
+            let line = exo_mail::escape_html_text(intro)
                 .split("{first_name}")
                 .collect::<Vec<_>>()
                 .join(&format!("<span class='{NAME}'></span>"));
-            let node = fragment(&format!(
+            if let Some(node) = fragment(&format!(
                 "<div class=\"{SNIPPET}\">{line}<div><br></div></div>"
-            ));
-            if let Some(name) = first_name {
-                set_names(&node, name);
+            )) {
+                if let Some(name) = first_name {
+                    set_names(&node, name);
+                }
+                dom::prepend(&body, &node);
             }
-            prepend(&body, &node);
         }
-        (None, _) => return,
+        (None, _) => {
+            dom::drop_tree(document);
+            return;
+        }
     }
-    open.editor.modify_html(&inner_html(&body));
+    let updated = dom::inner_html(&body);
+    dom::drop_tree(document);
+    open.editor.modify_html(&updated);
 }
 
 /// The body's first `div`, if it's the snippet with a name in it.
-fn find_snippet(body: &Handle) -> Option<Handle> {
-    let first = find(body, |name, _| name == "div")?;
-    let class = attribute(&first, "class").unwrap_or_default();
+fn find_snippet(body: &NodeRef) -> Option<NodeRef> {
+    let first = dom::select_first(body, |node| dom::is(node, "div"))?;
+    let class = dom::attr(&first, "class").unwrap_or_default();
     ((class.contains(SNIPPET) || class.contains(FOREIGN_SNIPPET))
-        && find(&first, |_, node| is_name(node)).is_some())
+        && dom::select_first(&first, is_name).is_some())
     .then_some(first)
 }
 
 /// Puts `name` in each of the snippet's name spans.
-fn set_names(snippet: &Handle, name: &str) {
+fn set_names(snippet: &NodeRef, name: &str) {
     let mut stack = vec![snippet.clone()];
     while let Some(node) = stack.pop() {
         if is_name(&node) {
-            let text = markup5ever_rcdom::Node::new(NodeData::Text {
-                contents: std::cell::RefCell::new(name.into()),
-            });
-            for child in node.children.borrow_mut().drain(..) {
-                child.parent.set(None);
+            for child in dom::take_children(&node) {
+                dom::drop_tree(child);
             }
-            text.parent.set(Some(std::rc::Rc::downgrade(&node)));
-            node.children.borrow_mut().push(text);
+            dom::set_children(&node, vec![dom::text_node(name)]);
         } else {
-            stack.extend(node.children.borrow().iter().cloned());
+            stack.extend(dom::children(&node));
         }
     }
 }
 
-/// The first element under `root` (depth first) that `matches` its tag name.
-fn find(root: &Handle, matches: impl Fn(&str, &Handle) -> bool) -> Option<Handle> {
-    let mut stack = vec![root.clone()];
-    while let Some(node) = stack.pop() {
-        if let NodeData::Element { name, .. } = &node.data
-            && !std::rc::Rc::ptr_eq(&node, root)
-            && matches(&name.local, &node)
-        {
-            return Some(node);
-        }
-        stack.extend(node.children.borrow().iter().rev().cloned());
+/// The element `html` parses to, detached from its temporary document.
+fn fragment(html: &str) -> Option<NodeRef> {
+    let mut nodes = dom::parse_fragment(html);
+    let first = (!nodes.is_empty()).then(|| nodes.remove(0));
+    for extra in nodes {
+        dom::drop_tree(extra);
     }
-    None
-}
-
-fn attribute(node: &Handle, wanted: &str) -> Option<String> {
-    let NodeData::Element { attrs, .. } = &node.data else {
-        return None;
-    };
-    attrs
-        .borrow()
-        .iter()
-        .find(|attr| &*attr.name.local == wanted)
-        .map(|attr| attr.value.to_string())
-}
-
-/// `textContent`.
-fn text(node: &Handle) -> String {
-    let mut out = String::new();
-    let mut stack = vec![node.clone()];
-    while let Some(node) = stack.pop() {
-        if let NodeData::Text { contents } = &node.data {
-            out.push_str(&contents.borrow());
-        }
-        stack.extend(node.children.borrow().iter().rev().cloned());
-    }
-    out
-}
-
-/// The element `html` parses to, taken out of its document (whose drop empties every node
-/// still in it).
-fn fragment(html: &str) -> Handle {
-    let dom = parse_document(RcDom::default(), Default::default()).one(html);
-    let body = find(&dom.document, |name, _| name == "body").expect("a parsed document has a body");
-    let node = body.children.borrow_mut().remove(0);
-    node.parent.set(None);
-    node
-}
-
-fn prepend(parent: &Handle, node: &Handle) {
-    node.parent.set(Some(std::rc::Rc::downgrade(parent)));
-    parent.children.borrow_mut().insert(0, node.clone());
-}
-
-fn detach(node: &Handle) {
-    let Some(parent) = node.parent.take().and_then(|parent| parent.upgrade()) else {
-        return;
-    };
-    parent
-        .children
-        .borrow_mut()
-        .retain(|child| !std::rc::Rc::ptr_eq(child, node));
-}
-
-fn serialize_node(node: &Handle, scope: serialize::TraversalScope) -> String {
-    let mut out = Vec::new();
-    let handle: SerializableHandle = node.clone().into();
-    let options = serialize::SerializeOpts {
-        traversal_scope: scope,
-        ..Default::default()
-    };
-    if serialize::serialize(&mut out, &handle, options).is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn inner_html(node: &Handle) -> String {
-    serialize_node(node, serialize::TraversalScope::ChildrenOnly(None))
-}
-
-fn outer_html(node: &Handle) -> String {
-    serialize_node(node, serialize::TraversalScope::IncludeNode)
-}
-
-/// The intro line as HTML text, so it shows as typed.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    first
 }
 
 /// Registers `Instant Intro` (⌘⇧I) for the draft with the keyboard.

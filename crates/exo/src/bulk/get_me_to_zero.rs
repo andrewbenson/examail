@@ -4,7 +4,8 @@
 
 use egui::{Context, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use exo_ui::{
-    ActionKind, Dialog, DialogAction, DialogResponse, Family, Font, Menu, TextStyle, palette,
+    ActionKind, Dialog, DialogAction, DialogResponse, DialogSelect, DialogSelectEvent, Family,
+    Font, TextStyle, palette,
 };
 use jiff::{Timestamp, ToSpan, Zoned};
 
@@ -39,9 +40,6 @@ const CHECKBOX_COLUMN: f32 = 30.0;
 /// The action buttons: 8px apart, the last 13px past the content's right edge.
 const ACTION_GAP: f32 = 8.0;
 const ACTIONS_OVERHANG: f32 = 13.0;
-/// The open list sits 18px left of the dropdown's text and 26px below its top, under Classic's
-/// 19px button.
-const MENU_OFFSET: Vec2 = vec2(-18.0, 26.0);
 
 /// An age to clean up past.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,38 +357,26 @@ fn draw(ui: &mut Ui, body: Rect, state: &State) -> Option<Event> {
         None,
     );
     let text_left = left + label_width + LABEL_GAP + 1.0;
-    let button = exo_ui::paint_dialog_dropdown(
-        ui,
+    let names: Vec<&str> = RANGES.iter().map(|range| range.name).collect();
+    if let Some(select_event) = DialogSelect::new(
+        exo_ui::id(ui.ctx(), "gmtz-range"),
         pos2(text_left, top + RANGE_TOP + 5.0),
         RANGES[state.range].name,
-    );
-    let response = ui
-        .interact(button, exo_ui::id(ui.ctx(), "gmtz-range"), Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.clicked() {
-        event = Some(Event::ToggleMenu);
-    }
-    if let Some(highlighted) = state.menu {
-        let names: Vec<&str> = RANGES.iter().map(|range| range.name).collect();
-        let list = Menu {
-            items: &names,
-            highlighted,
-        }
-        .show_in_dialog(
-            ui,
-            exo_ui::id(ui.ctx(), "gmtz-range-list"),
-            pos2(text_left, button.top()) + MENU_OFFSET,
-        );
-        if let Some(clicked) = list.clicked {
-            event = Some(Event::Choose(clicked));
-        } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-            event = Some(Event::Move(hovered as isize - highlighted as isize));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
-            event = Some(Event::ToggleMenu);
-        }
+        &names,
+        state.menu,
+    )
+    .current(state.range)
+    .clipped_focus_underline(state.focus == Focus::Range)
+    .clamp_keys()
+    .show(ui)
+    {
+        event = match select_event {
+            DialogSelectEvent::Toggle | DialogSelectEvent::Close => Some(Event::ToggleMenu),
+            DialogSelectEvent::Highlight(hovered) => state
+                .menu
+                .map(|highlighted| Event::Move(hovered as isize - highlighted as isize)),
+            DialogSelectEvent::Pick(clicked) => Some(Event::Choose(clicked)),
+        };
     }
 
     // `More options…`, or the two checkboxes it shows.

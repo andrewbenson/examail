@@ -120,6 +120,7 @@ pub struct ListedCalendar {
     pub name: String,
     pub color: CalendarColor,
     pub shown: bool,
+    pub writable: bool,
 }
 
 /// A calendar row's `…` button in Classic: 12px.
@@ -316,7 +317,7 @@ impl Week {
                     None => self.sidebar(ui, sidebar, page, &mut actions),
                 }
                 if page.loading {
-                    paint_spinner(ui);
+                    exo_ui::paint_loading_spinner(ui);
                 }
             });
         actions
@@ -859,10 +860,7 @@ impl Week {
             });
         } else if let Some(hovered) = shown.hovered {
             self.account_menu = Some((menu, hovered));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !on_trigger
-            && !ui.rect_contains_pointer(shown.rect)
-        {
+        } else if shown.outside_released(ui, on_trigger) {
             self.account_menu = None;
         }
     }
@@ -941,51 +939,6 @@ impl Week {
             exo_ui::Picked::Nothing => {}
         }
     }
-}
-
-/// The page's loading spinner: a 48px white disc with its top left at the window's centre
-/// (`top: 50%; left: 50%`, no translate), a soft shadow, and a 16px spinner in its middle.
-fn paint_spinner(ui: &Ui) {
-    const SHADOWS: [exo_ui::BoxShadow; 3] = [
-        exo_ui::BoxShadow::new(
-            [0.0, -1.0],
-            8.0,
-            0.0,
-            Color32::from_rgba_premultiplied(0, 0, 0, 10),
-        ),
-        exo_ui::BoxShadow::new(
-            [0.0, 2.0],
-            8.0,
-            0.0,
-            Color32::from_rgba_premultiplied(0, 0, 0, 13),
-        ),
-        exo_ui::BoxShadow::new(
-            [0.0, 4.0],
-            12.0,
-            0.0,
-            Color32::from_rgba_premultiplied(0, 0, 0, 20),
-        ),
-    ];
-    let palette = exo_ui::palette(ui.ctx());
-    let disc = Rect::from_min_size(ui.ctx().content_rect().center(), Vec2::splat(48.0));
-    for shadow in SHADOWS {
-        shadow.paint(ui.painter(), disc, egui::CornerRadius::same(24));
-    }
-    // `background: #fff`, a literal in every theme.
-    ui.painter()
-        .circle_filled(disc.center(), 24.0, Color32::WHITE);
-    let turn = (ui.input(|input| input.time) % 1.0) as f32 * std::f32::consts::TAU;
-    let points: Vec<egui::Pos2> = (0..=36)
-        .map(|step| {
-            let angle = turn + step as f32 / 36.0 * 1.5 * std::f32::consts::PI;
-            disc.center() + 7.0 * vec2(angle.cos(), angle.sin())
-        })
-        .collect();
-    ui.painter().add(egui::Shape::line(
-        points,
-        Stroke::new(2.0, palette.icon_base_default),
-    ));
-    ui.ctx().request_repaint();
 }
 
 /// The top bar's month: `November 2026`, `Nov – Dec 2026`, or `Dec 2026 – Jan 2027` for the 7

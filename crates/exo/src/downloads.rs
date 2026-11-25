@@ -113,9 +113,7 @@ pub fn choose(ctx: &Context, folder: PathBuf) -> Result<(), Error> {
             downloads_location: Some(folder.clone()),
         };
         let json = serde_json::to_vec_pretty(&saved).expect("the location always serializes");
-        let partial = file.with_extension("json.partial");
-        std::fs::write(&partial, json)?;
-        std::fs::rename(&partial, file)?;
+        fastframe_file::write(file, json)?;
     }
     location.folder = Some(folder);
     ctx.data_mut(|data| data.insert_temp(id(), location));

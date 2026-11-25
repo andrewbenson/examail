@@ -96,7 +96,11 @@ impl Verifier {
             bail!("the assertion isn't a JWT");
         };
         let header: Header = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(head)?)?;
-        ensure!(header.alg == "ES256", "the assertion is signed {}", header.alg);
+        ensure!(
+            header.alg == "ES256",
+            "the assertion is signed {}",
+            header.alg
+        );
         let key = self.key(&header.kid).await?;
         let point = [
             &[4u8][..],
@@ -142,9 +146,16 @@ impl Verifier {
 
 fn check(claims: &Claims, audience: &str, now: i64) -> Result<Identity> {
     ensure!(claims.iss == ISSUER, "the assertion is from {}", claims.iss);
-    ensure!(claims.aud == audience, "the assertion is for {}", claims.aud);
+    ensure!(
+        claims.aud == audience,
+        "the assertion is for {}",
+        claims.aud
+    );
     ensure!(claims.exp + LEEWAY > now, "the assertion expired");
-    ensure!(claims.iat - LEEWAY <= now, "the assertion is from the future");
+    ensure!(
+        claims.iat - LEEWAY <= now,
+        "the assertion is from the future"
+    );
     let sub = claims
         .sub
         .strip_prefix("accounts.google.com:")
@@ -177,7 +188,12 @@ mod tests {
 
     #[test]
     fn a_good_assertion_names_its_account() {
-        let identity = check(&claims(), "/projects/1/locations/us-central1/services/examail-api", 500).unwrap();
+        let identity = check(
+            &claims(),
+            "/projects/1/locations/us-central1/services/examail-api",
+            500,
+        )
+        .unwrap();
         assert_eq!(identity.sub, "1234");
         assert_eq!(identity.email, "me@example.com");
     }
@@ -185,9 +201,29 @@ mod tests {
     #[test]
     fn another_audience_issuer_or_time_is_refused() {
         let audience = "/projects/1/locations/us-central1/services/examail-api";
-        assert!(check(&claims(), "/projects/1/locations/us-central1/services/other", 500).is_err());
-        assert!(check(&Claims { iss: "https://evil".into(), ..claims() }, audience, 500).is_err());
+        assert!(
+            check(
+                &claims(),
+                "/projects/1/locations/us-central1/services/other",
+                500
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                &Claims {
+                    iss: "https://evil".into(),
+                    ..claims()
+                },
+                audience,
+                500
+            )
+            .is_err()
+        );
         assert!(check(&claims(), audience, 2_000).is_err(), "expired");
-        assert!(check(&claims(), audience, 100).is_err(), "issued in the future");
+        assert!(
+            check(&claims(), audience, 100).is_err(),
+            "issued in the future"
+        );
     }
 }

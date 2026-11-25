@@ -28,6 +28,16 @@ pub fn encode_component(text: &str) -> String {
         .collect()
 }
 
+/// A URL as link lists show it, without `http://` or `https://`, `www.` or a final `/`.
+pub fn display(url: &str) -> String {
+    let url = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let url = url.strip_prefix("www.").unwrap_or(url);
+    url.strip_suffix('/').unwrap_or(url).to_owned()
+}
+
 /// The URL a link preview shows in full, without `http://` and a trailing `/`.
 pub fn shown(url: &str) -> String {
     static HTTP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^http://").expect("valid regex"));
@@ -141,5 +151,10 @@ mod tests {
         );
         assert_eq!(shown("http://example.com/path/"), "example.com/path");
         assert_eq!(shown("https://example.com/?q=1"), "https://example.com?q=1");
+        assert_eq!(
+            display("https://www.brightmoor.co/agenda/"),
+            "brightmoor.co/agenda"
+        );
+        assert_eq!(display("http://www.brightmoor.co/"), "brightmoor.co");
     }
 }

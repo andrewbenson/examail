@@ -58,6 +58,7 @@ impl Index {
     }
 
     /// The address book.
+    #[cfg(test)]
     pub fn book(contacts: &[ScoredContact]) -> Self {
         Self::book_without(contacts, &std::collections::BTreeMap::new())
     }
@@ -476,7 +477,7 @@ impl crate::Mail {
             self.commands.hide_toast();
         }
         for open in &mut self.compose.drafts {
-            for input in &mut open.inputs {
+            for input in &mut open.header.inputs {
                 input.just_excluded = None;
             }
         }
@@ -494,7 +495,7 @@ impl crate::Mail {
             book,
             ..
         } = &mut self.compose;
-        let book = book.as_ref().map(|(_, index)| index);
+        let book = book.as_ref().map(|(_, index)| index.as_ref());
         let Some(open) = drafts
             .iter_mut()
             .find(|open| focus.as_deref() == Some(open.id.as_str()))

@@ -2,6 +2,7 @@
 //! would edit the DOM.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -15,7 +16,7 @@ use html5ever::{
 use markup5ever_rcdom::{Handle, Node, NodeData, RcDom, SerializableHandle};
 
 /// A node in the tree.
-pub(crate) type NodeRef = Handle;
+pub type NodeRef = Handle;
 
 /// Identifies a node while it's alive, for maps keyed by node.
 pub(crate) type NodeKey = *const Node;
@@ -25,15 +26,121 @@ pub(crate) fn key(node: &NodeRef) -> NodeKey {
     Rc::as_ptr(node)
 }
 
+/// Drops a node and everything under it iteratively, so a deeply nested tree cannot overflow the
+/// call stack inside recursive `Rc::drop`.
+pub fn drop_tree(root: NodeRef) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        node.parent.set(None);
+        if let Ok(mut children) = node.children.try_borrow_mut() {
+            stack.append(&mut *children);
+        }
+        if let NodeData::Element {
+            template_contents, ..
+        } = &node.data
+            && let Ok(mut contents) = template_contents.try_borrow_mut()
+            && let Some(contents) = contents.take()
+        {
+            stack.push(contents);
+        }
+    }
+}
+
+/// Empties a `<template>` element's `template_contents`, dropping its subtree iteratively.
+pub fn clear_template_contents(node: &NodeRef) {
+    if let NodeData::Element {
+        template_contents, ..
+    } = &node.data
+        && let Some(contents) = template_contents.borrow_mut().take()
+    {
+        drop_tree(contents);
+    }
+}
+
+/// Deep-clones `root` and its descendants iteratively (`Node.cloneNode(true)`).
+pub fn clone_node(root: &NodeRef) -> NodeRef {
+    fn shallow(node: &NodeRef) -> NodeRef {
+        let data = match &node.data {
+            NodeData::Document => NodeData::Document,
+            NodeData::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => NodeData::Doctype {
+                name: name.clone(),
+                public_id: public_id.clone(),
+                system_id: system_id.clone(),
+            },
+            NodeData::Text { contents } => NodeData::Text {
+                contents: RefCell::new(contents.borrow().clone()),
+            },
+            NodeData::Comment { contents } => NodeData::Comment {
+                contents: contents.clone(),
+            },
+            NodeData::Element {
+                name,
+                attrs,
+                mathml_annotation_xml_integration_point,
+                ..
+            } => NodeData::Element {
+                name: name.clone(),
+                attrs: RefCell::new(attrs.borrow().clone()),
+                template_contents: RefCell::new(None),
+                mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
+            },
+            NodeData::ProcessingInstruction { target, contents } => {
+                NodeData::ProcessingInstruction {
+                    target: target.clone(),
+                    contents: contents.clone(),
+                }
+            }
+        };
+        Node::new(data)
+    }
+    let cloned_root = shallow(root);
+    let mut stack = vec![(root.clone(), cloned_root.clone())];
+    while let Some((src, dst)) = stack.pop() {
+        let children = src.children.borrow();
+        let mut cloned_children = Vec::with_capacity(children.len());
+        for child in children.iter() {
+            let cloned_child = shallow(child);
+            cloned_child.parent.set(Some(Rc::downgrade(&dst)));
+            cloned_children.push(cloned_child);
+        }
+        for (child, cloned_child) in children.iter().zip(&cloned_children).rev() {
+            if !child.children.borrow().is_empty() {
+                stack.push((child.clone(), cloned_child.clone()));
+            }
+        }
+        drop(children);
+        *dst.children.borrow_mut() = cloned_children;
+    }
+    cloned_root
+}
+
 /// Parses a whole document (`<html>`, `<head>`, `<body>` are always there afterwards).
-pub(crate) fn parse(html: &str) -> NodeRef {
+pub fn parse(html: &str) -> NodeRef {
     parse_document(RcDom::default(), Default::default())
         .one(html)
         .document
 }
 
+/// Parses `html` as `<body>` content and returns its detached top-level nodes, dropping the
+/// temporary document iteratively.
+pub fn parse_fragment(html: &str) -> Vec<NodeRef> {
+    let document = parse(html);
+    let nodes = body(&document)
+        .map(|body| take_children(&body))
+        .unwrap_or_default();
+    for node in &nodes {
+        node.parent.set(None);
+    }
+    drop_tree(document);
+    nodes
+}
+
 /// The node's outer HTML (or, for the document, its children's).
-pub(crate) fn outer_html(node: &NodeRef) -> String {
+pub fn outer_html(node: &NodeRef) -> String {
     let scope = if matches!(node.data, NodeData::Document) {
         TraversalScope::ChildrenOnly(None)
     } else {
@@ -43,7 +150,7 @@ pub(crate) fn outer_html(node: &NodeRef) -> String {
 }
 
 /// The node's children as HTML.
-pub(crate) fn inner_html(node: &NodeRef) -> String {
+pub fn inner_html(node: &NodeRef) -> String {
     write(node, TraversalScope::ChildrenOnly(None))
 }
 
@@ -58,13 +165,87 @@ fn write(node: &NodeRef, traversal_scope: TraversalScope) -> String {
     String::from_utf8(out).expect("the serializer writes UTF-8")
 }
 
-/// Escapes text for a double-quoted attribute value.
-pub(crate) fn escape_attribute(text: &str) -> String {
-    text.replace('&', "&amp;").replace('"', "&quot;")
+/// Escapes `&`, `<`, `>`, `"` and `'` (`&#39;`) as HTML entities in a single pass.
+pub fn escape_html(text: &str) -> String {
+    if !text.contains(['&', '<', '>', '"', '\'']) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escapes `&`, `<` and `>` as HTML entities in a single pass, for text nodes.
+pub fn escape_html_text(text: &str) -> String {
+    if !text.contains(['&', '<', '>']) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escapes text for a double-quoted attribute value, in a single pass.
+pub fn escape_attribute(text: &str) -> String {
+    if !text.contains(['&', '"']) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Appends `text` as `innerHTML` serializes text nodes (`&`, `<`, `>`, and `\u{a0}` as `&nbsp;`).
+pub fn push_inner_html_text(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
+            ch => out.push(ch),
+        }
+    }
+}
+
+/// Appends `text` escaped for a double-quoted HTML attribute with `\u{a0}` written as `&nbsp;`.
+pub fn push_inner_html_attr(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            ch => out.push(ch),
+        }
+    }
 }
 
 /// A new element in the HTML namespace.
-pub(crate) fn element(name: &str, attributes: &[(&str, &str)]) -> NodeRef {
+pub fn element(name: &str, attributes: &[(&str, &str)]) -> NodeRef {
     Node::new(NodeData::Element {
         name: html_name(name),
         attrs: RefCell::new(
@@ -82,7 +263,7 @@ pub(crate) fn element(name: &str, attributes: &[(&str, &str)]) -> NodeRef {
 }
 
 /// A new text node.
-pub(crate) fn text_node(text: &str) -> NodeRef {
+pub fn text_node(text: &str) -> NodeRef {
     Node::new(NodeData::Text {
         contents: RefCell::new(text.into()),
     })
@@ -93,7 +274,7 @@ fn html_name(name: &str) -> QualName {
 }
 
 /// The element's tag name (lowercase for HTML), or `None` for other nodes.
-pub(crate) fn tag(node: &NodeRef) -> Option<&str> {
+pub fn tag(node: &NodeRef) -> Option<&str> {
     match &node.data {
         NodeData::Element { name, .. } => Some(&name.local),
         _ => None,
@@ -101,35 +282,40 @@ pub(crate) fn tag(node: &NodeRef) -> Option<&str> {
 }
 
 /// Whether `node` is a `name` element.
-pub(crate) fn is(node: &NodeRef, name: &str) -> bool {
+pub fn is(node: &NodeRef, name: &str) -> bool {
     tag(node) == Some(name)
 }
 
+/// Whether `node` is an SVG `<image>` or `<feImage>` element.
+pub fn is_svg_image(node: &NodeRef) -> bool {
+    tag(node).is_some_and(|t| t.eq_ignore_ascii_case("image") || t.eq_ignore_ascii_case("feimage"))
+}
+
 /// Whether `node` is an element.
-pub(crate) fn is_element(node: &NodeRef) -> bool {
+pub fn is_element(node: &NodeRef) -> bool {
     matches!(node.data, NodeData::Element { .. })
 }
 
 /// Whether `node` is text.
-pub(crate) fn is_text(node: &NodeRef) -> bool {
+pub fn is_text(node: &NodeRef) -> bool {
     matches!(node.data, NodeData::Text { .. })
 }
 
 /// Whether `node` is a comment.
-pub(crate) fn is_comment(node: &NodeRef) -> bool {
+pub fn is_comment(node: &NodeRef) -> bool {
     matches!(node.data, NodeData::Comment { .. })
 }
 
 /// The namespaces HTML parsing puts elements in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Namespace {
+pub enum Namespace {
     Html,
     Svg,
     MathMl,
 }
 
 /// The element's namespace (`None` for other nodes).
-pub(crate) fn namespace(node: &NodeRef) -> Option<Namespace> {
+pub fn namespace(node: &NodeRef) -> Option<Namespace> {
     match &node.data {
         NodeData::Element { name, .. } if name.ns == ns!(html) => Some(Namespace::Html),
         NodeData::Element { name, .. } if name.ns == ns!(svg) => Some(Namespace::Svg),
@@ -139,7 +325,7 @@ pub(crate) fn namespace(node: &NodeRef) -> Option<Namespace> {
 }
 
 /// The text of a text node.
-pub(crate) fn text(node: &NodeRef) -> Option<String> {
+pub fn text(node: &NodeRef) -> Option<String> {
     match &node.data {
         NodeData::Text { contents } => Some(contents.borrow().to_string()),
         _ => None,
@@ -147,33 +333,69 @@ pub(crate) fn text(node: &NodeRef) -> Option<String> {
 }
 
 /// Replaces a text node's text.
-pub(crate) fn set_text(node: &NodeRef, value: &str) {
+pub fn set_text(node: &NodeRef, value: &str) {
     if let NodeData::Text { contents } = &node.data {
         *contents.borrow_mut() = value.into();
     }
 }
 
+fn attr_name(name: &QualName) -> Cow<'_, str> {
+    match &name.prefix {
+        Some(prefix) if !prefix.is_empty() => Cow::Owned(format!("{prefix}:{}", name.local)),
+        _ => Cow::Borrowed(&name.local),
+    }
+}
+
+fn attr_matches(attr: &QualName, name: &str) -> bool {
+    match &attr.prefix {
+        Some(prefix) if !prefix.is_empty() => {
+            name.strip_prefix(&**prefix)
+                .and_then(|rest| rest.strip_prefix(':'))
+                == Some(&*attr.local)
+        }
+        _ => &*attr.local == name,
+    }
+}
+
+fn attr_qual_name(node: &NodeRef, name: &str) -> QualName {
+    if matches!(namespace(node), Some(Namespace::Svg | Namespace::MathMl)) {
+        if let Some(local) = name.strip_prefix("xlink:") {
+            return QualName::new(Some("xlink".into()), ns!(xlink), LocalName::from(local));
+        }
+        if let Some(local) = name.strip_prefix("xml:") {
+            return QualName::new(Some("xml".into()), ns!(xml), LocalName::from(local));
+        }
+        if let Some(local) = name.strip_prefix("xmlns:") {
+            return QualName::new(Some("xmlns".into()), ns!(xmlns), LocalName::from(local));
+        }
+        if name == "xmlns" {
+            return QualName::new(None, ns!(xmlns), LocalName::from("xmlns"));
+        }
+    }
+    QualName::new(None, ns!(), LocalName::from(name))
+}
+
 /// An attribute's value.
-pub(crate) fn attr(node: &NodeRef, name: &str) -> Option<String> {
+pub fn attr(node: &NodeRef, name: &str) -> Option<String> {
     match &node.data {
         NodeData::Element { attrs, .. } => attrs
             .borrow()
             .iter()
-            .find(|attribute| &*attribute.name.local == name)
+            .find(|attribute| attr_matches(&attribute.name, name))
             .map(|attribute| attribute.value.to_string()),
         _ => None,
     }
 }
 
 /// The element's attributes, names and values, in order.
-pub(crate) fn attrs(node: &NodeRef) -> Vec<(String, String)> {
+pub fn attrs(node: &NodeRef) -> Vec<(String, String)> {
     match &node.data {
         NodeData::Element { attrs, .. } => attrs
             .borrow()
             .iter()
             .map(|attribute| {
                 (
-                    attribute.name.local.to_string(),
+                    attr_name(&attribute.name).into_owned(),
                     attribute.value.to_string(),
                 )
             })
@@ -182,22 +404,37 @@ pub(crate) fn attrs(node: &NodeRef) -> Vec<(String, String)> {
     }
 }
 
+/// Replaces the element's attributes with `attributes`, in order.
+pub fn set_attrs(node: &NodeRef, attributes: &[(String, String)]) {
+    let updated: Vec<Attribute> = attributes
+        .iter()
+        .map(|(name, value)| Attribute {
+            name: attr_qual_name(node, name),
+            value: value.as_str().into(),
+        })
+        .collect();
+    if let NodeData::Element { attrs, .. } = &node.data {
+        *attrs.borrow_mut() = updated;
+    }
+}
+
 /// Whether the element has the attribute.
-pub(crate) fn has_attr(node: &NodeRef, name: &str) -> bool {
+pub fn has_attr(node: &NodeRef, name: &str) -> bool {
     attr(node, name).is_some()
 }
 
 /// Sets an attribute.
-pub(crate) fn set_attr(node: &NodeRef, name: &str, value: &str) {
+pub fn set_attr(node: &NodeRef, name: &str, value: &str) {
+    let qual = attr_qual_name(node, name);
     if let NodeData::Element { attrs, .. } = &node.data {
         let mut attrs = attrs.borrow_mut();
         match attrs
             .iter_mut()
-            .find(|attribute| &*attribute.name.local == name)
+            .find(|attribute| attr_matches(&attribute.name, name))
         {
             Some(attribute) => attribute.value = value.into(),
             None => attrs.push(Attribute {
-                name: QualName::new(None, ns!(), LocalName::from(name)),
+                name: qual,
                 value: value.into(),
             }),
         }
@@ -205,19 +442,20 @@ pub(crate) fn set_attr(node: &NodeRef, name: &str, value: &str) {
 }
 
 /// Removes an attribute.
-pub(crate) fn remove_attr(node: &NodeRef, name: &str) {
+pub fn remove_attr(node: &NodeRef, name: &str) {
     if let NodeData::Element { attrs, .. } = &node.data {
         attrs
             .borrow_mut()
-            .retain(|attribute| &*attribute.name.local != name);
+            .retain(|attribute| !attr_matches(&attribute.name, name));
     }
 }
 
 /// Keeps the attributes `keep` gives a value for (given each name and value), with that value.
-pub(crate) fn retain_attrs(node: &NodeRef, mut keep: impl FnMut(&str, &str) -> Option<String>) {
+pub fn retain_attrs(node: &NodeRef, mut keep: impl FnMut(&str, &str) -> Option<String>) {
     if let NodeData::Element { attrs, .. } = &node.data {
         attrs.borrow_mut().retain_mut(|attribute| {
-            match keep(&attribute.name.local, &attribute.value) {
+            let qualified = attr_name(&attribute.name);
+            match keep(&qualified, &attribute.value) {
                 Some(value) => {
                     if *attribute.value != *value {
                         attribute.value = value.into();
@@ -231,12 +469,12 @@ pub(crate) fn retain_attrs(node: &NodeRef, mut keep: impl FnMut(&str, &str) -> O
 }
 
 /// Whether the element's `class` contains `class`.
-pub(crate) fn has_class(node: &NodeRef, class: &str) -> bool {
+pub fn has_class(node: &NodeRef, class: &str) -> bool {
     attr(node, "class").is_some_and(|classes| classes.split_ascii_whitespace().any(|c| c == class))
 }
 
 /// Adds classes (in order, skipping ones already there).
-pub(crate) fn add_class(node: &NodeRef, classes: &[&str]) {
+pub fn add_class(node: &NodeRef, classes: &[&str]) {
     let mut list: Vec<String> = attr(node, "class")
         .map(|value| value.split_ascii_whitespace().map(str::to_owned).collect())
         .unwrap_or_default();
@@ -249,7 +487,7 @@ pub(crate) fn add_class(node: &NodeRef, classes: &[&str]) {
 }
 
 /// Removes classes.
-pub(crate) fn remove_class(node: &NodeRef, classes: &[&str]) {
+pub fn remove_class(node: &NodeRef, classes: &[&str]) {
     if let Some(value) = attr(node, "class")
         && value
             .split_ascii_whitespace()
@@ -264,7 +502,7 @@ pub(crate) fn remove_class(node: &NodeRef, classes: &[&str]) {
 }
 
 /// The node's parent.
-pub(crate) fn parent(node: &NodeRef) -> Option<NodeRef> {
+pub fn parent(node: &NodeRef) -> Option<NodeRef> {
     let weak = node.parent.take();
     let parent = weak.as_ref().and_then(|weak| weak.upgrade());
     node.parent.set(weak);
@@ -272,12 +510,12 @@ pub(crate) fn parent(node: &NodeRef) -> Option<NodeRef> {
 }
 
 /// The node's children.
-pub(crate) fn children(node: &NodeRef) -> Vec<NodeRef> {
+pub fn children(node: &NodeRef) -> Vec<NodeRef> {
     node.children.borrow().clone()
 }
 
 /// The node's element children.
-pub(crate) fn element_children(node: &NodeRef) -> Vec<NodeRef> {
+pub fn element_children(node: &NodeRef) -> Vec<NodeRef> {
     node.children
         .borrow()
         .iter()
@@ -288,7 +526,7 @@ pub(crate) fn element_children(node: &NodeRef) -> Vec<NodeRef> {
 
 /// Takes the node's children out, for [`set_children`] to put back edited. Their parent links
 /// stay until then.
-pub(crate) fn take_children(node: &NodeRef) -> Vec<NodeRef> {
+pub fn take_children(node: &NodeRef) -> Vec<NodeRef> {
     std::mem::take(&mut *node.children.borrow_mut())
 }
 
@@ -296,7 +534,7 @@ pub(crate) fn take_children(node: &NodeRef) -> Vec<NodeRef> {
 ///
 /// Editing the child list in one go keeps passes over long sibling lists linear. The tree has no
 /// sibling links, so each single-node edit has to find the node among its siblings first.
-pub(crate) fn set_children(node: &NodeRef, children: Vec<NodeRef>) {
+pub fn set_children(node: &NodeRef, children: Vec<NodeRef>) {
     for child in &children {
         child.parent.set(Some(Rc::downgrade(node)));
     }
@@ -314,26 +552,26 @@ fn index_in_parent(node: &NodeRef) -> Option<(NodeRef, usize)> {
 }
 
 /// The siblings after the node, in order.
-pub(crate) fn following_siblings(node: &NodeRef) -> Vec<NodeRef> {
+pub fn following_siblings(node: &NodeRef) -> Vec<NodeRef> {
     index_in_parent(node)
         .map(|(parent, index)| parent.children.borrow()[index + 1..].to_vec())
         .unwrap_or_default()
 }
 
 /// The siblings before the node, in order.
-pub(crate) fn preceding_siblings(node: &NodeRef) -> Vec<NodeRef> {
+pub fn preceding_siblings(node: &NodeRef) -> Vec<NodeRef> {
     index_in_parent(node)
         .map(|(parent, index)| parent.children.borrow()[..index].to_vec())
         .unwrap_or_default()
 }
 
 /// The previous element sibling.
-pub(crate) fn previous_element_sibling(node: &NodeRef) -> Option<NodeRef> {
+pub fn previous_element_sibling(node: &NodeRef) -> Option<NodeRef> {
     preceding_siblings(node).into_iter().rev().find(is_element)
 }
 
 /// Takes the node out of the tree.
-pub(crate) fn detach(node: &NodeRef) {
+pub fn detach(node: &NodeRef) {
     if let Some((parent, index)) = index_in_parent(node) {
         parent.children.borrow_mut().remove(index);
     }
@@ -341,7 +579,7 @@ pub(crate) fn detach(node: &NodeRef) {
 }
 
 /// Takes the nodes out of the tree, visiting each parent's child list once.
-pub(crate) fn detach_all(nodes: &[NodeRef]) {
+pub fn detach_all(nodes: &[NodeRef]) {
     let gone: HashSet<NodeKey> = nodes.iter().map(key).collect();
     for parent in parents_of(nodes) {
         parent
@@ -355,7 +593,7 @@ pub(crate) fn detach_all(nodes: &[NodeRef]) {
 }
 
 /// The nodes' parents, each once.
-pub(crate) fn parents_of(nodes: &[NodeRef]) -> Vec<NodeRef> {
+pub fn parents_of(nodes: &[NodeRef]) -> Vec<NodeRef> {
     let mut seen = HashSet::new();
     nodes
         .iter()
@@ -365,19 +603,26 @@ pub(crate) fn parents_of(nodes: &[NodeRef]) -> Vec<NodeRef> {
 }
 
 /// Appends `child` to `parent`.
-pub(crate) fn append(parent: &NodeRef, child: &NodeRef) {
+pub fn append(parent: &NodeRef, child: &NodeRef) {
     detach(child);
     child.parent.set(Some(Rc::downgrade(parent)));
     parent.children.borrow_mut().push(child.clone());
 }
 
+/// Prepends `child` as `parent`'s first child.
+pub fn prepend(parent: &NodeRef, child: &NodeRef) {
+    detach(child);
+    child.parent.set(Some(Rc::downgrade(parent)));
+    parent.children.borrow_mut().insert(0, child.clone());
+}
+
 /// Inserts `node` before `reference`.
-pub(crate) fn insert_before(reference: &NodeRef, node: &NodeRef) {
+pub fn insert_before(reference: &NodeRef, node: &NodeRef) {
     insert_at(reference, 0, node);
 }
 
 /// Inserts `node` after `reference`.
-pub(crate) fn insert_after(reference: &NodeRef, node: &NodeRef) {
+pub fn insert_after(reference: &NodeRef, node: &NodeRef) {
     insert_at(reference, 1, node);
 }
 
@@ -394,7 +639,7 @@ fn insert_at(reference: &NodeRef, offset: usize, node: &NodeRef) {
 
 /// Puts each node's replacements (new nodes, not ones in the tree) where it is, editing each
 /// parent's child list once.
-pub(crate) fn replace_all(mut replacements: Vec<(NodeRef, Vec<NodeRef>)>) {
+pub fn replace_all(mut replacements: Vec<(NodeRef, Vec<NodeRef>)>) {
     let nodes: Vec<NodeRef> = replacements.iter().map(|(node, _)| node.clone()).collect();
     let index: HashMap<NodeKey, usize> = replacements
         .iter()
@@ -417,7 +662,7 @@ pub(crate) fn replace_all(mut replacements: Vec<(NodeRef, Vec<NodeRef>)>) {
 }
 
 /// Merges adjacent text nodes and drops empty ones, throughout the subtree (`Node.normalize`).
-pub(crate) fn normalize(node: &NodeRef) {
+pub fn normalize(node: &NodeRef) {
     let mut kept: Vec<NodeRef> = Vec::new();
     for child in take_children(node) {
         match text(&child) {
@@ -440,23 +685,20 @@ pub(crate) fn normalize(node: &NodeRef) {
 
 /// Replaces each of `nodes` with its children, editing each affected child list once, and
 /// returns the parents those children ended up in.
-pub(crate) fn unwrap_all(nodes: &[NodeRef]) -> Vec<NodeRef> {
+pub fn unwrap_all(nodes: &[NodeRef]) -> Vec<NodeRef> {
     let gone: HashSet<NodeKey> = nodes.iter().map(key).collect();
-    fn expand(node: NodeRef, gone: &HashSet<NodeKey>, into: &mut Vec<NodeRef>) {
-        if gone.contains(&key(&node)) {
-            for child in take_children(&node) {
-                expand(child, gone, into);
-            }
-        } else {
-            into.push(node);
-        }
-    }
     let mut parents = parents_of(nodes);
     parents.retain(|parent| !gone.contains(&key(parent)));
     for parent in &parents {
         let mut children = Vec::new();
-        for child in take_children(parent) {
-            expand(child, &gone, &mut children);
+        let mut stack: Vec<NodeRef> = take_children(parent).into_iter().rev().collect();
+        while let Some(node) = stack.pop() {
+            if gone.contains(&key(&node)) {
+                stack.extend(take_children(&node).into_iter().rev());
+                drop_tree(node);
+            } else {
+                children.push(node);
+            }
         }
         set_children(parent, children);
     }
@@ -464,7 +706,7 @@ pub(crate) fn unwrap_all(nodes: &[NodeRef]) -> Vec<NodeRef> {
 }
 
 /// Every node under `node`, in document order (not `node` itself).
-pub(crate) fn descendants(node: &NodeRef) -> impl Iterator<Item = NodeRef> {
+pub fn descendants(node: &NodeRef) -> impl Iterator<Item = NodeRef> {
     let mut stack: Vec<NodeRef> = children(node).into_iter().rev().collect();
     std::iter::from_fn(move || {
         let next = stack.pop()?;
@@ -474,19 +716,19 @@ pub(crate) fn descendants(node: &NodeRef) -> impl Iterator<Item = NodeRef> {
 }
 
 /// The elements under `node` that `matches` accepts, in document order (`querySelectorAll`).
-pub(crate) fn select(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Vec<NodeRef> {
+pub fn select(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Vec<NodeRef> {
     descendants(node)
         .filter(|n| is_element(n) && matches(n))
         .collect()
 }
 
 /// The first descendant element `matches` accepts.
-pub(crate) fn select_first(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Option<NodeRef> {
+pub fn select_first(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Option<NodeRef> {
     descendants(node).find(|n| is_element(n) && matches(n))
 }
 
 /// The nearest inclusive ancestor element `matches` accepts (`closest`).
-pub(crate) fn closest(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Option<NodeRef> {
+pub fn closest(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Option<NodeRef> {
     let mut current = Some(node.clone());
     while let Some(candidate) = current {
         if is_element(&candidate) && matches(&candidate) {
@@ -498,7 +740,7 @@ pub(crate) fn closest(node: &NodeRef, matches: impl Fn(&NodeRef) -> bool) -> Opt
 }
 
 /// The concatenated text of every text node under `node` (`textContent`).
-pub(crate) fn text_content(node: &NodeRef) -> String {
+pub fn text_content(node: &NodeRef) -> String {
     if let Some(text) = text(node) {
         return text;
     }
@@ -508,11 +750,14 @@ pub(crate) fn text_content(node: &NodeRef) -> String {
 /// The text of `html` read as a document (the parsed document's text content): its entities
 /// decoded, its tags dropped.
 pub fn html_text(html: &str) -> String {
-    text_content(&parse(html))
+    let document = parse(html);
+    let text = text_content(&document);
+    drop_tree(document);
+    text
 }
 
 /// The document's `<body>` (or `<html>` when a fragment has none).
-pub(crate) fn body(document: &NodeRef) -> Option<NodeRef> {
+pub fn body(document: &NodeRef) -> Option<NodeRef> {
     let html = element_children(document)
         .into_iter()
         .find(|n| is(n, "html"))?;
@@ -523,7 +768,7 @@ pub(crate) fn body(document: &NodeRef) -> Option<NodeRef> {
 }
 
 /// The document's `<head>`.
-pub(crate) fn head(document: &NodeRef) -> Option<NodeRef> {
+pub fn head(document: &NodeRef) -> Option<NodeRef> {
     let html = element_children(document)
         .into_iter()
         .find(|n| is(n, "html"))?;
@@ -532,20 +777,20 @@ pub(crate) fn head(document: &NodeRef) -> Option<NodeRef> {
 
 /// The declarations of an inline `style` attribute, as `CSSStyleDeclaration` exposes them.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Style {
+pub struct Style {
     declarations: Vec<(String, String, bool)>,
 }
 
 impl Style {
     /// The element's inline style.
-    pub(crate) fn of(node: &NodeRef) -> Self {
+    pub fn of(node: &NodeRef) -> Self {
         attr(node, "style")
             .map(|css| Self::parse(&css))
             .unwrap_or_default()
     }
 
-    /// Parses a declaration list.
-    pub(crate) fn parse(css: &str) -> Self {
+    /// Parses a declaration list, ignoring semicolons inside parentheses and quotes.
+    pub fn parse(css: &str) -> Self {
         let mut declarations: Vec<(String, String, bool)> = Vec::new();
         for declaration in split_top_level(css, ';') {
             let Some((name, value)) = declaration.split_once(':') else {
@@ -573,7 +818,7 @@ impl Style {
 
     /// A property's value (`""` when unset, as the DOM returns it). The `border` shorthand
     /// only reads back when it was set as a shorthand.
-    pub(crate) fn get(&self, name: &str) -> &str {
+    pub fn get(&self, name: &str) -> &str {
         self.declarations
             .iter()
             .find(|(n, _, _)| n == name)
@@ -581,31 +826,45 @@ impl Style {
     }
 
     /// Whether a property is set with `!important`.
-    pub(crate) fn is_important(&self, name: &str) -> bool {
+    pub fn is_important(&self, name: &str) -> bool {
         self.declarations
             .iter()
             .any(|(n, _, important)| n == name && *important)
     }
 
-    /// Sets a property.
-    pub(crate) fn set(&mut self, name: &str, value: &str, important: bool) {
-        self.declarations.retain(|(n, _, _)| n != name);
-        self.declarations
-            .push((name.to_owned(), value.to_owned(), important));
+    /// Sets a property, updating an existing declaration in place (as the CSSOM does) or appending
+    /// it if unset.
+    pub fn set(&mut self, name: &str, value: &str, important: bool) {
+        match self.declarations.iter_mut().find(|(n, _, _)| n == name) {
+            Some((_, existing, existing_important)) => {
+                value.clone_into(existing);
+                *existing_important = important;
+            }
+            None => self
+                .declarations
+                .push((name.to_owned(), value.to_owned(), important)),
+        }
     }
 
     /// Removes a property.
-    pub(crate) fn remove(&mut self, name: &str) {
+    pub fn remove(&mut self, name: &str) {
         self.declarations.retain(|(n, _, _)| n != name);
     }
 
     /// Whether no property is set.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.declarations.is_empty()
     }
 
+    /// Iterates `(property, value, important)` declarations in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.declarations
+            .iter()
+            .map(|(name, value, important)| (name.as_str(), value.as_str(), *important))
+    }
+
     /// The declarations, serialized the way the DOM does.
-    pub(crate) fn css(&self) -> String {
+    pub fn css(&self) -> String {
         let css: Vec<String> = self
             .declarations
             .iter()
@@ -620,7 +879,7 @@ impl Style {
     }
 
     /// Writes the declarations back to `node`'s `style`.
-    pub(crate) fn apply(&self, node: &NodeRef) {
+    pub fn apply(&self, node: &NodeRef) {
         set_attr(node, "style", &self.css());
     }
 }
@@ -628,9 +887,14 @@ impl Style {
 /// Splits on `separator` outside parentheses and quotes.
 fn split_top_level(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
-    let (mut depth, mut quote, mut start) = (0usize, None, 0);
+    let (mut depth, mut quote, mut escaped, mut start) = (0usize, None, false, 0);
     for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match (quote, c) {
+            (Some(_), '\\') => escaped = true,
             (Some(q), _) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') => quote = Some(c),

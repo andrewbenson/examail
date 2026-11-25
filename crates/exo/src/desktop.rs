@@ -128,6 +128,9 @@ enum Request {
 enum Input {
     /// The keystroke of a clicked menu item.
     Keystroke(menu::Keystroke),
+    /// A paste keystroke whose caller already verified the system pasteboard holds no plain text,
+    /// avoiding a second synchronous clipboard read.
+    KeystrokeWithoutText(menu::Keystroke),
     /// Text macOS inserted with no key behind it (Emoji & Symbols, dictation).
     Text(String),
 }
@@ -223,6 +226,13 @@ impl Launcher {
     /// Hands `keystroke` to whatever has the keyboard, as a click on its menu item does.
     pub fn keystroke(&self, keystroke: menu::Keystroke) {
         self.give(Input::Keystroke(keystroke));
+    }
+
+    /// Hands `keystroke` to whatever has the keyboard when the pasteboard is already known to hold
+    /// no text.
+    #[cfg(target_os = "macos")]
+    pub(super) fn keystroke_without_text(&self, keystroke: menu::Keystroke) {
+        self.give(Input::KeystrokeWithoutText(keystroke));
     }
 
     /// Hands `text` to whatever has the keyboard as if typed, as macOS's Emoji & Symbols does.
@@ -379,22 +389,21 @@ impl Desktop {
         }
         for input in self.launcher.take_input() {
             match input {
-                Input::Keystroke(keystroke) => {
-                    let (modifiers, mut events) = keystroke.input(|| {
-                        arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.get_text())
-                            .ok()
-                    });
-                    // Copied attachments come with no text, but a draft still pastes them.
-                    if events.is_empty()
-                        && matches!(
-                            keystroke,
-                            menu::Keystroke::Paste | menu::Keystroke::PasteAndMatchStyle
-                        )
-                        && crate::clipboard::holds_attachments()
-                    {
-                        events.push(egui::Event::Paste(String::new()));
-                    }
+                Input::Keystroke(keystroke) | Input::KeystrokeWithoutText(keystroke) => {
+                    let read_text = matches!(input, Input::Keystroke(_));
+                    let (modifiers, events) = keystroke_events(
+                        keystroke,
+                        || {
+                            read_text
+                                .then(|| {
+                                    arboard::Clipboard::new()
+                                        .and_then(|mut clipboard| clipboard.get_text())
+                                        .ok()
+                                })
+                                .flatten()
+                        },
+                        crate::clipboard::holds_attachments,
+                    );
                     self.held
                         .get_or_insert_with(|| ctx.input(|input| input.modifiers));
                     raw.events.push(egui::Event::ModifiersChanged(modifiers));
@@ -594,6 +603,28 @@ fn on_screen(ctx: &egui::Context) -> bool {
     reported
 }
 
+/// The modifiers and egui events for a menu or system `keystroke`. When pasting with no clipboard
+/// text while copied attachments are held, replaces the fallback `Event::Key` pair with
+/// `Event::Paste(String::new())` so `compose_paste_attachments` handles the paste.
+fn keystroke_events(
+    keystroke: menu::Keystroke,
+    clipboard: impl FnOnce() -> Option<String>,
+    holds_attachments: impl FnOnce() -> bool,
+) -> (Modifiers, Vec<egui::Event>) {
+    let (modifiers, mut events) = keystroke.input(clipboard);
+    if matches!(
+        keystroke,
+        menu::Keystroke::Paste | menu::Keystroke::PasteAndMatchStyle
+    ) && !events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)))
+        && holds_attachments()
+    {
+        events = vec![egui::Event::Paste(String::new())];
+    }
+    (modifiers, events)
+}
+
 /// Whether the window is in full screen, as AppKit has it on the Mac, or else as egui does.
 fn in_full_screen(ctx: &egui::Context) -> bool {
     let reported = ctx.input(|input| input.viewport().fullscreen == Some(true));
@@ -601,4 +632,42 @@ fn in_full_screen(ctx: &egui::Context) -> bool {
     return macos::in_full_screen().unwrap_or(reported);
     #[cfg(not(target_os = "macos"))]
     reported
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_keystroke_emits_paste_event_when_clipboard_holds_attachments_without_text() {
+        for keystroke in [menu::Keystroke::Paste, menu::Keystroke::PasteAndMatchStyle] {
+            for text in [None, Some(String::new())] {
+                let (_, events) = keystroke_events(keystroke, || text, || true);
+                assert_eq!(
+                    events,
+                    vec![egui::Event::Paste(String::new())],
+                    "{keystroke:?}"
+                );
+            }
+        }
+
+        // Without attachments held (e.g. a screenshot image), the fallback Key events stay so
+        // compose handles image paste.
+        let (_, events) = keystroke_events(menu::Keystroke::Paste, || None, || false);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, egui::Event::Key { key: Key::V, .. }))
+        );
+
+        // With non-empty clipboard text, the text paste event is preserved as-is.
+        let (_, events) =
+            keystroke_events(menu::Keystroke::Paste, || Some("hello".into()), || true);
+        assert_eq!(events, vec![egui::Event::Paste("hello".into())]);
+
+        // Non-paste keystrokes are unaffected even when attachments are held.
+        let (_, events) = keystroke_events(menu::Keystroke::Copy, || None, || true);
+        assert_eq!(events, vec![egui::Event::Copy]);
+    }
 }

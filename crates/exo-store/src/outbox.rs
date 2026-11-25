@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::ids::ThreadId;
 use crate::mutation::{Mutation, Plan, Step, resolve};
 use crate::provider;
+use crate::queue::{self, Disposition};
 use crate::quota::Lane;
 use crate::store::{Inner, Store, load_view, reindex};
 use crate::sync::{Rows, fetch_rows};
@@ -68,6 +69,14 @@ impl Undo {
         self.entries
             .iter()
             .map(|entry| ThreadId::new(entry.thread.clone()))
+    }
+
+    /// The reminder replaced on the first thread, if this undo came from a reminder mutation.
+    pub(crate) fn prior_reminder(&self) -> Option<&ReminderRow> {
+        self.entries
+            .first()
+            .and_then(|entry| entry.reminder.as_ref())
+            .and_then(Option::as_ref)
     }
 }
 
@@ -150,30 +159,23 @@ impl Store {
                 .order_by(OutboxRow::fields().id().asc())
                 .exec(&mut db)
                 .await?;
-            let now = Timestamp::now();
-            let mut queues = HashSet::new();
-            let heads: Vec<OutboxRow> = rows
-                .into_iter()
-                .filter(|row| queues.insert(row.queue.clone()))
-                .collect();
-            report.retry_at = heads
-                .iter()
-                .filter_map(|row| row.not_before)
-                .filter(|at| *at > now)
-                .min();
-            let due: Vec<u64> = heads
-                .iter()
-                .filter(|row| row.not_before.is_none_or(|at| at <= now))
-                .map(|row| row.id)
-                .collect();
-            if due.is_empty() {
+            let batch = queue::select_due(
+                rows,
+                Timestamp::now(),
+                false,
+                |row| row.queue.clone(),
+                |row| row.not_before,
+            );
+            report.retry_at = batch.retry_at;
+            if batch.due.is_empty() {
                 return Ok(report);
             }
-            let outcomes: Vec<Result<Outcome>> = stream::iter(due)
-                .map(|id| inner.persist(id))
-                .buffer_unordered(CONCURRENCY)
-                .collect()
-                .await;
+            let outcomes: Vec<Result<Outcome>> =
+                stream::iter(batch.due.into_iter().map(|row| row.id))
+                    .map(|id| inner.persist(id))
+                    .buffer_unordered(CONCURRENCY)
+                    .collect()
+                    .await;
             for outcome in outcomes {
                 match outcome? {
                     Outcome::Done => report.completed += 1,
@@ -205,10 +207,15 @@ impl Store {
             sends: 0,
             changes: self.pending().await? + self.calendar_pending().await?,
         };
-        for draft in DraftRow::all().exec(&mut db).await? {
-            if draft.send_at.is_some() && !draft.discarded {
+        let f = DraftRow::fields();
+        for (discarded, send_at, pushed, revision) in DraftRow::all()
+            .select((f.discarded(), f.send_at(), f.pushed(), f.revision()))
+            .exec(&mut db)
+            .await?
+        {
+            if send_at.is_some() && !discarded {
                 unsent.sends += 1;
-            } else if draft.discarded || draft.pushed < draft.revision {
+            } else if discarded || pushed < revision {
                 unsent.changes += 1;
             }
         }
@@ -230,14 +237,31 @@ impl Store {
             sends: 0,
             changes: self.pending().await? + self.calendar_pending().await?,
         };
-        for draft in DraftRow::all().exec(&mut db).await? {
-            if draft.failure.is_some() || crate::drafts::scheduled(&draft).is_some() {
+        let f = DraftRow::fields();
+        for (discarded, send_at, pushed, revision, not_before, failure, record) in DraftRow::all()
+            .select((
+                f.discarded(),
+                f.send_at(),
+                f.pushed(),
+                f.revision(),
+                f.not_before(),
+                f.failure(),
+                f.record(),
+            ))
+            .exec(&mut db)
+            .await?
+        {
+            let is_scheduled = send_at.is_some()
+                && !discarded
+                && failure.is_none()
+                && record.0.send_later.is_some();
+            if failure.is_some() || is_scheduled {
                 continue;
             }
-            if draft.send_at.is_some() && !draft.discarded {
+            if send_at.is_some() && !discarded {
                 uploading.sends += 1;
-            } else if draft.discarded
-                || (draft.pushed < draft.revision && crate::drafts::complete(&draft))
+            } else if discarded
+                || (pushed < revision && not_before != Some(crate::drafts::UNTIL_COMPLETE))
             {
                 uploading.changes += 1;
             }
@@ -387,6 +411,7 @@ impl Inner {
                 .await?;
         }
         write.commit().await?;
+        let mut removed = false;
         while let Some(step) = row.steps.first().cloned() {
             // A refresh fetches the thread's rows, and fetches in full only the messages that
             // aren't stored yet.
@@ -406,11 +431,19 @@ impl Inner {
             row.steps.remove(0);
             row.failures = 0;
             let mut write = self.begin(&mut db).await?;
-            OutboxRow::update_by_id(id)
-                .steps(row.steps.to_vec())
-                .failures(0)
-                .exec(write.exec())
-                .await?;
+            if row.steps.is_empty() {
+                OutboxRow::filter_by_id(id)
+                    .delete()
+                    .exec(write.exec())
+                    .await?;
+                removed = true;
+            } else {
+                OutboxRow::update_by_id(id)
+                    .steps(row.steps.to_vec())
+                    .failures(0)
+                    .exec(write.exec())
+                    .await?;
+            }
             match effect {
                 Effect::Labels => provider::apply_step(write.exec(), &row.queue, &step).await?,
                 Effect::Replace(rows) => {
@@ -421,7 +454,9 @@ impl Inner {
             reindex(write.exec(), &row.queue, &self.router()).await?;
             write.publish().await?;
         }
-        self.remove(&row).await?;
+        if !removed {
+            self.remove(&row).await?;
+        }
         Ok(Outcome::Done)
     }
 
@@ -483,34 +518,32 @@ impl Inner {
     async fn fail(&self, row: OutboxRow, failure: Failure) -> Result<Outcome> {
         let counted = matches!(failure, Failure::Transient(_) | Failure::Permanent(_));
         let attempts = row.attempts + u32::from(counted);
-        if matches!(failure, Failure::Permanent(_)) || attempts > MAX_ATTEMPTS {
-            log::warn!(
-                "giving up on {:?} for thread {}: {}",
-                row.mutation.0,
-                row.queue,
-                failure.message()
-            );
-            self.given_up
-                .lock()
-                .expect("given-up lock is never poisoned")
-                .insert(row.id);
-            self.remove(&row).await?;
-            return Ok(Outcome::Failed(FailedMutation {
-                thread: ThreadId::new(row.queue),
-                mutation: row.mutation.0,
-                undo: row.undo,
-                error: failure.message(),
-            }));
-        }
         let failures = row.failures.saturating_add(1);
-        let not_before = match failure {
-            Failure::Throttled(until) => until,
-            _ => self.api.postpone(failures),
+        let message = failure.message();
+        let not_before = match queue::dispose_failure(&self.api, failure, failures) {
+            Disposition::Postponed(until) if attempts <= MAX_ATTEMPTS => until,
+            Disposition::Postponed(_) | Disposition::Refused(_) => {
+                log::warn!(
+                    "giving up on {:?} for thread {}: {message}",
+                    row.mutation.0,
+                    row.queue,
+                );
+                self.given_up
+                    .lock()
+                    .expect("given-up lock is never poisoned")
+                    .insert(row.id);
+                self.remove(&row).await?;
+                return Ok(Outcome::Failed(FailedMutation {
+                    thread: ThreadId::new(row.queue),
+                    mutation: row.mutation.0,
+                    undo: row.undo,
+                    error: message,
+                }));
+            }
         };
         log::debug!(
-            "postponing outbox row {} until {not_before}: {}",
-            row.id,
-            failure.message()
+            "postponing outbox row {} until {not_before}: {message}",
+            row.id
         );
         let mut db = self.db.clone();
         let mut write = self.begin(&mut db).await?;

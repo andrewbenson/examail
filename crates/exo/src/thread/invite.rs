@@ -2,20 +2,36 @@
 //! status over it, then the RSVP (or `Add To Calendar`), When, Where, video, Who, About and
 //! Files rows, read from the message's `.ics`. The buttons answer through the calendar.
 
-use std::{collections::HashMap, path::Path, sync::LazyLock};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use egui::{
     Color32, CornerRadius, Rect, Sense, Stroke, TextureHandle, Ui, epaint::RectShape, pos2, vec2,
 };
 use exo_store::{Attachment, Contact, MessageDetail};
-use exo_ui::{BoxShadow, Family, Font, Palette, TextStyle, Theme};
-use jiff::{Timestamp, Zoned, civil::DateTime, tz::TimeZone};
+use exo_ui::{Family, Font, TextStyle};
+use gmail::ics::{content_line, resolve_timezone, strip_mailto, unescape, unfold};
+use jiff::{
+    SignedDuration, Timestamp, ToSpan as _, Zoned,
+    civil::{Date, DateTime},
+    tz::TimeZone,
+};
 use regex::Regex;
 
+pub use crate::calendar::event::ConferenceCall as Meeting;
+use crate::calendar::{
+    description::{interact_link, linkify},
+    event::extract_conference_text,
+};
 use crate::format::{
     dates,
     names::{NameFormat, Person, display_name},
 };
+pub use crate::rsvp::{ANSWERS, Rsvp as Response};
+use crate::rsvp::{RsvpButtonMetrics, show_rsvp_button, show_rsvp_buttons};
 
 /// The card's text is 14px/24px, and the row names are bold with `min-width: 92px`.
 const TEXT: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 14.0, 24.0);
@@ -36,18 +52,6 @@ pub(super) const MARGIN_BOTTOM: f32 = 16.0;
 const BUTTON_HEIGHT: f32 = 28.0;
 const BUTTON_PADDING: f32 = 12.0;
 const BUTTON_GAP: f32 = 16.0;
-/// A focused RSVP button's glow: `0 0 6px 1px #aeb1dd`, `0 0 6px 0 #54acdc` on the current
-/// answer, then `0 2px 12px 0 rgba(174, 177, 221, .5)`.
-const FOCUS_GLOW: BoxShadow =
-    BoxShadow::new([0.0, 0.0], 6.0, 1.0, Color32::from_rgb(0xae, 0xb1, 0xdd));
-const SELECTED_FOCUS_GLOW: BoxShadow =
-    BoxShadow::new([0.0, 0.0], 6.0, 0.0, Color32::from_rgb(0x54, 0xac, 0xdc));
-const FOCUS_HAZE: BoxShadow = BoxShadow::new(
-    [0.0, 2.0],
-    12.0,
-    0.0,
-    Color32::from_rgba_unmultiplied_const(0xae, 0xb1, 0xdd, 128),
-);
 /// Who lists the first 15 attendees.
 const MAX_WHO: usize = 15;
 /// About shows the first 8 lines until `Show more`.
@@ -70,56 +74,17 @@ const NOTE_BOTTOM: f32 = 16.0;
 /// A title longer than this leads the description.
 const LONG_SUMMARY: usize = 60;
 
-/// An attendee's answer (`PARTSTAT`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Response {
-    NeedsAction,
-    Accepted,
-    Tentative,
-    Declined,
-}
-
-impl Response {
-    /// Calendar's `responseStatus` for it.
-    pub fn status(self) -> &'static str {
-        match self {
-            Response::NeedsAction => "needsAction",
-            Response::Accepted => "accepted",
-            Response::Tentative => "tentative",
-            Response::Declined => "declined",
-        }
-    }
-
-    /// The answer Calendar's `responseStatus` names.
-    pub fn parse(status: &str) -> Option<Self> {
-        [
-            Response::NeedsAction,
-            Response::Accepted,
-            Response::Tentative,
-            Response::Declined,
-        ]
-        .into_iter()
-        .find(|response| response.status() == status)
-    }
-}
-
 /// What a click on the card asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardAction {
-    /// A link: the location's map or number, the video call, a file.
+    /// A web link: the location's map, the video call, a file.
     Open(String),
+    /// A validated phone number (`tel:` and 7..=15 digits, built by [`phone_href`]).
+    Dial(String),
     /// An answer other than the current one. `NeedsAction` adds the event to the calendar.
     Respond(Response),
     /// `Show more` / `Show Less`.
     ToggleAbout,
-}
-
-/// The video call an invite's description links to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Meeting {
-    /// The row's label, `Meet` or `Teams`.
-    pub label: &'static str,
-    pub url: String,
 }
 
 /// A file the invite attaches (`ATTACH` with a name and a type).
@@ -141,6 +106,10 @@ pub struct Invite {
     pub location: String,
     pub start: Timestamp,
     pub end: Timestamp,
+    /// True when `DTSTART` is a date-only (`VALUE=DATE` / `YYYYMMDD`) all-day event.
+    pub all_day: bool,
+    /// Civil `(start, end)` dates when `all_day` is true (exclusive `end` date).
+    pub dates: Option<(Date, Date)>,
     /// The `METHOD` is `REQUEST` (an invitation, not a reply or a cancellation).
     pub request: bool,
     /// `STATUS:CANCELLED` or `METHOD:CANCEL`.
@@ -165,6 +134,21 @@ pub struct Invite {
 }
 
 impl Invite {
+    /// Resolves `(start, end)` in `tz`, keeping date-only all-day invites anchored to their civil
+    /// dates in `tz` rather than shifting across `TimeZone::system()`.
+    #[must_use]
+    pub fn zoned(&self, tz: &TimeZone) -> (Zoned, Zoned) {
+        if self.all_day
+            && let Some((first, last)) = self.dates
+            && let (Ok(start), Ok(end)) = (first.to_zoned(tz.clone()), last.to_zoned(tz.clone()))
+        {
+            return (start, end);
+        }
+        (
+            self.start.to_zoned(tz.clone()),
+            self.end.to_zoned(tz.clone()),
+        )
+    }
     /// Who I am on the invite: `me` (the mail account) when it's invited, else the first of my
     /// other calendar accounts in `accounts` that is, else `me`.
     pub fn calendar_account<'a>(&'a self, me: &'a str, accounts: &[String]) -> &'a str {
@@ -275,15 +259,16 @@ pub(super) fn hides_body(invite: &Invite, message: &MessageDetail, gcal: bool) -
     google || outlook
 }
 
+#[derive(Clone, Debug)]
+enum ParsedWhen {
+    Day(Date),
+    Zoned(Zoned),
+}
+
 /// Reads the first `VEVENT` of an iCalendar file.
 pub fn parse(ics: &str) -> Option<Invite> {
-    // Lines fold with a leading space or tab (RFC 5545 §3.1).
-    let unfolded = ics
-        .replace("\r\n ", "")
-        .replace("\r\n\t", "")
-        .replace("\n ", "")
-        .replace("\n\t", "");
     let mut in_event = false;
+    let mut nested_depth: usize = 0;
     let mut method = String::new();
     let mut status = String::new();
     let mut invite = Invite {
@@ -293,6 +278,8 @@ pub fn parse(ics: &str) -> Option<Invite> {
         location: String::new(),
         start: Timestamp::UNIX_EPOCH,
         end: Timestamp::UNIX_EPOCH,
+        all_day: false,
+        dates: None,
         request: false,
         cancelled: false,
         counter: false,
@@ -305,17 +292,31 @@ pub fn parse(ics: &str) -> Option<Invite> {
         note: String::new(),
         saved: None,
     };
-    let mut started = false;
+    let mut parsed_start: Option<ParsedWhen> = None;
+    let mut parsed_end: Option<ParsedWhen> = None;
+    let mut parsed_duration: Option<(i64, SignedDuration)> = None;
     let (mut comment, mut response_comments) = (None, Vec::new());
-    for line in unfolded.lines() {
-        let Some((name, params, value)) = content_line(line) else {
+    for line in unfold(ics) {
+        let Some((name, params, value)) = content_line(&line) else {
             continue;
         };
+        if in_event && nested_depth > 0 {
+            match name.as_str() {
+                "BEGIN" => nested_depth += 1,
+                "END" => nested_depth = nested_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
         match name.as_str() {
-            "METHOD" => method = value.trim().to_ascii_uppercase(),
+            "METHOD" if !in_event => method = value.trim().to_ascii_uppercase(),
             "PRODID" if !in_event => invite.product = value.trim().to_owned(),
-            "BEGIN" if value.eq_ignore_ascii_case("VEVENT") => in_event = true,
-            "END" if value.eq_ignore_ascii_case("VEVENT") => break,
+            "BEGIN" if !in_event && value.eq_ignore_ascii_case("VEVENT") => {
+                in_event = true;
+                nested_depth = 0;
+            }
+            "BEGIN" if in_event => nested_depth = 1,
+            "END" if in_event && value.eq_ignore_ascii_case("VEVENT") => break,
             _ if !in_event => {}
             "UID" => invite.uid = value.trim().to_owned(),
             "SUMMARY" => invite.summary = unescape(value),
@@ -325,32 +326,21 @@ pub fn parse(ics: &str) -> Option<Invite> {
             "STATUS" => status = value.trim().to_ascii_uppercase(),
             "RRULE" | "EXRULE" | "RDATE" | "EXDATE" => invite.recurring = true,
             "DTSTART" => {
-                invite.start = date_time(value, params.get("TZID"))?;
-                started = true;
+                parsed_start = Some(when_of(value, params.get("TZID"), params.get("VALUE"))?);
             }
-            "DTEND" => invite.end = date_time(value, params.get("TZID"))?,
+            "DTEND" => {
+                parsed_end = Some(when_of(value, params.get("TZID"), params.get("VALUE"))?);
+            }
+            "DURATION" => {
+                parsed_duration = Some(parse_duration(value)?);
+            }
             "ORGANIZER" => {
-                let email = value
-                    .trim_start_matches("mailto:")
-                    .trim_start_matches("MAILTO:")
-                    .to_owned();
+                let email = strip_mailto(value).to_owned();
                 invite.organizer = Some((params.get("CN").cloned().unwrap_or_default(), email));
             }
             "ATTENDEE" => {
-                let email = value
-                    .trim_start_matches("mailto:")
-                    .trim_start_matches("MAILTO:")
-                    .to_owned();
-                let response = match params
-                    .get("PARTSTAT")
-                    .map(|status| status.to_ascii_uppercase())
-                    .as_deref()
-                {
-                    Some("ACCEPTED") => Response::Accepted,
-                    Some("TENTATIVE") => Response::Tentative,
-                    Some("DECLINED") => Response::Declined,
-                    _ => Response::NeedsAction,
-                };
+                let email = strip_mailto(value).to_owned();
+                let response = Response::parse_ics(params.get("PARTSTAT").map(String::as_str));
                 invite.attendees.push((
                     params.get("CN").cloned().unwrap_or_default(),
                     email,
@@ -363,17 +353,65 @@ pub fn parse(ics: &str) -> Option<Invite> {
                         .to_owned(),
                 );
             }
-            // An attachment is listed only with both a name and a type.
+            // An attachment is listed only with a name, a type, and a web URL.
             "ATTACH" => {
-                if let (Some(name), Some(mime)) = (params.get("FILENAME"), params.get("FMTTYPE")) {
+                if let (Some(name), Some(mime), Some(url)) = (
+                    params.get("FILENAME"),
+                    params.get("FMTTYPE"),
+                    crate::format::urls::web(value.trim()),
+                ) {
                     invite.files.push(File {
                         name: name.clone(),
                         mime: mime.clone(),
-                        url: value.trim().to_owned(),
+                        url,
                     });
                 }
             }
             _ => {}
+        }
+    }
+    match parsed_start? {
+        ParsedWhen::Day(start_date) => {
+            let end_date = match (parsed_end, parsed_duration) {
+                (Some(ParsedWhen::Day(end)), _) if end > start_date => end,
+                (Some(ParsedWhen::Zoned(end)), _) if end.date() > start_date => end.date(),
+                (_, Some((days, sub))) => {
+                    let span_days = (days + sub.as_secs() / 86_400).max(1);
+                    start_date.checked_add(span_days.days()).ok()?
+                }
+                _ => start_date.tomorrow().ok()?,
+            };
+            invite.all_day = true;
+            invite.dates = Some((start_date, end_date));
+            invite.start = start_date
+                .at(11, 0, 0, 0)
+                .to_zoned(TimeZone::UTC)
+                .ok()?
+                .timestamp();
+            invite.end = end_date
+                .at(11, 0, 0, 0)
+                .to_zoned(TimeZone::UTC)
+                .ok()?
+                .timestamp();
+        }
+        ParsedWhen::Zoned(start_zoned) => {
+            invite.all_day = false;
+            invite.dates = None;
+            invite.start = start_zoned.timestamp();
+            invite.end = match (parsed_end, parsed_duration) {
+                (Some(ParsedWhen::Zoned(end)), _) => end.timestamp(),
+                (Some(ParsedWhen::Day(end)), _) => end
+                    .to_zoned(start_zoned.time_zone().clone())
+                    .ok()?
+                    .timestamp(),
+                (None, Some((days, sub))) => start_zoned
+                    .checked_add(days.days())
+                    .ok()?
+                    .checked_add(sub)
+                    .ok()?
+                    .timestamp(),
+                (None, None) => invite.start,
+            };
         }
     }
     invite.request = method == "REQUEST";
@@ -385,129 +423,113 @@ pub fn parse(ics: &str) -> Option<Invite> {
         [only] if !only.is_empty() => only.clone(),
         _ => comment.unwrap_or_default(),
     };
-    started.then_some(invite)
+    Some(invite)
 }
 
-/// A content line's upper-cased name, its parameters (upper-cased names, values unquoted and
-/// RFC 6868's `^n`, `^'` and `^^` decoded) and its value (RFC 5545 §3.1). The first `:` outside
-/// a quoted parameter value starts the value.
-fn content_line(line: &str) -> Option<(String, HashMap<String, String>, &str)> {
-    let mut quoted = false;
-    let mut parts = Vec::new();
-    let mut start = 0;
-    for (at, c) in line.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            ';' | ':' if !quoted => {
-                parts.push(&line[start..at]);
-                start = at + 1;
-                if c == ':' {
-                    let name = parts.remove(0).to_ascii_uppercase();
-                    let params = parts
-                        .into_iter()
-                        .filter_map(|param| param.split_once('='))
-                        .map(|(key, value)| {
-                            (
-                                key.to_ascii_uppercase(),
-                                decode_param(value.trim_matches('"')),
-                            )
-                        })
-                        .collect();
-                    return Some((name, params, &line[start..]));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// RFC 6868's parameter value escapes.
-fn decode_param(value: &str) -> String {
-    static ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\^['n^]").expect("valid regex"));
-    ESCAPE
-        .replace_all(value, |found: &regex::Captures| match &found[0] {
-            "^n" => "\n",
-            "^'" => "\"",
-            _ => "^",
-        })
-        .into_owned()
-}
-
-/// `TEXT` value escapes (RFC 5545 §3.3.11).
-fn unescape(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
-}
-
-static TEAMS_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([\n|]\s*)(.+?)<(https?://.+?)>").expect("valid regex"));
-static ANGLE_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<(https?://.+?)>").expect("valid regex"));
-static MEET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\n(?:Join|Join with Google Meet): (https?://(www\.)?meet\.google\.com/(.*))")
-        .expect("valid regex")
-});
-
-/// The description with its `<url>`s (and Teams' `text<url>`
-/// lines) as links, and the Meet (else Teams) call it joins.
+/// Rewrites `<url>` and Teams join lines into links and extracts a `Meet`, `Teams`, or `Zoom`
+/// call via [`crate::calendar::event::extract_conference_text`].
 fn extract_meeting(description: &str) -> (String, Option<Meeting>) {
-    let mut text = description.to_owned();
-    let mut teams = None;
-    if description.contains("Microsoft Teams meeting") {
-        let trimmed = text.trim().trim_matches('_').to_owned();
-        if let Some(at) = trimmed.find("Microsoft Teams meeting") {
-            let tail = TEAMS_LINE.replace_all(&trimmed[at..], |found: &regex::Captures| {
-                if found[3].contains("teams.microsoft.com/l/meetup-join/") {
-                    teams = Some(found[3].to_owned());
-                }
-                format!("{}<a href=\"{}\">{}</a>", &found[1], &found[3], &found[2])
-            });
-            text = format!("{}{tail}", &trimmed[..at]);
-        }
-    }
-    let text = ANGLE_URL
-        .replace_all(&text, " <a href=\"$1\">$1</a>")
-        .into_owned();
-    let meet = description
-        .contains("meet.google.com")
-        .then(|| MEET.captures(description).map(|found| found[1].to_owned()))
-        .flatten();
-    let meeting = meet.map(|url| Meeting { label: "Meet", url }).or_else(|| {
-        teams.map(|url| Meeting {
-            label: "Teams",
-            url,
-        })
-    });
-    (text, meeting)
+    extract_conference_text(description)
 }
 
-/// A `DATE-TIME` (`20261125T140000Z`, or local with a `TZID`) or `DATE` (`20261125`).
-fn date_time(value: &str, zone: Option<&String>) -> Option<Timestamp> {
+/// Parses an RFC 5545 `DATE` (`VALUE=DATE` or 8-digit `YYYYMMDD`) or `DATE-TIME` (`...Z` or local
+/// with IANA / Windows `TZID`).
+fn when_of(value: &str, zone: Option<&String>, kind: Option<&String>) -> Option<ParsedWhen> {
     let value = value.trim();
     let utc = value.ends_with('Z');
     let digits = value.trim_end_matches('Z');
-    let civil = if digits.len() == 8 {
-        DateTime::strptime("%Y%m%d", digits)
-            .or_else(|_| {
-                jiff::civil::Date::strptime("%Y%m%d", digits)
-                    .map(|date| date.to_datetime(jiff::civil::Time::midnight()))
-            })
-            .ok()?
-    } else {
-        DateTime::strptime("%Y%m%dT%H%M%S", digits).ok()?
-    };
+    if kind.is_some_and(|v| v.eq_ignore_ascii_case("DATE")) || (!utc && digits.len() == 8) {
+        return Date::strptime("%Y%m%d", digits).ok().map(ParsedWhen::Day);
+    }
+    let civil = DateTime::strptime("%Y%m%dT%H%M%S", digits).ok()?;
     let zone = if utc {
         TimeZone::UTC
     } else {
-        zone.and_then(|name| TimeZone::get(name).ok())
+        zone.and_then(|name| resolve_timezone(name))
             .unwrap_or_else(TimeZone::system)
     };
-    civil.to_zoned(zone).ok().map(|zoned| zoned.timestamp())
+    civil.to_zoned(zone).ok().map(ParsedWhen::Zoned)
+}
+
+/// Parses an RFC 5545 / ISO 8601 `DURATION` value (`P1W`, `P2D`, `PT1H30M`, `P1DT2H`, `-PT15M`)
+/// into `(days, sub_day_duration)`.
+fn parse_duration(raw: &str) -> Option<(i64, SignedDuration)> {
+    let trimmed = raw.trim();
+    let (sign, rest) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (-1_i64, rest)
+    } else {
+        (1_i64, trimmed.strip_prefix('+').unwrap_or(trimmed))
+    };
+    let body = rest.strip_prefix('P').or_else(|| rest.strip_prefix('p'))?;
+    if body.is_empty() {
+        return None;
+    }
+    let (date_part, time_part) = match body.find(['T', 't']) {
+        Some(idx) => {
+            let tail = &body[idx + 1..];
+            if tail.is_empty() {
+                return None;
+            }
+            (&body[..idx], Some(tail))
+        }
+        None => (body, None),
+    };
+    let mut days: i64 = 0;
+    let mut secs: i64 = 0;
+    let mut parsed_any = false;
+    let mut num: i64 = 0;
+    let mut has_digits = false;
+    for ch in date_part.chars() {
+        if let Some(d) = ch.to_digit(10) {
+            num = num.checked_mul(10)?.checked_add(i64::from(d))?;
+            has_digits = true;
+        } else {
+            if !has_digits {
+                return None;
+            }
+            match ch.to_ascii_uppercase() {
+                'W' => days = days.checked_add(num.checked_mul(7)?)?,
+                'D' => days = days.checked_add(num)?,
+                _ => return None,
+            }
+            parsed_any = true;
+            num = 0;
+            has_digits = false;
+        }
+    }
+    if has_digits {
+        return None;
+    }
+    if let Some(time_part) = time_part {
+        for ch in time_part.chars() {
+            if let Some(d) = ch.to_digit(10) {
+                num = num.checked_mul(10)?.checked_add(i64::from(d))?;
+                has_digits = true;
+            } else {
+                if !has_digits {
+                    return None;
+                }
+                match ch.to_ascii_uppercase() {
+                    'H' => secs = secs.checked_add(num.checked_mul(3600)?)?,
+                    'M' => secs = secs.checked_add(num.checked_mul(60)?)?,
+                    'S' => secs = secs.checked_add(num)?,
+                    _ => return None,
+                }
+                parsed_any = true;
+                num = 0;
+                has_digits = false;
+            }
+        }
+        if has_digits {
+            return None;
+        }
+    }
+    parsed_any.then(|| {
+        (
+            days.saturating_mul(sign),
+            SignedDuration::from_secs(secs.saturating_mul(sign)),
+        )
+    })
 }
 
 /// Which photo heads the card.
@@ -555,41 +577,50 @@ fn kind(text: &str, attendees: usize) -> Option<&'static str> {
         .then_some(if attendees == 2 { "1on1" } else { "meeting" })
 }
 
-/// The invite photos, decoded once.
-#[derive(Default)]
-pub struct Photos(HashMap<&'static str, Option<TextureHandle>>);
+/// Decoded invite card textures cached in `egui::Context` data per `(images, kind)`, so opening or
+/// stepping across threads reuses uploaded textures without re-reading or decoding JPEGs on the UI
+/// thread.
+type PhotoCache = Arc<Mutex<HashMap<&'static str, Option<TextureHandle>>>>;
 
-impl Photos {
-    fn get(
-        &mut self,
-        ctx: &egui::Context,
-        images: &Path,
-        kind: &'static str,
-    ) -> Option<&TextureHandle> {
-        self.0
-            .entry(kind)
-            .or_insert_with(|| {
-                let path = images.join(format!("invite-{kind}.jpg"));
-                let decoded = std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| image::load_from_memory(&bytes).ok());
-                let Some(decoded) = decoded else {
-                    log::warn!("no invite photo at {}", path.display());
-                    return None;
-                };
-                let rgba = decoded.to_rgba8();
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                );
-                Some(ctx.load_texture(
-                    format!("invite {kind}"),
-                    color,
-                    egui::TextureOptions::LINEAR,
-                ))
-            })
-            .as_ref()
+fn photo(ctx: &egui::Context, images: &Path, kind: &'static str) -> Option<TextureHandle> {
+    let cache: PhotoCache = ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<PhotoCache>(egui::Id::new((
+            "exo::thread::invite::photos",
+            images,
+        )))
+        .clone()
+    });
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(kind)
+    {
+        return cached.clone();
     }
+    let loaded = load_photo(ctx, images, kind);
+    match cache.lock() {
+        Ok(mut guard) => guard.entry(kind).or_insert(loaded).clone(),
+        Err(_) => loaded,
+    }
+}
+
+fn load_photo(ctx: &egui::Context, images: &Path, kind: &'static str) -> Option<TextureHandle> {
+    let path = images.join(format!("invite-{kind}.jpg"));
+    let decoded = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok());
+    let Some(decoded) = decoded else {
+        log::warn!("no invite photo at {}", path.display());
+        return None;
+    };
+    let rgba = decoded.to_rgba8();
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    Some(ctx.load_texture(
+        format!("invite {kind}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 /// What the card knows beyond the invite: whose card it is (the calendar account it's to), the
@@ -665,12 +696,41 @@ fn responder(name: &str, email: &str, message: &MessageDetail) -> String {
         .unwrap_or_else(|| email.to_owned())
 }
 
+/// What clicking a linked piece does: open a web URL, or dial a phone number built by
+/// [`phone_href`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PieceLink {
+    Web(String),
+    Dial(String),
+}
+
+impl PieceLink {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Web(url) | Self::Dial(url) => url,
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Self::Web(url) | Self::Dial(url) => url,
+        }
+    }
+
+    fn to_action(&self) -> CardAction {
+        match self {
+            Self::Web(url) => CardAction::Open(url.clone()),
+            Self::Dial(tel) => CardAction::Dial(tel.clone()),
+        }
+    }
+}
+
 /// A piece of a row's value: text, a link when `link` is set, bold when `bold`, a participant's
 /// name with their tooltip when `contact` is.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Piece {
     text: String,
-    link: Option<String>,
+    link: Option<PieceLink>,
     bold: bool,
     contact: Option<Contact>,
 }
@@ -686,7 +746,15 @@ impl Piece {
     fn link(text: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            link: Some(url.into()),
+            link: Some(PieceLink::Web(url.into())),
+            ..Self::default()
+        }
+    }
+
+    fn dial(text: impl Into<String>, tel: String) -> Self {
+        Self {
+            text: text.into(),
+            link: Some(PieceLink::Dial(tel)),
             ..Self::default()
         }
     }
@@ -727,10 +795,8 @@ fn rows(invite: &Invite, context: &Context) -> Vec<Row> {
             value: Value::AddToCalendar(invite.saved == Some(Response::NeedsAction)),
         });
     }
-    let mut when = dates::calendar_range(invite.start, invite.end, context.now);
-    if invite.recurring {
-        when.push_str(" (recurring)");
-    }
+    let (start, end) = invite.zoned(context.now.time_zone());
+    let when = dates::invite_range(&start, &end, invite.all_day, invite.recurring);
     rows.push(Row {
         question: "When",
         value: Value::When(when),
@@ -809,7 +875,7 @@ fn rows(invite: &Invite, context: &Context) -> Vec<Row> {
                             .into_iter()
                             .map(|run| Piece {
                                 text: run.text,
-                                link: run.link,
+                                link: run.link.map(PieceLink::Web),
                                 bold: run.bold,
                                 contact: None,
                             })
@@ -854,19 +920,10 @@ fn location(invite: &Invite) -> Option<Vec<Piece>> {
         return Some(vec![Piece::text(location)]);
     }
     if let Some(tel) = phone_href(location) {
-        return Some(vec![Piece::link(location, tel)]);
+        return Some(vec![Piece::dial(location, tel)]);
     }
-    let links = exo_mail::links(location);
-    if !links.is_empty() {
-        let mut pieces = Vec::new();
-        let mut at = 0;
-        for (range, url) in links {
-            pieces.push(Piece::text(&location[at..range.start]));
-            pieces.push(Piece::link(&location[range.clone()], url));
-            at = range.end;
-        }
-        pieces.push(Piece::text(&location[at..]));
-        pieces.retain(|piece| !piece.text.is_empty());
+    let pieces = pieces_from_runs(linkify(location));
+    if pieces.iter().any(|piece| piece.link.is_some()) {
         return Some(pieces);
     }
     let query: String = url::form_urlencoded::byte_serialize(location.as_bytes()).collect();
@@ -1032,20 +1089,22 @@ pub(super) fn note(invite: &Invite, calendar: Option<&exo_mail::CalendarData>) -
     })
 }
 
+/// Converts [`crate::calendar::description::Run`]s into card [`Piece`]s.
+fn pieces_from_runs(runs: Vec<crate::calendar::description::Run>) -> Vec<Piece> {
+    runs.into_iter()
+        .filter(|run| !run.text.is_empty())
+        .map(|run| Piece {
+            text: run.text,
+            link: run.link.map(PieceLink::Web),
+            bold: run.bold,
+            contact: None,
+        })
+        .collect()
+}
+
 /// The note's pieces, with its URLs made links.
 fn note_pieces(note: &str) -> Vec<Piece> {
-    let mut pieces = Vec::new();
-    let mut at = 0;
-    for (range, url) in exo_mail::links(note) {
-        pieces.extend([
-            Piece::text(&note[at..range.start]),
-            Piece::link(&note[range.clone()], url),
-        ]);
-        at = range.end;
-    }
-    pieces.push(Piece::text(&note[at..]));
-    pieces.retain(|piece| !piece.text.is_empty());
-    pieces
+    pieces_from_runs(linkify(note))
 }
 
 /// The note's lines in a column `width` wide, with its URLs made links.
@@ -1069,7 +1128,7 @@ pub(super) fn printout(
             .into_iter()
             .map(|piece| Run {
                 text: piece.text,
-                link: piece.link,
+                link: piece.link.map(PieceLink::into_string),
                 bold: piece.bold,
             })
             .collect()
@@ -1131,16 +1190,10 @@ pub(super) fn show_note(
                 palette.ink(1.0, 0.9)
             };
             NOTE.paint_line(ui.painter(), pos2(x, y), &piece.text, color, None);
-            if let Some(url) = piece.link {
+            if let Some(piece_link) = piece.link {
+                let url = piece_link.into_string();
                 let rect = Rect::from_min_size(pos2(x, y), vec2(advance, NOTE.line_height));
-                exo_ui::link_box(ui.ctx(), rect, &url);
-                if ui
-                    .interact(
-                        rect,
-                        id.with(("note-link", x as i32, y as i32)),
-                        Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                if interact_link(ui, rect, id.with(("note-link", x as i32, y as i32)), &url)
                     .clicked()
                 {
                     clicked = Some(url);
@@ -1152,10 +1205,6 @@ pub(super) fn show_note(
     }
     clicked
 }
-
-/// The RSVP buttons' answers, in order.
-pub(super) const ANSWERS: [Response; 3] =
-    [Response::Accepted, Response::Tentative, Response::Declined];
 
 /// What [`show`] found: what was clicked, whether the pointer is on When's text, and where
 /// Who's names went, for their tooltips.
@@ -1179,7 +1228,6 @@ pub(super) fn show(
     width: f32,
     invite: &Invite,
     context: &Context,
-    photos: &mut Photos,
     images: &Path,
     id: egui::Id,
     focused: Option<usize>,
@@ -1199,15 +1247,18 @@ pub(super) fn show(
         palette.fill_base_accent,
     );
     // The photo covers 640×176, centred (`background-size: cover; background-position-x: 50%`).
-    let photo = Rect::from_min_size(card.min, vec2(width, IMAGE_HEIGHT));
-    if let Some(texture) = photos.get(ui.ctx(), images, image_kind(invite)) {
+    let photo_rect = Rect::from_min_size(card.min, vec2(width, IMAGE_HEIGHT));
+    if let Some(texture) = photo(ui.ctx(), images, image_kind(invite)) {
         let [w, h] = texture.size().map(|side| side as f32);
-        let scale = (photo.width() / w).max(photo.height() / h);
-        let (u, v) = (photo.width() / (w * scale), photo.height() / (h * scale));
+        let scale = (photo_rect.width() / w).max(photo_rect.height() / h);
+        let (u, v) = (
+            photo_rect.width() / (w * scale),
+            photo_rect.height() / (h * scale),
+        );
         let uv = Rect::from_min_max(pos2((1.0 - u) / 2.0, 0.0), pos2((1.0 + u) / 2.0, v));
         painter.add(
             RectShape::filled(
-                exo_ui::pixel_snap(photo),
+                exo_ui::pixel_snap(photo_rect),
                 CornerRadius {
                     nw: 4,
                     ne: 4,
@@ -1220,25 +1271,24 @@ pub(super) fn show(
         );
     }
     if let Some(status) = status(invite, context) {
-        paint_status(ui, photo, &status);
+        paint_status(ui, photo_rect, &status);
     }
 
     let value_left = card.left() + ROWS_SIDE + QUESTION + PROPERTY_PADDING;
     let value_width = value_width(width);
-    let mut row_top = photo.bottom() + ROWS_TOP;
+    let mut row_top = photo_rect.bottom() + ROWS_TOP;
     let mut shown = Shown::default();
     let pointer = ui
         .ctx()
         .pointer_hover_pos()
         .filter(|_| ui.ui_contains_pointer());
     let link = |rect: Rect, key: &str, href: &str| {
-        exo_ui::link_box(ui.ctx(), rect, href);
-        ui.interact(
+        interact_link(
+            ui,
             rect,
             id.with(("link", key, rect.min.x as i32, rect.min.y as i32)),
-            Sense::click(),
+            href,
         )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
     };
     for row in rows(invite, context) {
@@ -1268,17 +1318,17 @@ pub(super) fn show(
                                 },
                             );
                             style.paint_line(painter, pos2(x, y), &piece.text, color, None);
-                            if let Some(url) = &piece.link
+                            if let Some(piece_link) = &piece.link
                                 && link(
                                     Rect::from_min_size(
                                         pos2(x, y),
                                         vec2(advance, TEXT.line_height),
                                     ),
                                     row.question,
-                                    url,
+                                    piece_link.as_str(),
                                 )
                             {
-                                shown.clicked = Some(CardAction::Open(url.clone()));
+                                shown.clicked = Some(piece_link.to_action());
                             }
                             // A contact name's box is the 17px content area of its text, 3px
                             // down the line. The boxes cover the name's words and the spaces
@@ -1336,37 +1386,44 @@ pub(super) fn show(
                 }
             }
             Value::Rsvp(answer) => {
-                let mut x = card.left() + ROWS_SIDE + QUESTION;
-                // Upper-cased labels in Classic.
-                for (index, (label, response)) in
-                    ["YES", "MAYBE", "NO"].into_iter().zip(ANSWERS).enumerate()
-                {
-                    let selected = *answer == Some(response);
-                    let (button, clicked) = rsvp_button(
-                        ui,
-                        palette,
-                        id.with(label),
-                        pos2(x, row_top),
-                        label,
-                        selected,
-                        focused == Some(index),
-                    );
-                    // Answering again with the current answer does nothing.
-                    if clicked && !selected {
-                        shown.clicked = Some(CardAction::Respond(response));
-                    }
-                    x = button.right() + BUTTON_GAP;
+                let metrics = RsvpButtonMetrics {
+                    font: BOLD,
+                    height: BUTTON_HEIGHT,
+                    padding_x: BUTTON_PADDING,
+                    gap: BUTTON_GAP,
+                    text_top: 4.0,
+                    animated: false,
+                };
+                if let Some(response) = show_rsvp_buttons(
+                    ui,
+                    palette,
+                    id,
+                    pos2(card.left() + ROWS_SIDE + QUESTION, row_top - 3.0),
+                    *answer,
+                    focused,
+                    metrics,
+                ) {
+                    shown.clicked = Some(CardAction::Respond(response));
                 }
             }
             Value::AddToCalendar(selected) => {
-                let (_, clicked) = rsvp_button(
+                let metrics = RsvpButtonMetrics {
+                    font: BOLD,
+                    height: BUTTON_HEIGHT,
+                    padding_x: BUTTON_PADDING,
+                    gap: BUTTON_GAP,
+                    text_top: 4.0,
+                    animated: false,
+                };
+                let (_, clicked) = show_rsvp_button(
                     ui,
                     palette,
                     id.with("add"),
-                    pos2(card.left() + ROWS_SIDE + QUESTION, row_top),
-                    "ADD TO CALENDAR",
+                    pos2(card.left() + ROWS_SIDE + QUESTION, row_top - 3.0),
+                    Response::NeedsAction.button_label(),
                     *selected,
                     focused == Some(0),
+                    metrics,
                 );
                 if clicked && !selected {
                     shown.clicked = Some(CardAction::Respond(Response::NeedsAction));
@@ -1444,109 +1501,6 @@ fn paint_status(ui: &Ui, photo: Rect, status: &str) {
             Color32::from_black_alpha(191),
             None,
         );
-    }
-}
-
-/// One RSVP button, with its row's line box at `at`. Returns the button's box and whether it was
-/// clicked.
-fn rsvp_button(
-    ui: &Ui,
-    palette: &Palette,
-    id: egui::Id,
-    at: egui::Pos2,
-    label: &str,
-    selected: bool,
-    focused: bool,
-) -> (Rect, bool) {
-    let painter = ui.painter();
-    let text = BOLD
-        .single_line(painter, label, Color32::PLACEHOLDER, None)
-        .size()
-        .x;
-    let button = Rect::from_min_size(
-        pos2(at.x, at.y - 4.0 + 1.0),
-        vec2(text + 2.0 * BUTTON_PADDING, BUTTON_HEIGHT),
-    );
-    // A pointer cursor over the button.
-    let response = ui
-        .interact(button, id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let color = paint_rsvp_button(
-        painter,
-        palette,
-        exo_ui::pixel_snap(button),
-        response.hovered(),
-        selected,
-        focused,
-    );
-    // The label sits a pixel below the row's other text (measured).
-    BOLD.paint_line(
-        painter,
-        pos2(button.left() + BUTTON_PADDING, at.y + 1.0),
-        label,
-        color,
-        None,
-    );
-    (button, response.clicked())
-}
-
-/// Paints an RSVP button's box at `rect` and returns its label's color. Hovered and focused
-/// buttons and the current answer fill with the link blue. Hovered buttons cast a gray shadow and
-/// focused ones glow, except the answer, which only glows when focused and takes a blue label.
-fn paint_rsvp_button(
-    painter: &egui::Painter,
-    palette: &Palette,
-    rect: Rect,
-    hovered: bool,
-    selected: bool,
-    focused: bool,
-) -> Color32 {
-    let radius = CornerRadius::same(2);
-    if focused {
-        for shadow in [
-            if selected {
-                SELECTED_FOCUS_GLOW
-            } else {
-                FOCUS_GLOW
-            },
-            FOCUS_HAZE,
-        ] {
-            shadow.paint(painter, rect, radius);
-        }
-    } else if hovered && !selected {
-        // `box-shadow: rgba(0, 0, 0, .2) 0 0 8px`, `.5` in Carbon.
-        BoxShadow::new(
-            [0.0, 0.0],
-            8.0,
-            0.0,
-            Color32::from_black_alpha(if palette.theme == Theme::Carbon {
-                128
-            } else {
-                51
-            }),
-        )
-        .paint(painter, rect, radius);
-    }
-    if hovered || selected || focused {
-        painter.rect_filled(rect, radius, palette.button_ghost_fill_active);
-    }
-    if selected {
-        // The answer's label: `rgba(84, 172, 220, .9)`, `.8` in Carbon.
-        Color32::from_rgba_unmultiplied(
-            0x54,
-            0xac,
-            0xdc,
-            if palette.theme == Theme::Carbon {
-                204
-            } else {
-                230
-            },
-        )
-    } else if hovered || focused {
-        // Hovered or focused: `.35` in both.
-        palette.ink(0.35, 0.35)
-    } else {
-        palette.button_ghost_content_default
     }
 }
 
@@ -1833,14 +1787,20 @@ mod tests {
         };
         assert_eq!(
             link(&invite),
-            Some(vec![
+            Some(vec![PieceLink::Web(
                 "https://maps.google.com/maps?q=Harborlight%20Coffee%2C%205th%20Ave".to_owned()
-            ])
+            )])
         );
         invite.location = "+1 (555) 010-2030".into();
-        assert_eq!(link(&invite), Some(vec!["tel:+15550102030".to_owned()]));
+        assert_eq!(
+            link(&invite),
+            Some(vec![PieceLink::Dial("tel:+15550102030".to_owned())])
+        );
         invite.location = "Zoom: https://zoom.us/j/1".into();
-        assert_eq!(link(&invite), Some(vec!["https://zoom.us/j/1".to_owned()]));
+        assert_eq!(
+            link(&invite),
+            Some(vec![PieceLink::Web("https://zoom.us/j/1".to_owned())])
+        );
         invite.location = "Microsoft Teams Meeting".into();
         assert_eq!(link(&invite), Some(Vec::new()));
         invite.meeting = Some(Meeting {
@@ -1949,5 +1909,309 @@ mod tests {
             printed.rows[1].value,
             InviteValue::When("Wednesday, November 25th, 2026 at 9:00 AM – 9:45 AM EST".into())
         );
+    }
+
+    #[test]
+    fn valarm_nested_components_never_clobber_vevent_properties_or_meeting_links() {
+        let raw = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "METHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:valarm-1@brightmoor.co\r\n",
+            "DTSTART:20261125T140000Z\r\n",
+            "DTEND:20261125T150000Z\r\n",
+            "SUMMARY:Design review\r\n",
+            "DESCRIPTION:Docs at C:\\\\notes\\\\v1\\nJoin with Google Meet: https://meet.google.com/abc-defg-hij\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;CN=Maya Okafor:mailto:maya@brightmoor.co\r\n",
+            "BEGIN:VALARM\r\n",
+            "ACTION:EMAIL\r\n",
+            "DESCRIPTION:Reminder\r\n",
+            "SUMMARY:Alarm summary\r\n",
+            "ATTENDEE:mailto:alarm@brightmoor.co\r\n",
+            "END:VALARM\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let invite = parse(raw).expect("parses");
+        assert_eq!(invite.summary, "Design review");
+        assert!(
+            invite.description.starts_with("Docs at C:\\notes\\v1\n"),
+            "single-pass unescape keeps literal \\n while VALARM DESCRIPTION:Reminder is ignored: {}",
+            invite.description
+        );
+        assert_eq!(
+            invite.meeting,
+            Some(Meeting {
+                label: "Meet",
+                url: "https://meet.google.com/abc-defg-hij".into(),
+            })
+        );
+        assert_eq!(invite.attendees.len(), 1);
+        assert_eq!(invite.attendees[0].1, "maya@brightmoor.co");
+    }
+
+    #[test]
+    fn duration_and_missing_dtend_resolve_without_epoch_fallback() {
+        let with_duration = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:dur-1\r\n",
+            "DTSTART:20261125T140000Z\r\n",
+            "DURATION:PT1H30M\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let timed = parse(with_duration).expect("timed duration");
+        assert!(!timed.all_day);
+        assert_eq!(
+            timed.end.duration_since(timed.start),
+            SignedDuration::from_mins(90)
+        );
+
+        let timed_no_end = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:noend-1\r\n",
+            "DTSTART:20261125T140000Z\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let instant = parse(timed_no_end).expect("timed without DTEND");
+        assert_eq!(instant.end, instant.start);
+        assert_ne!(instant.end, Timestamp::UNIX_EPOCH);
+
+        let all_day_no_end = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:date-noend\r\n",
+            "DTSTART;VALUE=DATE:20261207\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let single_day = parse(all_day_no_end).expect("date without DTEND");
+        assert!(single_day.all_day);
+        assert_eq!(
+            single_day.dates,
+            Some((Date::constant(2026, 12, 7), Date::constant(2026, 12, 8)))
+        );
+        for zone_name in ["America/Los_Angeles", "Europe/London", "Pacific/Auckland"] {
+            let tz = TimeZone::get(zone_name).expect("zone");
+            let (start, end) = single_day.zoned(&tz);
+            assert_eq!(
+                (start.date(), end.date()),
+                (Date::constant(2026, 12, 7), Date::constant(2026, 12, 8)),
+                "civil dates preserved in {zone_name}"
+            );
+            assert_eq!(
+                dates::invite_range(&start, &end, single_day.all_day, false),
+                "Monday, December 7th 2026 (all day)"
+            );
+        }
+
+        let all_day_duration = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:date-dur\r\n",
+            "DTSTART;VALUE=DATE:20261209\r\n",
+            "DURATION:P3D\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let multi_day = parse(all_day_duration).expect("date with P3D");
+        assert_eq!(
+            multi_day.dates,
+            Some((Date::constant(2026, 12, 9), Date::constant(2026, 12, 12)))
+        );
+    }
+
+    #[test]
+    fn windows_exchange_tzids_map_to_valid_iana_zones() {
+        for (windows, iana) in gmail::ics::WINDOWS_ZONES {
+            assert!(
+                TimeZone::get(iana).is_ok(),
+                "unrecognized IANA zone {iana} for {windows}"
+            );
+            assert!(resolve_timezone(windows).is_some(), "resolves {windows}");
+            assert_eq!(gmail::ics::windows_to_iana(windows), Some(*iana));
+        }
+        let outlook = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "METHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:win-tz\r\n",
+            "DTSTART;TZID=\"Eastern Standard Time\":20261118T100000\r\n",
+            "DTEND;TZID=Pacific Standard Time:20261118T080000\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let invite = parse(outlook).expect("parses Windows TZID");
+        assert_eq!(invite.start.to_string(), "2026-11-18T15:00:00Z");
+        assert_eq!(invite.end.to_string(), "2026-11-18T16:00:00Z");
+    }
+
+    #[test]
+    fn ics_attach_rejects_non_web_urls_and_file_cards_never_emit_dial() {
+        let with_attach = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "METHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:attach-check\r\n",
+            "DTSTART:20261125T140000Z\r\n",
+            "DTEND:20261125T144500Z\r\n",
+            "ATTACH;FILENAME=call.pdf;FMTTYPE=application/pdf:tel:+15550102030\r\n",
+            "ATTACH;FILENAME=local.txt;FMTTYPE=text/plain:file:///etc/passwd\r\n",
+            "ATTACH;FILENAME=script.html;FMTTYPE=text/html:javascript:alert(1)\r\n",
+            "ATTACH;FILENAME=agenda.pdf;FMTTYPE=application/pdf:https://drive.example/agenda.pdf\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let parsed = parse(with_attach).expect("parses");
+        assert_eq!(
+            parsed.files,
+            vec![File {
+                name: "agenda.pdf".into(),
+                mime: "application/pdf".into(),
+                url: "https://drive.example/agenda.pdf".into(),
+            }],
+            "non-http(s) ATTACH URLs including tel: are rejected at parse time"
+        );
+
+        // Even if a File carries a `tel:` URL directly, clicking it emits `CardAction::Open`
+        // (never `CardAction::Dial`), whereas clicking a phone number in Where emits `Dial`.
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("fonts load");
+        let now: Zoned = "2026-11-17T09:00:00[America/New_York]"
+            .parse()
+            .expect("valid");
+        let plain = message("Invitation: Phone check");
+        let images = crate::assets_dir().join("images");
+
+        let mut invite = parsed;
+        invite.location = "+1 (555) 010-2030".into();
+        invite.files = vec![File {
+            name: "spoof.pdf".into(),
+            mime: "application/pdf".into(),
+            url: "tel:+15550102030".into(),
+        }];
+
+        let mut where_pos = None;
+        let mut file_pos = None;
+        let mut prime = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let mut row_top = 1.0 + IMAGE_HEIGHT + ROWS_TOP;
+                let vw = value_width(640.0);
+                let value_left = ROWS_SIDE + QUESTION + PROPERTY_PADDING;
+                for row in rows(&invite, &context(&plain, &now)) {
+                    let h = value_height(ui.ctx(), &row.value, vw);
+                    if row.question == "Where" {
+                        where_pos = Some(pos2(value_left + 20.0, row_top + TEXT.line_height / 2.0));
+                    } else if row.question == "Files" {
+                        file_pos = Some(pos2(value_left + 20.0, row_top + 20.0));
+                    }
+                    row_top += h + ROW_GAP;
+                }
+                let _ = show(
+                    ui,
+                    0.0,
+                    0.0,
+                    640.0,
+                    &invite,
+                    &context(&plain, &now),
+                    &images,
+                    egui::Id::new("test-invite"),
+                    None,
+                );
+            },
+        );
+        prime.textures_delta.clear();
+
+        let click_at = |target: egui::Pos2| -> Option<CardAction> {
+            let mut action = None;
+            let frame = |events: Vec<egui::Event>| {
+                let mut clicked = None;
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 800.0))),
+                    ..Default::default()
+                };
+                raw.events = events;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    let shown = show(
+                        ui,
+                        0.0,
+                        0.0,
+                        640.0,
+                        &invite,
+                        &context(&plain, &now),
+                        &images,
+                        egui::Id::new("test-invite"),
+                        None,
+                    );
+                    clicked = shown.clicked;
+                });
+                out.textures_delta.clear();
+                clicked
+            };
+            let _ = frame(vec![egui::Event::PointerMoved(target)]);
+            let _ = frame(vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            action = action.or_else(|| {
+                frame(vec![egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }])
+            });
+            action
+        };
+
+        assert_eq!(
+            click_at(where_pos.expect("Where row present")),
+            Some(CardAction::Dial("tel:+15550102030".into())),
+            "phone link in Where emits CardAction::Dial"
+        );
+        assert_eq!(
+            click_at(file_pos.expect("Files row present")),
+            Some(CardAction::Open("tel:+15550102030".into())),
+            "file attachment card emits CardAction::Open, never CardAction::Dial"
+        );
+    }
+
+    #[test]
+    fn invite_photos_cache_in_egui_context_across_calls() {
+        let dir = std::env::temp_dir().join(format!(
+            "exo-invite-photo-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = crate::assets_dir().join("images/invite-coffee.jpg");
+        let dst = dir.join("invite-coffee.jpg");
+        std::fs::copy(&src, &dst).expect("copy invite photo");
+
+        let ctx = egui::Context::default();
+        let first = photo(&ctx, &dir, "coffee").expect("decodes and caches photo");
+        std::fs::remove_file(&dst).expect("remove source file after first load");
+        let second = photo(&ctx, &dir, "coffee").expect("reuses cached texture without disk read");
+        assert_eq!(first.id(), second.id());
+
+        assert!(photo(&ctx, &dir, "missing").is_none());
+        let missing_file = dir.join("invite-missing.jpg");
+        std::fs::copy(&src, &missing_file).expect("copy after negative cache");
+        assert!(
+            photo(&ctx, &dir, "missing").is_none(),
+            "missing photo result stays cached so frames do not re-hit disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

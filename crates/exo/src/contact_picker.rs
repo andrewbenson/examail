@@ -4,15 +4,13 @@
 //! its right adds what's typed. Split Inbox's VIP definition uses it, without the picker's focus
 //! bar.
 
-use std::sync::LazyLock;
-
 use egui::{Color32, CornerRadius, Id, Rect, Sense, Ui, pos2, vec2};
 use exo_ui::{
-    ContactColumns, ContactListStyle, ContactRow, ContactSelectorList, DialogInput, Family, Font,
-    RowAvatar, TextStyle,
+    ContactColumns, ContactListStyle, ContactRow, ContactSearchInput, ContactSelectorList,
+    DialogInput, Family, Font, RowAvatar, TextStyle, step_list_index,
 };
-use regex::Regex;
 
+pub(crate) use crate::compose::recipients::is_valid_domain;
 use crate::compose::{
     contacts::{self, Suggestion},
     recipients,
@@ -35,21 +33,6 @@ const RULE: f32 = 1.0;
 /// The add button's plus: 16px, its circle `#aeb1dd`.
 const ADD: f32 = 16.0;
 const PERIWINKLE: Color32 = Color32::from_rgb(0xae, 0xb1, 0xdd);
-
-/// A domain name: dot-separated labels of letters, digits and inner hyphens.
-static DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-        .expect("valid regex")
-});
-/// What could be the start of an address.
-static ADDRESS_START: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^[a-z0-9!#$%&'*/=?^_`{|}~-]{1,20}(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]{1,20}){0,2}@?(?:[a-z0-9](?:[a-z0-9-]{0,20}[a-z0-9])?\.)?(?:[a-z0-9-]{0,20}[a-z0-9])?$").expect("valid regex")
-});
-
-/// Whether `text` is a domain.
-pub(crate) fn is_valid_domain(text: &str) -> bool {
-    DOMAIN.is_match(text)
-}
 
 /// A key the picker takes while it has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,21 +63,9 @@ pub(crate) struct ContactPicker {
     focused: bool,
     /// Whether it asks for the keyboard next frame.
     focus: bool,
-    /// The field's spellchecking, boxed to keep the dialog screens it's in small.
-    pub spelling: Box<exo_editor::FieldSpelling>,
 }
 
 impl ContactPicker {
-    /// Does `choice` from the menu of a right-click `menu` in the field.
-    pub(crate) fn spelling_choice(
-        &mut self,
-        ctx: &egui::Context,
-        menu: &exo_editor::ContextMenu,
-        choice: crate::page_menu::Choice,
-    ) -> crate::spelling::Done {
-        crate::spelling::field_choice(ctx, &mut self.spelling, &mut self.text, menu, choice)
-    }
-
     /// Asks for the keyboard.
     pub fn request_focus(&mut self) {
         self.focus = true;
@@ -103,6 +74,32 @@ impl ContactPicker {
     /// Whether it had the keyboard last frame.
     pub fn is_focused(&self) -> bool {
         self.focused
+    }
+
+    /// What's currently typed in the picker.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.query.clone_from(&self.text);
+        self.suggest(None);
+    }
+
+    /// Whether the picker has non-whitespace text not yet added.
+    pub fn has_pending(&self) -> bool {
+        !self.text.trim().is_empty()
+    }
+
+    /// Commits pending text (or the highlighted suggestion, as `+` does). Returns `Ok(None)` when
+    /// empty, `Ok(Some(sender))` when added, or `Err(())` when non-empty and invalid.
+    pub fn commit_pending(&mut self) -> Result<Option<String>, ()> {
+        if !self.has_pending() {
+            return Ok(None);
+        }
+        self.add_button().map(Some).ok_or(())
     }
 
     /// The keys it takes now, besides typing, as (command id, key, bindings): ↓ / ↑ and Enter /
@@ -140,17 +137,30 @@ impl ContactPicker {
     pub fn key(&mut self, key: PickerKey) -> Option<String> {
         match key {
             PickerKey::Move(delta) => {
-                let count = self.suggestions.len().max(1) as isize;
-                self.highlight = (self.highlight as isize + delta).rem_euclid(count) as usize;
+                self.highlight =
+                    step_list_index(self.highlight, self.suggestions.len().max(1), delta, true);
                 None
             }
             PickerKey::Select | PickerKey::Space if self.suggestions.is_empty() => {
-                self.take_typed()
+                let picked = self.take_typed();
+                if picked.is_some() {
+                    self.focus = true;
+                }
+                picked
             }
-            PickerKey::Select => self.take(self.highlight),
+            PickerKey::Select => {
+                let picked = self.take(self.highlight);
+                if picked.is_some() {
+                    self.focus = true;
+                }
+                picked
+            }
             PickerKey::Space => None,
             PickerKey::Clear => {
                 self.clear();
+                // Keep focus on the field after Escape clears its text (egui surrenders focus on
+                // Escape during begin_pass when focus_lock_filter.escape is false).
+                self.focus = true;
                 None
             }
         }
@@ -167,42 +177,30 @@ impl ContactPicker {
         book: Option<&contacts::Index>,
     ) -> Option<String> {
         let ctx = ui.ctx().clone();
-        let spelling = &mut self.spelling;
+        let request_focus = std::mem::take(&mut self.focus);
+        let highlight = &mut self.highlight;
         let field = input.show_with(
             ui,
             id,
             &mut self.text,
             line,
             |ui, id, text, line, style, color, selection| {
-                spelling.show(ui, id, text, line, style, color, selection)
+                ContactSearchInput::new(id, line, style, color, selection)
+                    .request_focus(request_focus)
+                    .show_input_with(ui, text, highlight, crate::spelling::text_field)
+                    .response
             },
         );
-        if std::mem::take(&mut self.focus) {
-            field.request_focus();
-        }
         self.focused = field.has_focus();
         if self.text != self.query {
             self.query.clone_from(&self.text);
             self.suggest(book);
         }
-        if self.focused {
-            // The field keeps the caret through the keys it takes, where egui would move it on Tab
-            // and drop it on Escape. This goes after the `TextEdit` sets its own filter, which it
-            // does each frame.
-            let tab = !self.suggestions.is_empty() || self.valid;
-            let filter = egui::EventFilter {
-                tab,
-                escape: !self.text.is_empty(),
-                horizontal_arrows: true,
-                vertical_arrows: true,
-            };
-            ctx.memory_mut(|memory| memory.set_focus_lock_filter(id, filter));
-        }
+        let mut picked = None;
         let container = Rect::from_min_size(
             pos2(line.left(), line.top() - NUDGE),
             vec2(line.width(), line.height() + RULE),
         );
-        let mut picked = None;
         if !self.text.trim().is_empty() {
             let add = Rect::from_center_size(
                 pos2(container.right() - ADD / 2.0, container.center().y),
@@ -390,7 +388,7 @@ impl ContactPicker {
             return;
         }
         self.valid = recipients::is_valid(text);
-        self.typed_row = self.valid || ADDRESS_START.is_match(text);
+        self.typed_row = self.valid || recipients::is_address_start(text);
     }
 
     /// Takes the sender of suggestion `index`, and the field empties.
@@ -524,6 +522,77 @@ mod tests {
             typed("ana@x.org").keys().len(),
             3,
             "Enter/Tab, Space and Escape"
+        );
+    }
+
+    #[test]
+    fn commit_pending_and_escape_clear_preserve_picker_behavior() {
+        let mut empty = ContactPicker::default();
+        assert!(!empty.has_pending());
+        assert_eq!(empty.commit_pending(), Ok(None));
+
+        let mut invalid = typed("nope");
+        assert!(invalid.has_pending());
+        assert_eq!(invalid.commit_pending(), Err(()));
+
+        let mut valid = typed("ana@x.org");
+        assert_eq!(valid.commit_pending(), Ok(Some("ana@x.org".into())));
+        assert!(!valid.has_pending());
+
+        // Escape clearing text via PickerKey::Clear requests focus back on the same frame so
+        // egui's begin_pass focus surrender doesn't lose keyboard focus.
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("fonts");
+        let id = Id::new("vip-picker-escape");
+        let line = Rect::from_min_size(pos2(20.0, 20.0), vec2(260.0, 20.0));
+        let style = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
+        let mut picker = ContactPicker::default();
+        picker.request_focus();
+
+        // Frame 1: gain focus and type "nope".
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = picker.show(
+                ui,
+                id,
+                DialogInput::new(style, "Enter name"),
+                line,
+                Some(&book()),
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(picker.is_focused());
+        picker.text = "nope".into();
+        picker.suggest(Some(&book()));
+
+        // Frame 2: Escape hits begin_pass (which drops focus because escape filter is false),
+        // then exo_commands invokes PickerKey::Clear before show(). Focus must stay on picker.
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(picker.key(PickerKey::Clear), None);
+                let _ = picker.show(
+                    ui,
+                    id,
+                    DialogInput::new(style, "Enter name"),
+                    line,
+                    Some(&book()),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(picker.text().is_empty());
+        assert!(
+            picker.is_focused(),
+            "clearing text with Escape keeps focus in the picker"
         );
     }
 }

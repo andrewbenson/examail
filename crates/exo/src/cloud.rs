@@ -146,7 +146,8 @@ pub struct Access {
     /// Hands the account a settings merge: the settings as read, and as merged
     /// ([`crate::account::Account::start_cloud`] queues it behind the UI's own saves).
     /// Answers once the stored settings have it, and never when they couldn't be saved.
-    pub merge_settings: Box<dyn Fn(Value, Value) -> tokio::sync::oneshot::Receiver<()> + Send + Sync>,
+    pub merge_settings:
+        Box<dyn Fn(Value, Value) -> tokio::sync::oneshot::Receiver<()> + Send + Sync>,
 }
 
 /// Why a call to the service didn't go.
@@ -233,7 +234,10 @@ fn device_name() -> String {
 /// Why it couldn't, to show.
 pub async fn mint_mcp_token(keys: Keys) -> Result<(String, String), String> {
     let mut client = keys.client();
-    client.ensure_device().await.map_err(|failure| failure.to_string())?;
+    client
+        .ensure_device()
+        .await
+        .map_err(|failure| failure.to_string())?;
     let name = format!("Examail on {}", device_name());
     let answer = client
         .call(
@@ -255,7 +259,10 @@ pub async fn mint_mcp_token(keys: Keys) -> Result<(String, String), String> {
 /// Why it couldn't, to show.
 pub async fn revoke_mcp_tokens(keys: Keys) -> Result<(), String> {
     let mut client = keys.client();
-    client.ensure_device().await.map_err(|failure| failure.to_string())?;
+    client
+        .ensure_device()
+        .await
+        .map_err(|failure| failure.to_string())?;
     client
         .call(reqwest::Method::DELETE, "v1/mcp-tokens", None)
         .await

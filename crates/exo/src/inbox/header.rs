@@ -10,6 +10,8 @@ use exo_ui::{
 };
 use regex::Regex;
 
+use crate::triage_copy::{TriageAction, TriageRemind, TriageStrip};
+
 /// `padding: 32px … 20px` around a 24px line of tabs.
 pub(super) const HEIGHT: f32 = 76.0;
 /// A tab's name: 16px/24px.
@@ -371,98 +373,28 @@ pub(super) fn show(
                 action = Some(HeaderAction::ToggleSelectAll);
             }
             // The selection's actions: `padding-right: calc(2rem - 5px)`, `margin: -4px -4px 0 0`
-            // under the header's 32px top padding, buttons 2px down in their clickables.
-            let mut left = rect.right() - 2.0 * rem + 5.0 + 4.0;
-            // Their tooltips sit 10px right of centre.
-            let done_tooltip = if *done {
-                KeyTooltip {
-                    text: "Mark not Done",
-                    keys: &["shift", "E"],
-                }
-            } else {
-                KeyTooltip {
-                    text: "Mark Done",
-                    keys: &["E"],
-                }
-            };
-            let placement = Placement::Below {
-                gap: 8.0,
-                shift: 10.0,
-            };
-            // 24px boxes 4px apart, with the 14px glyphs 5px in and the 16×14 check 4px in, all
-            // 6px down (as Chromium lays them out, 1px under a row's).
-            let mut place = |inset: Vec2, size: Vec2| {
-                let hit =
-                    Rect::from_min_size(pos2(left - 24.0, rect.top() + 30.0), Vec2::splat(24.0));
-                left = hit.left() - 4.0;
-                (hit, Rect::from_min_size(hit.min + inset, size))
-            };
-            let (hit, glyph) = place(vec2(5.0, 6.0), Vec2::splat(14.0));
-            action = action.or(button(
-                hit,
-                glyph,
-                "legacy/DEPRECATED_threadActionsCommand",
-                None,
-                HeaderAction::Command,
-                KeyTooltip {
-                    text: "Examail Command",
-                    keys: &["⌘", "K"],
-                },
-                placement,
-            ));
-            if let Some(remind) = remind {
-                let (hit, glyph) = place(vec2(5.0, 6.0), Vec2::splat(14.0));
-                let icon = if remind.set {
-                    super::row::REMIND_SET_ICON
-                } else {
-                    super::row::REMIND_ICON
-                };
-                let mut button = IconButton::new(icon);
-                if remind.set {
-                    // With a reminder set, the clock's own colors.
-                    button = button.colors(
-                        Color32::from_rgb(0xe0, 0xbf, 0xe0),
-                        Color32::from_rgb(0xcd, 0x7a, 0xcf),
-                    );
-                }
-                let response = button.show(ui, id.with(icon), hit, glyph);
-                let tooltip = KeyTooltip {
-                    text: "Remind Me",
+            // under the header's 32px top padding, 24px boxes 4px apart with glyphs 6px down.
+            let (_, clicked) = (TriageStrip {
+                right: rect.right() - 2.0 * rem + 5.0 + 4.0,
+                top: rect.top() + 30.0,
+                done_width: 24.0,
+                done_inset: vec2(4.0, 6.0),
+                other_inset: vec2(5.0, 6.0),
+                done: view.archivable.then_some(*done),
+                remind: remind.as_ref().map(|remind| TriageRemind {
+                    set: remind.set,
+                    status: remind.status.as_deref(),
                     keys: &["H"],
-                };
-                match &remind.status {
-                    Some(status) => tooltip.show_at_with_status(
-                        ui,
-                        &response,
-                        placement,
-                        status,
-                        egui::Rangef::EVERYTHING,
-                    ),
-                    None => tooltip.show_at(ui, &response, placement),
-                }
-                if response.clicked() {
-                    action = Some(HeaderAction::Remind);
-                }
-            }
-            // A done selection's check is a done row's.
-            let (hit, glyph) = place(vec2(4.0, 6.0), vec2(16.0, 14.0));
-            let icon = super::row::DONE_ICON;
-            if *done {
-                let response = super::row::done_check(ui, id.with(icon), hit, glyph);
-                done_tooltip.show_at(ui, &response, placement);
-                if response.clicked() {
-                    action = action.or(Some(HeaderAction::Done));
-                }
-            } else {
-                action = action.or(button(
-                    hit,
-                    glyph,
-                    icon,
-                    None,
-                    HeaderAction::Done,
-                    done_tooltip,
-                    placement,
-                ));
+                    within: egui::Rangef::EVERYTHING,
+                }),
+            })
+            .show(ui, id);
+            if let Some(clicked) = clicked {
+                action = Some(match clicked {
+                    TriageAction::Done => HeaderAction::Done,
+                    TriageAction::Remind => HeaderAction::Remind,
+                    TriageAction::Command => HeaderAction::Command,
+                });
             }
         }
     }

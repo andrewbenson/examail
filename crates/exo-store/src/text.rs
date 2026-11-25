@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use toasty::Executor;
 
-use crate::db::{AttachmentRow, BodyRow, MessageRow, strings};
+use crate::db::{AttachmentRow, BodyRow, MessageRow, query_col};
 use crate::error::Result;
 use crate::ids::labels::DRAFT;
 use crate::model::Body;
@@ -94,13 +94,11 @@ impl Inner {
             return Ok(0);
         };
         let mut db = self.db.clone();
-        let due: Vec<String> = strings(
-            toasty::sql::query(DUE)
-                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-                .exec(&mut db)
-                .await?,
+        let due = query_col::<String>(
+            &mut db,
+            toasty::sql::query(DUE).bind(i64::try_from(limit).unwrap_or(i64::MAX)),
         )
-        .collect();
+        .await?;
         for thread in &due {
             let work = Work::read(&mut db, thread).await?;
             let mut texts = Vec::new();
@@ -284,11 +282,10 @@ impl Work {
     /// The messages of `thread` that have a body without visible text and didn't have a body
     /// when this was read.
     async fn bodied_since(&self, exec: &mut dyn Executor, thread: &str) -> Result<Vec<String>> {
-        let lacking = toasty::sql::query(LACKING)
-            .bind(thread.to_owned())
-            .exec(exec)
-            .await?;
-        Ok(strings(lacking)
+        let lacking =
+            query_col::<String>(exec, toasty::sql::query(LACKING).bind(thread.to_owned())).await?;
+        Ok(lacking
+            .into_iter()
             .filter(|id| !self.bodied.contains(id))
             .collect())
     }

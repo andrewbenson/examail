@@ -1,4 +1,4 @@
-//! Spelling in compose and the body's right-click menu, end to end on gmail-mock: a misspelled
+//! Spelling in compose and the body's right-click menu, end to end on mock-servers: a misspelled
 //! word's corrections, `Add to Dictionary`, the selection's `Search with Google`, `Paste` of a
 //! screenshot, and `Copy Image` of an inline image.
 

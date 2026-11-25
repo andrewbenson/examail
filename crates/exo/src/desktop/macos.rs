@@ -197,8 +197,10 @@ fn is_session_end(event: &NSAppleEventDescriptor) -> bool {
 /// turns `warning` off. Cancel, Escape included, leaves everything as it was, whatever the checkbox
 /// says.
 fn confirm_quit(app: &NSApplication, warning: &QuitWarning) -> bool {
-    // `activate` is new in macOS 14, and Exo runs on 13 (`LSMinimumSystemVersion`).
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "`activate` is new in macOS 14, and Exo runs on macOS 13 (`LSMinimumSystemVersion`)"
+    )]
     app.activateIgnoringOtherApps(true);
     let alert = NSAlert::new(app.mtm());
     alert.setAlertStyle(NSAlertStyle::Warning);
@@ -267,9 +269,11 @@ pub(super) fn crashed_repeatedly(gave_up: crate::recovery::GaveUp) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    // Bring Exo to the front, because the window may be closed or another app active. `activate` is
-    // new in macOS 14.
-    #[allow(deprecated)]
+    // Bring Exo to the front, because the window may be closed or another app active.
+    #[expect(
+        deprecated,
+        reason = "`activate` is new in macOS 14, and Exo runs on macOS 13"
+    )]
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
     let alert = NSAlert::new(mtm);
     // An error.
@@ -302,6 +306,9 @@ pub(super) fn terminate_soon() {
 
 /// A modal alert, on the main thread, with Exo in front (see [`super::ask`]).
 pub(super) fn ask(message: &str, detail: &str, buttons: &[&str]) -> Option<usize> {
+    if let Some(mtm) = MainThreadMarker::new() {
+        return alert_on_main(mtm, message, detail, buttons);
+    }
     let (message, detail) = (message.to_owned(), detail.to_owned());
     let buttons: Vec<String> = buttons.iter().map(|&button| button.to_owned()).collect();
     let (answer, answered) = std::sync::mpsc::channel();
@@ -309,20 +316,32 @@ pub(super) fn ask(message: &str, detail: &str, buttons: &[&str]) -> Option<usize
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
-        // Bring Exo to the front, because the window may be closed or another app active.
-        // `activate` is new in macOS 14.
-        #[allow(deprecated)]
-        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-        let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str(&message));
-        alert.setInformativeText(&NSString::from_str(&detail));
-        for button in &buttons {
-            alert.addButtonWithTitle(&NSString::from_str(button));
-        }
-        let chosen = alert.runModal() - NSAlertFirstButtonReturn;
-        let _ = answer.send(usize::try_from(chosen).ok());
+        let button_refs: Vec<&str> = buttons.iter().map(String::as_str).collect();
+        let _ = answer.send(alert_on_main(mtm, &message, &detail, &button_refs));
     });
     answered.recv().ok().flatten()
+}
+
+fn alert_on_main(
+    mtm: MainThreadMarker,
+    message: &str,
+    detail: &str,
+    buttons: &[&str],
+) -> Option<usize> {
+    // Bring Exo to the front, because the window may be closed or another app active.
+    #[expect(
+        deprecated,
+        reason = "`activate` is new in macOS 14, and Exo runs on macOS 13"
+    )]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(message));
+    alert.setInformativeText(&NSString::from_str(detail));
+    for button in buttons {
+        alert.addButtonWithTitle(&NSString::from_str(button));
+    }
+    let chosen = alert.runModal() - NSAlertFirstButtonReturn;
+    usize::try_from(chosen).ok()
 }
 
 /// What the observer tells the window.

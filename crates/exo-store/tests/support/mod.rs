@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use exo_store::{ListId, Options, Store, ThreadId, ThreadSummary};
 use gmail::{Format, ListQuery, TokenFuture, TokenProvider};
-use gmail_mock::{Config, DEV_ACCESS_TOKEN, MockServer};
+use mock_servers::{Config, DEV_ACCESS_TOKEN, MockServer};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -28,6 +28,9 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // A test process that was killed left its folders behind, and process ids come round
+        // again: one already here is a stale store, not this test's.
+        let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp dir");
         Self(path)
     }

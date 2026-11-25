@@ -420,10 +420,12 @@ fn zone_input(
         limit: ZONES,
         ink: palette.ink(0.8, 0.8),
         placeholder: palette.ink(0.35, 0.35),
+        show_rule: true,
         always_ruled: true,
         blur_on_pick: true,
         list_width: ZONE_LIST_WIDTH,
-        rows: super::share::ZoneRows::SIDEBAR,
+        list_offset: timezones::DEFAULT_LIST_OFFSET,
+        rows: timezones::ZoneRows::SIDEBAR,
     };
     zone.show(ui, &field).picked
 }

@@ -201,6 +201,35 @@ fn small_and_best_fit_resize_with_an_undo_step_each() {
 }
 
 #[test]
+fn fit_image_undo_restores_pre_resize_width_without_losing_prior_typing() {
+    let mut editor = with_screenshot();
+    // Type after the image without hitting a boundary (so the typing is un-snapshotted).
+    editor.type_text("!");
+    assert!(editor.html().contains("!<br>"), "{}", editor.html());
+    assert!(editor.html().contains("width: 400px;"), "{}", editor.html());
+    // Move left over `!` and focus the image, then resize to Small.
+    editor.press(Key::ArrowLeft, Modifiers::NONE);
+    editor.press(Key::ArrowLeft, Modifiers::NONE);
+    assert_eq!(editor.focused_image(), Some(Pos::new(0, 10)));
+    editor.fit_image(Fit::Small);
+    assert!(editor.html().contains("width: 200px;"), "{}", editor.html());
+    // First undo reverts only the resize, preserving `!`.
+    editor.undo();
+    assert!(
+        editor.html().contains("width: 400px;") && editor.html().contains("!<br>"),
+        "first undo should restore pre-resize width and keep `!`: {}",
+        editor.html()
+    );
+    // Second undo reverts `!`.
+    editor.undo();
+    assert!(
+        !editor.html().contains("!<br>"),
+        "second undo should revert prior typing: {}",
+        editor.html()
+    );
+}
+
+#[test]
 fn a_blocked_image_cant_be_focused() {
     let mut editor =
         Editor::from_html(r#"<div>a<img src="https://x.io/a.png" width="40" height="40"></div>"#);

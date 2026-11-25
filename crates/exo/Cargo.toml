@@ -33,17 +33,14 @@ fastframe-update = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 gmail = { workspace = true }
-html5ever = { workspace = true }
 icu_segmenter = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
 jiff = { workspace = true }
 log = { workspace = true }
-markup5ever_rcdom = { workspace = true }
 psl = { workspace = true }
 regex = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true }
 resvg = { workspace = true }
-ring = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls-webpki = { workspace = true }
 serde = { workspace = true }
@@ -55,6 +52,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
+x509-parser = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { workspace = true }
@@ -156,9 +154,11 @@ objc2-map-kit = { workspace = true }
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe"] }
-gmail-mock = { workspace = true }
+mock-servers = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 toasty = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

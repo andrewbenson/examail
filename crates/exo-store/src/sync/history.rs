@@ -56,6 +56,7 @@ impl Inner {
             return Ok(Some(Applied::default()));
         };
         let mut records: Vec<History> = Vec::new();
+        let mut response_history_id: Option<u64> = None;
         let (mut page_token, mut pages, mut changes) = (None, 0, 0);
         loop {
             let query = HistoryQuery {
@@ -84,6 +85,7 @@ impl Inner {
                 }
                 Err(failure) => return Err(failure.into()),
             };
+            response_history_id = response_history_id.max(page.history_id);
             pages += 1;
             changes += page
                 .history
@@ -105,15 +107,33 @@ impl Inner {
                 None => break,
             }
         }
-        let Some(cursor) = records.iter().filter_map(|record| record.id).max() else {
-            return Ok(Some(Applied::default()));
+        self.apply_history_records(&mut db, start, records, response_history_id)
+            .await
+            .map(Some)
+    }
+
+    async fn apply_history_records(
+        &self,
+        db: &mut toasty::Db,
+        start: u64,
+        records: Vec<History>,
+        response_history_id: Option<u64>,
+    ) -> Result<Applied> {
+        let Some(record_max) = records.iter().filter_map(|record| record.id).max() else {
+            if let Some(latest) = response_history_id.filter(|&id| id > start) {
+                let mut write = self.begin(db).await?;
+                db::kv_set(write.exec(), HISTORY_ID, &latest).await?;
+                write.commit().await?;
+            }
+            return Ok(Applied::default());
         };
+        let cursor = response_history_id.map_or(record_max, |id| id.max(record_max));
 
         // When history mentions a label created elsewhere, pick up its name and color first, so
         // that if this fails the next sync replays the same history and tries again.
         let known: HashSet<String> = LabelRow::all()
             .select(LabelRow::fields().id())
-            .exec(&mut db)
+            .exec(&mut *db)
             .await?
             .into_iter()
             .collect();
@@ -170,10 +190,10 @@ impl Inner {
         self.forget_drafts_gone(&undrafted).await?;
         // A reply that came in has called off an `if no reply` send.
         self.unschedule_replied(&touched).await?;
-        let mut write = self.begin(&mut db).await?;
+        let mut write = self.begin(db).await?;
         db::kv_set(write.exec(), HISTORY_ID, &cursor).await?;
         write.commit().await?;
-        Ok(Some(Applied { changed, arrived }))
+        Ok(Applied { changed, arrived })
     }
 
     /// Applies one thread's changes. Returns the messages history added that the store didn't
@@ -334,5 +354,56 @@ impl Drop for CaughtUp<'_> {
             caught_up: true,
             changes: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn empty_history_response_advances_stored_cursor() {
+        let dir =
+            std::env::temp_dir().join(format!("exo-empty-history-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("tok".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        db::kv_set(&mut db, HISTORY_ID, &500_u64)
+            .await
+            .expect("sets start");
+
+        // An older or equal response historyId never moves the cursor backwards.
+        let applied = store
+            .inner
+            .apply_history_records(&mut db, 500, Vec::new(), Some(450))
+            .await
+            .expect("applies");
+        assert_eq!(applied.changed, 0);
+        assert_eq!(
+            db::kv_get::<u64>(&mut db, HISTORY_ID).await.expect("reads"),
+            Some(500)
+        );
+
+        // An empty history response with a newer mailbox historyId persists the new cursor.
+        let applied = store
+            .inner
+            .apply_history_records(&mut db, 500, Vec::new(), Some(950))
+            .await
+            .expect("applies");
+        assert_eq!(applied.changed, 0);
+        assert_eq!(
+            db::kv_get::<u64>(&mut db, HISTORY_ID).await.expect("reads"),
+            Some(950)
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

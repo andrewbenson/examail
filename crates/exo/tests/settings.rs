@@ -155,11 +155,13 @@ fn an_accounts_theme_applies_as_its_mail_opens_before_any_frame() {
     // grant before the mail's first frame.
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let server = runtime
-        .block_on(gmail_mock::MockServer::start(gmail_mock::Config::default()))
+        .block_on(mock_servers::MockServer::start(
+            mock_servers::Config::default(),
+        ))
         .expect("mock starts");
     let dir = std::env::temp_dir().join(format!("exo-settings-launch-{}", std::process::id()));
     let email = "maya@brightmoor.co";
-    let token = || gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into());
+    let token = || gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into());
     runtime.block_on(async {
         let store = exo_store::Store::open(&dir, email, server.endpoints(), token())
             .await
@@ -186,7 +188,7 @@ fn an_accounts_theme_applies_as_its_mail_opens_before_any_frame() {
         &ctx,
         &exo::assets_dir(),
         account,
-        exo::Clock::fixed(gmail_mock::Config::default().now),
+        exo::Clock::fixed(mock_servers::Config::default().now),
     );
     assert_eq!(exo_ui::theme(&ctx), exo_ui::Theme::Carbon);
     let _ = std::fs::remove_dir_all(&dir);

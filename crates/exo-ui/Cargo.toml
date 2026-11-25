@@ -17,3 +17,6 @@ memmap2 = { workspace = true }
 skrifa = { workspace = true }
 thiserror = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[lints]
+workspace = true

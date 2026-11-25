@@ -1,5 +1,5 @@
 //! The Move and Label pickers and the label keys (`V`, `L`, `Y`, `[`, `]`, `⇧Y`), end to end
-//! on gmail-mock.
+//! on mock-servers.
 
 mod support;
 

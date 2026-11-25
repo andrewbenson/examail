@@ -47,11 +47,16 @@ pub(crate) struct Registry {
     accounts: Vec<Account>,
 }
 
+/// Canonical account key: trimmed ASCII lowercase.
+pub(crate) fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
 impl Registry {
     /// The list saved in `dir`, empty when there's none yet.
     pub(crate) fn load(dir: &Path) -> Result<Self, Error> {
         let path = dir.join(FILE_NAME);
-        let accounts = match std::fs::read(&path) {
+        let mut accounts: Vec<Account> = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| Error::Accounts {
                 path: path.clone(),
                 source: error.into(),
@@ -59,6 +64,12 @@ impl Registry {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(source) => return Err(Error::Accounts { path, source }),
         };
+        for account in &mut accounts {
+            account.email = normalize_email(&account.email);
+            for calendar in &mut account.calendars {
+                *calendar = normalize_email(calendar);
+            }
+        }
         Ok(Self { path, accounts })
     }
 
@@ -82,25 +93,31 @@ impl Registry {
     }
 
     /// Records a sign-in. A new account goes at the end, joined now. An account already listed
-    /// keeps its place, its color, its join date and whether it's the last used, and is signed in
-    /// again. Either way its name is Google's latest, and it becomes the one used last.
-    pub(crate) fn sign_in(&mut self, account: Account) -> Result<(), Error> {
+    /// keeps its place, its color and its join date, and is signed in again. Either way its name
+    /// is Google's latest, and it becomes the one used last.
+    pub(crate) fn sign_in(&mut self, mut account: Account) -> Result<(), Error> {
+        account.email = normalize_email(&account.email);
         let email = account.email.clone();
-        match self
-            .accounts
-            .iter_mut()
-            .find(|known| known.email == account.email)
-        {
+        let previous = self.accounts.clone();
+        match self.accounts.iter_mut().find(|known| known.email == email) {
             Some(known) => {
                 known.name = account.name;
                 known.signed_out = false;
             }
             None => self.accounts.push(Account {
+                signed_out: false,
                 joined: Some(jiff::Timestamp::now()),
                 ..account
             }),
         }
-        self.use_account(&email)
+        for known in &mut self.accounts {
+            known.last_used = known.email == email;
+        }
+        if let Err(error) = self.save() {
+            self.accounts = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Makes `email` the one used last.
@@ -352,5 +369,57 @@ mod tests {
             Registry::load(dir.path()),
             Err(Error::Accounts { .. })
         ));
+    }
+
+    #[test]
+    fn resigning_in_last_used_account_persists_state_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::load(dir.path()).unwrap();
+        registry
+            .sign_in(Account {
+                name: Some("Ada".into()),
+                ..account("a@x.com")
+            })
+            .unwrap();
+        registry.sign_out("a@x.com").unwrap();
+        assert!(registry.accounts()[0].last_used);
+        assert!(registry.accounts()[0].signed_out);
+
+        registry
+            .sign_in(Account {
+                name: Some("Ada Lovelace".into()),
+                ..account("a@x.com")
+            })
+            .unwrap();
+
+        let reloaded = Registry::load(dir.path()).unwrap();
+        assert_eq!(reloaded.accounts().len(), 1);
+        let a = &reloaded.accounts()[0];
+        assert!(!a.signed_out);
+        assert!(a.last_used);
+        assert_eq!(a.name.as_deref(), Some("Ada Lovelace"));
+    }
+
+    #[test]
+    fn sign_in_rolls_back_in_memory_state_when_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::load(dir.path()).unwrap();
+        registry
+            .sign_in(Account {
+                name: Some("Ada".into()),
+                ..account("a@x.com")
+            })
+            .unwrap();
+        registry.sign_out("a@x.com").unwrap();
+        let before = registry.accounts().to_vec();
+
+        // Block writes to the partial file so `save()` fails.
+        std::fs::create_dir(dir.path().join("accounts.json.partial")).unwrap();
+        let result = registry.sign_in(Account {
+            name: Some("Ada Lovelace".into()),
+            ..account("a@x.com")
+        });
+        assert!(matches!(result, Err(Error::Accounts { .. })));
+        assert_eq!(registry.accounts(), before.as_slice());
     }
 }

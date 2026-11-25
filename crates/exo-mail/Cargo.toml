@@ -16,12 +16,9 @@ blitz-html = { workspace = true }
 blitz-paint = { workspace = true }
 blitz-traits = { workspace = true }
 exo-fonts = { workspace = true }
-fancy-regex = { workspace = true }
 gif = { workspace = true }
-gmail = { workspace = true }
 html5ever = { workspace = true }
 image = { workspace = true, features = ["gif", "webp"] }
-log = { workspace = true }
 markup5ever_rcdom = { workspace = true }
 parley = { workspace = true }
 peniko = { workspace = true }
@@ -33,5 +30,9 @@ url = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+gmail = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

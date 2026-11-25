@@ -450,7 +450,7 @@ fn focus_bar(ui: &Ui, rect: Rect, color: Color32, id: &str, focused: bool) {
 /// for someone you know.
 fn name(contact: &Contact, spam: bool) -> String {
     if spam {
-        names::display_name(&person(contact), false, NameFormat::Full, false)
+        names::display_name(&person_of(contact), false, NameFormat::Full, false)
     } else {
         named(contact, NameFormat::First)
     }
@@ -458,14 +458,24 @@ fn name(contact: &Contact, spam: bool) -> String {
 
 /// [`name`] in `format`.
 fn named(contact: &Contact, format: NameFormat) -> String {
-    names::display_name(&person(contact), contact.is_me, format, false)
+    names::display_name(&person_of(contact), contact.is_me, format, false)
 }
 
-fn person(contact: &Contact) -> Person {
+/// Converts a stored [`Contact`] into a [`Person`] for display formatting.
+pub(crate) fn person_of(contact: &Contact) -> Person {
     Person::new(
         contact.name.clone().unwrap_or_default(),
         contact.email.clone(),
     )
+}
+
+/// A contact's non-empty display name, or their address when they have none.
+pub(crate) fn contact_title(contact: &Contact) -> &str {
+    contact
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&contact.email)
 }
 
 /// Whether the conversation is spam, which its headers name everyone in full for.
@@ -814,27 +824,6 @@ fn has_reply_all(message: &MessageDetail) -> bool {
     people.len() > 1
 }
 
-/// The snippet up to a signature line or a quote header.
-fn clean_snippet(text: &str) -> &str {
-    use std::sync::LazyLock;
-    static CUTS: LazyLock<[regex::Regex; 4]> = LazyLock::new(|| {
-        [r"[^a-zA-Z0-9]+You are receiving this", r"Sent (using|with|from|via) ", r"On ((Mon|Tue|Wed|Thu|Fri|Sat|Sun), )?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", r"\s?\{#HS:[\d-]+#\}\s?"].map(|pattern| regex::Regex::new(pattern).expect("valid regex"))
-    });
-    let mut text = text
-        .split("----")
-        .next()
-        .unwrap_or_default()
-        .split("____")
-        .next()
-        .unwrap_or_default();
-    for cut in CUTS.iter() {
-        if let Some(found) = cut.find(text) {
-            text = &text[..found.start()];
-        }
-    }
-    text
-}
-
 /// A collapsed row.
 #[expect(
     clippy::too_many_arguments,
@@ -981,7 +970,9 @@ pub(super) fn snippet(
 /// A body's snippet before it's cut to fit: its text up to the quote, whitespace collapsed.
 pub(super) fn snippet_text(facts: Option<&Facts>) -> String {
     facts
-        .map(|facts| measure::normalize_whitespace(clean_snippet(&facts.snippet)))
+        .map(|facts| {
+            measure::normalize_whitespace(crate::format::row::clean_snippet(&facts.snippet))
+        })
         .unwrap_or_default()
 }
 
@@ -1496,6 +1487,33 @@ pub(super) fn failed_tooltip(
     }
 }
 
+/// Appends `contacts` to `job`, separated by `, ` in `comma_color`, each formatted as
+/// `Name <address>` (name in `name_color`, ` <address>` in `email_color`) or `address` alone in
+/// `name_color`.
+pub(crate) fn append_contacts<'a>(
+    job: &mut egui::text::LayoutJob,
+    contacts: impl IntoIterator<Item = &'a Contact>,
+    style: &TextStyle,
+    name_color: Color32,
+    email_color: Color32,
+    comma_color: Color32,
+) {
+    for (at, person) in contacts.into_iter().enumerate() {
+        if at > 0 {
+            job.append(", ", 0.0, style.format(comma_color));
+        }
+        let title = contact_title(person);
+        job.append(title, 0.0, style.format(name_color));
+        if person.name.as_deref().is_some_and(|name| !name.is_empty()) {
+            job.append(
+                &format!(" <{}>", person.email),
+                0.0,
+                style.format(email_color),
+            );
+        }
+    }
+}
+
 /// A full header row's people, comma-separated after the label's column and wrapped at `width`.
 /// Each is a name and ` <address>`, or the address alone. Names and lone addresses are in
 /// `contact`, and the rest is in `label`.
@@ -1506,18 +1524,7 @@ pub(crate) fn header_job(
     contact: Color32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    for (at, person) in contacts.iter().enumerate() {
-        if at > 0 {
-            job.append(", ", 0.0, HEADER.format(label));
-        }
-        match person.name.as_deref().filter(|name| !name.is_empty()) {
-            Some(name) => {
-                job.append(name, 0.0, HEADER.format(contact));
-                job.append(&format!(" <{}>", person.email), 0.0, HEADER.format(label));
-            }
-            None => job.append(&person.email, 0.0, HEADER.format(contact)),
-        }
-    }
+    append_contacts(&mut job, contacts, &HEADER, contact, label, label);
     if let Some(first) = job.sections.first_mut() {
         first.leading_space = HEADER_LABEL;
     }
@@ -1862,9 +1869,12 @@ mod tests {
     #[test]
     fn snippets_stop_at_quote_headers() {
         assert_eq!(
-            clean_snippet("Sounds good. On Mon, Nov 16 Tom wrote: …"),
+            crate::format::row::clean_snippet("Sounds good. On Mon, Nov 16 Tom wrote: …"),
             "Sounds good. "
         );
-        assert_eq!(clean_snippet("Thanks!\n----\nMaya"), "Thanks!\n");
+        assert_eq!(
+            crate::format::row::clean_snippet("Thanks!\n----\nMaya"),
+            "Thanks!\n"
+        );
     }
 }

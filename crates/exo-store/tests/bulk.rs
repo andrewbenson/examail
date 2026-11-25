@@ -1,4 +1,4 @@
-//! Bulk relabels and sender filters, against gmail-mock.
+//! Bulk relabels and sender filters, against mock-servers.
 
 mod support;
 
@@ -731,4 +731,109 @@ async fn the_log_keeps_a_week_of_bulk_actions_with_what_they_changed() {
     )
     .expect("dates it");
     assert!(harness.store.bulk_log().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn select_all_preserves_subsecond_arrivals_after_cutoff_and_filters_search_by_cutoff() {
+    let harness = Harness::synced().await;
+    let cutoff: jiff::Timestamp = "2026-11-18T10:00:00.200Z".parse().unwrap();
+    let later_same_second: jiff::Timestamp = "2026-11-18T10:00:00.750Z".parse().unwrap();
+
+    harness
+        .admin(
+            reqwest::Method::POST,
+            "/__mock/clock",
+            serde_json::json!({ "now": cutoff.to_string() }),
+        )
+        .await;
+    let at_cutoff = harness
+        .deliver(serde_json::json!({
+            "from": format!("Tom <{SENDER}>"),
+            "subject": "At cutoff",
+            "text": "Should be archived",
+            "labelIds": ["INBOX", "UNREAD"],
+        }))
+        .await
+        .thread_id
+        .unwrap();
+    harness.store.sync().await.unwrap();
+
+    // Another message arrives 550 ms later in the SAME epoch second, before Exo has synced it!
+    harness
+        .admin(
+            reqwest::Method::POST,
+            "/__mock/clock",
+            serde_json::json!({ "now": later_same_second.to_string() }),
+        )
+        .await;
+    let unseen_subsecond = harness
+        .deliver(serde_json::json!({
+            "from": format!("Tom <{SENDER}>"),
+            "subject": "Subsecond arrival",
+            "text": "Arrived after cutoff within same second",
+            "labelIds": ["INBOX", "UNREAD"],
+        }))
+        .await
+        .thread_id
+        .unwrap();
+
+    let target = BulkTarget {
+        list: Some(ListCutoff {
+            scope: Scope::List(ListId::Inbox),
+            filter: None,
+            keep: Vec::new(),
+            before: cutoff,
+        }),
+        ..BulkTarget::default()
+    };
+    let mut done = Relabelled::default();
+    harness
+        .store
+        .bulk(
+            &target,
+            &Mutation::MarkDone,
+            &Progress::default(),
+            &mut done,
+        )
+        .await
+        .unwrap();
+
+    let inbox_after = harness.ids(&ListId::Inbox).await;
+    assert!(
+        !inbox_after.contains(&at_cutoff),
+        "thread at cutoff was archived"
+    );
+    assert!(
+        inbox_after.contains(&unseen_subsecond),
+        "thread arriving 550ms after cutoff in the same second was NOT bulk-archived unseen"
+    );
+
+    // Now sync so `unseen_subsecond` is stored locally, and run a `Scope::Search` select-all with
+    // `before = cutoff`: `listed_by` must also exclude stored search hits newer than `cutoff`!
+    let mut search_done = Relabelled::default();
+    let search_target = BulkTarget {
+        list: Some(ListCutoff {
+            scope: Scope::Search(format!("from:{SENDER}")),
+            filter: None,
+            keep: Vec::new(),
+            before: cutoff,
+        }),
+        ..BulkTarget::default()
+    };
+    harness
+        .store
+        .bulk(
+            &search_target,
+            &Mutation::Star,
+            &Progress::default(),
+            &mut search_done,
+        )
+        .await
+        .unwrap();
+    let starred = harness.ids(&ListId::Starred).await;
+    assert!(starred.contains(&at_cutoff));
+    assert!(
+        !starred.contains(&unseen_subsecond),
+        "stored search thread newer than cutoff is left alone"
+    );
 }

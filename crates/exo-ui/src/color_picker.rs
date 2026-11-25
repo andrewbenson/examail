@@ -100,7 +100,9 @@ impl ColorPicker<'_> {
         egui::Area::new(id)
             .order(egui::Order::Tooltip)
             .fixed_pos(rect.min)
+            .constrain(false)
             .show(ctx, |ui| {
+                let _ = ui.allocate_rect(rect, Sense::click());
                 let painter = ui.painter();
                 crate::paint_tooltip_box(painter, rect);
                 for (index, color) in self.colors.iter().enumerate() {
@@ -230,6 +232,67 @@ mod tests {
                 picker_key(PickerKey::Down, 1, 0, 4, 4)
             ),
             (PickerMove::Preview(1), PickerMove::Preview(1))
+        );
+    }
+
+    #[test]
+    fn clicking_picker_padding_blocks_click_through_to_controls_behind() {
+        let ctx = Context::default();
+        let colors = [Color32::RED, Color32::GREEN, Color32::BLUE, Color32::YELLOW];
+        let picker = ColorPicker {
+            colors: &colors,
+            per_row: 2,
+            chosen: Some(0),
+            padding_bottom: 6.0,
+        };
+        let at = pos2(40.0, 40.0);
+        let behind_rect = Rect::from_min_size(at, picker.size());
+        // Click in the 3px horizontal gap between disc 0 (47..79) and disc 1 (82..114).
+        let gap = pos2(
+            at.x + PADDING.x + DISC + GAP.x / 2.0,
+            at.y + PADDING.y + 10.0,
+        );
+        let run = |events: Vec<egui::Event>| -> (Picked, bool) {
+            let mut picked = Picked::Nothing;
+            let mut behind_clicked = false;
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    behind_clicked = ui
+                        .interact(behind_rect, Id::new("behind-button"), Sense::click())
+                        .clicked();
+                    picked = picker.show(ui.ctx(), Id::new("color-picker"), at, Rect::NOTHING);
+                },
+            )
+            .drop_without_applying_deltas();
+            (picked, behind_clicked)
+        };
+
+        // Two priming frames: frame 1 sizes the Area, frame 2 marks it interactable in Areas.
+        let _ = run(vec![]);
+        let _ = run(vec![]);
+        let _ = run(vec![
+            egui::Event::PointerMoved(gap),
+            egui::Event::PointerButton {
+                pos: gap,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (picked, behind_clicked) = run(vec![egui::Event::PointerButton {
+            pos: gap,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(picked, Picked::Nothing);
+        assert!(
+            !behind_clicked,
+            "clicking gap inside ColorPicker must not click through to controls behind"
         );
     }
 }

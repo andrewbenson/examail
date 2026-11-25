@@ -233,7 +233,10 @@ pub(crate) async fn run(
         };
         let settings: Settings = match store.settings().await {
             Ok(settings) => settings,
-            Err(error) => return log::warn!("calendar notifications stop: {error}"),
+            Err(error) => {
+                log::warn!("reading settings for calendar notifications: {error}");
+                continue;
+            }
         };
         let calendars = calendars(&settings);
         let (now, tz) = (Timestamp::now(), TimeZone::system());
@@ -253,7 +256,10 @@ pub(crate) async fn run(
         }
         let events = match store.events(&calendars, days, &tz).await {
             Ok(events) => events,
-            Err(error) => return log::warn!("calendar notifications stop: {error}"),
+            Err(error) => {
+                log::warn!("reading events for calendar notifications: {error}");
+                continue;
+            }
         };
         let lead = SignedDuration::from_secs(settings.notifications.calendar_events.lead_time());
         shown.retain(|_, start| now <= *start + LATE);
@@ -512,6 +518,27 @@ mod tests {
         );
         assert_eq!(provider(json!({}), "sip"), Some("Phone"));
         assert_eq!(provider(json!({}), "more"), None);
+
+        // Phone-only and SIP-only conferences produce Join meeting buttons with valid tel:/sip: URIs.
+        for (kind, uri) in [
+            ("phone", "tel:+1-555-0100"),
+            ("sip", "sip:123456@myprovider.com"),
+        ] {
+            let mut dial = stored("2026-11-17T10:00", "2026-11-17T10:30");
+            dial.event.conference_data = Some(json!({
+                "entryPoints": [{ "entryPointType": kind, "uri": uri }],
+            }));
+            let [reminder] = reminders(&dial, lead(), ME).try_into().expect("one");
+            let notice = super::notice(&reminder, ME, reminder.at + 1.second(), &tz());
+            let Some(Click {
+                open: Open::Event { url: Some(got), .. },
+                ..
+            }) = notice.button
+            else {
+                panic!("Join meeting button for {kind}");
+            };
+            assert_eq!(super::super::meeting_uri(&got).as_deref(), Some(uri));
+        }
     }
 
     #[test]

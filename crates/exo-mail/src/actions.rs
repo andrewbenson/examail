@@ -126,7 +126,7 @@ fn action(node: &NodeRef, tag: &str) -> Option<Action> {
 /// An `ld+json` script's action (one with a `@context` of `http://schema.org…` and a
 /// `potentialAction` or `action`).
 fn ld_json(node: &NodeRef) -> Option<Action> {
-    let text = dom::text_content(&dom::parse(&dom::text_content(node)));
+    let text = dom::html_text(&dom::text_content(node));
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let valid = |item: &serde_json::Value| {
         item["@context"]

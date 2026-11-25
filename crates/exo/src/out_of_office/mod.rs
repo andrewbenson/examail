@@ -12,8 +12,6 @@ mod date_input;
 mod dialog;
 mod spelling;
 
-use std::sync::{Arc, Mutex};
-
 use egui::{Context, Rect};
 use exo_commands::{Command, Commands, Region, Toast};
 use exo_editor::FormatCommand;
@@ -67,6 +65,7 @@ pub enum AlertEvent {
 enum Outcome {
     /// Gmail's responder, read for the dialog or on the hour, or `Err` when it couldn't be.
     Read {
+        generation: u64,
         settings: Result<VacationSettings, ()>,
         dialog: bool,
     },
@@ -81,8 +80,9 @@ enum Outcome {
 pub(crate) struct OutOfOffice {
     dialog: Option<dialog::Dialog>,
     alert: Option<(Alert, usize)>,
-    /// Answers from the account's runtime.
-    outcomes: Arc<Mutex<Vec<Outcome>>>,
+    /// Monotonic generation bumped on every read and save so out-of-order reads never overwrite
+    /// newer state.
+    read_generation: u64,
     /// When (in egui's time) Gmail and the calendar were last asked.
     read_at: Option<f64>,
     events_at: Option<f64>,
@@ -116,28 +116,12 @@ pub(crate) fn register(commands: &mut Commands<commands::Action>, state: &OutOfO
             .icon("data/settings"),
     );
     if state.alert.is_some() {
-        const ALERT: &[Region] = &[Region::Alert];
-        let key = |id: &'static str, event: AlertEvent, keys: &[&'static str]| {
-            Command::shortcut(id, act(Action::Alert(event)))
-                .keys(keys.iter().copied())
-                .regions(ALERT)
-        };
-        commands.add(key(
-            "OOO_ALERT_CONFIRM",
-            AlertEvent::Confirm,
-            &["enter", "mod+enter", "space"],
-        ));
-        commands.add(key("OOO_ALERT_ESCAPE", AlertEvent::Dismiss, &["esc"]));
-        commands.add(key(
-            "OOO_ALERT_NEXT",
-            AlertEvent::Cycle(-1),
-            &["right", "tab"],
-        ));
-        commands.add(key(
-            "OOO_ALERT_PREVIOUS",
-            AlertEvent::Cycle(1),
-            &["left", "shift+tab"],
-        ));
+        crate::notice::register_alert_keys(
+            commands,
+            act(Action::Alert(AlertEvent::Confirm)),
+            act(Action::Alert(AlertEvent::Dismiss)),
+            |step| act(Action::Alert(AlertEvent::Cycle(step))),
+        );
         return;
     }
     let Some(dialog) = state.dialog.as_ref().filter(|dialog| dialog.open) else {
@@ -200,20 +184,9 @@ pub(crate) fn register(commands: &mut Commands<commands::Action>, state: &OutOfO
 }
 
 impl Mail {
-    /// What Gmail and Calendar answered since last frame, the polls that are due, and the
-    /// nudge. Call each frame before drawing.
+    /// The polls that are due, and the nudge. Call each frame before drawing.
     pub(crate) fn out_of_office_frame(&mut self, ctx: &Context) {
         let time = ctx.input(|input| input.time);
-        let outcomes = std::mem::take(
-            &mut *self
-                .out_of_office
-                .outcomes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for outcome in outcomes {
-            self.out_of_office_outcome(outcome);
-        }
         if self
             .out_of_office
             .read_at
@@ -251,31 +224,31 @@ impl Mail {
     }
 
     /// Asks Gmail for its responder.
-    fn read_vacation(&self, for_dialog: bool) {
-        let outcomes = self.out_of_office.outcomes.clone();
-        let ctx = self.ctx.clone();
+    fn read_vacation(&mut self, for_dialog: bool) {
+        self.out_of_office.read_generation += 1;
+        let generation = self.out_of_office.read_generation;
+        self.out_of_office.read_at = Some(self.ctx.input(|input| input.time));
+        let ui = self.ui_sender();
         self.account.loader().run(
             |store| async move { store.vacation().await },
             move |result| {
                 if let Err(error) = &result {
                     log::info!("reading the vacation responder: {error}");
                 }
-                push(
-                    &outcomes,
-                    &ctx,
-                    Outcome::Read {
+                ui.send(move |mail| {
+                    mail.out_of_office_outcome(Outcome::Read {
+                        generation,
                         settings: result.map_err(drop),
                         dialog: for_dialog,
-                    },
-                );
+                    });
+                });
             },
         );
     }
 
     /// Asks Calendar for the primary calendar's events coming up.
     fn read_events(&self) {
-        let outcomes = self.out_of_office.outcomes.clone();
-        let ctx = self.ctx.clone();
+        let ui = self.ui_sender();
         let from = self.now.timestamp();
         self.account.loader().run(
             move |store| async move {
@@ -284,7 +257,9 @@ impl Mail {
                     .await
             },
             move |result| match result {
-                Ok(events) => push(&outcomes, &ctx, Outcome::Events(events)),
+                Ok(events) => ui.send(move |mail| {
+                    mail.out_of_office_outcome(Outcome::Events(events));
+                }),
                 Err(error) => log::info!("looking for out-of-office events: {error}"),
             },
         );
@@ -293,7 +268,14 @@ impl Mail {
     fn out_of_office_outcome(&mut self, outcome: Outcome) {
         let now = self.now.clone();
         match outcome {
-            Outcome::Read { settings, dialog } => {
+            Outcome::Read {
+                generation,
+                settings,
+                dialog,
+            } => {
+                if generation < self.out_of_office.read_generation {
+                    return;
+                }
                 if let Ok(settings) = &settings {
                     let copy = OutOfOfficeResponder::synced(
                         settings,
@@ -323,13 +305,14 @@ impl Mail {
                 }
             }
             Outcome::Saved(result) => {
-                let Some(open) = self.out_of_office.dialog.as_mut() else {
-                    return;
-                };
-                open.submitting = false;
+                if let Some(open) = self.out_of_office.dialog.as_mut() {
+                    open.submitting = false;
+                }
                 match result {
                     Ok(kept) => {
-                        open.open = false;
+                        if let Some(open) = self.out_of_office.dialog.as_mut() {
+                            open.open = false;
+                        }
                         let copy = OutOfOfficeResponder::of(&kept, now.timestamp());
                         self.account.update_settings(|account| {
                             account.out_of_office_responder = Some(copy)
@@ -340,7 +323,11 @@ impl Mail {
                             commands::Action::OutOfOffice(Action::Open),
                         ));
                     }
-                    Err(()) => self.out_of_office.alert = Some((Alert::SaveFailed, 0)),
+                    Err(()) => {
+                        if self.out_of_office.dialog.is_some() {
+                            self.out_of_office.alert = Some((Alert::SaveFailed, 0));
+                        }
+                    }
                 }
             }
             Outcome::Events(events) => {
@@ -460,7 +447,7 @@ impl Mail {
                 let count = alert.actions().len();
                 match event {
                     AlertEvent::Cycle(step) => {
-                        *selected = (*selected as isize + step).rem_euclid(count as isize) as usize
+                        *selected = exo_ui::Alert::move_selection(*selected, count, step, true)
                     }
                     AlertEvent::Confirm => {
                         let selected = *selected;
@@ -510,18 +497,24 @@ impl Mail {
                     open.open = false;
                 }
             }
-            Some(DialogEvent::Save) if !open.save_disabled() => {
+            Some(DialogEvent::Save) => {
+                open.commit_dates(&now);
+                if open.save_disabled() {
+                    return;
+                }
                 open.submitting = true;
                 let settings = open.vacation();
-                let outcomes = self.out_of_office.outcomes.clone();
-                let ctx = self.ctx.clone();
+                self.out_of_office.read_generation += 1;
+                let ui = self.ui_sender();
                 self.account.loader().run(
                     |store| async move { store.update_vacation(&settings).await },
                     move |result| {
                         if let Err(error) = &result {
                             log::warn!("saving the vacation responder: {error}");
                         }
-                        push(&outcomes, &ctx, Outcome::Saved(result.map_err(drop)));
+                        ui.send(move |mail| {
+                            mail.out_of_office_outcome(Outcome::Saved(result.map_err(drop)));
+                        });
                     },
                 );
             }
@@ -593,18 +586,7 @@ impl Mail {
         let Some((alert, selected)) = self.out_of_office.alert.as_mut() else {
             return;
         };
-        let selected = *selected;
-        let shown = egui::Area::new(exo_ui::id(&ctx, "out-of-office-alert"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(page.min)
-            .show(&ctx, |ui| {
-                // The overlay: the page dimmed to half, nothing behind it clickable.
-                ui.painter()
-                    .rect_filled(page, 0.0, egui::Color32::from_black_alpha(128));
-                let _ = ui.allocate_rect(page, egui::Sense::click());
-                alert.show(ui, page, selected, &tz)
-            });
-        let (clicked, link) = shown.inner;
+        let (clicked, link) = alert.show_modal(&ctx, page, *selected, &tz);
         if link && let Some(url) = alert.link() {
             self.open_url(&url);
         }
@@ -649,11 +631,114 @@ impl Mail {
     }
 }
 
-/// Hands `outcome` to the UI thread and wakes it.
-fn push(outcomes: &Mutex<Vec<Outcome>>, ctx: &Context, outcome: Outcome) {
-    outcomes
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(outcome);
-    ctx.request_repaint();
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        Clock,
+        account::{Account, Credentials},
+    };
+
+    fn test_mail(name: &str) -> (Mail, std::path::PathBuf) {
+        let ctx = egui::Context::default();
+        let _ = exo_ui::install(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "exo-ooo-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = Account::open(
+            &dir,
+            Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let mail = Mail::new(&ctx, &crate::assets_dir(), account, Clock::system());
+        (mail, dir)
+    }
+
+    #[test]
+    fn saved_outcome_updates_account_responder_even_when_dialog_already_closed() {
+        let (mut mail, dir) = test_mail("saved-closed");
+        assert!(mail.out_of_office.dialog.is_none());
+
+        let kept = VacationSettings {
+            enable_auto_reply: Some(true),
+            response_subject: Some("Away".into()),
+            response_body_html: Some("<div>Back Monday</div>".into()),
+            ..VacationSettings::default()
+        };
+        mail.out_of_office_outcome(Outcome::Saved(Ok(kept)));
+
+        let saved = mail
+            .account
+            .settings()
+            .out_of_office_responder
+            .as_ref()
+            .expect("responder saved even with dialog closed");
+        assert!(saved.is_enabled());
+        assert_eq!(saved.google.response_subject, "Away");
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_read_generation_cannot_overwrite_newer_responder_state() {
+        let (mut mail, dir) = test_mail("stale-gen");
+        mail.out_of_office.read_generation = 2;
+
+        let fresh = VacationSettings {
+            enable_auto_reply: Some(true),
+            response_subject: Some("Fresh".into()),
+            response_body_html: Some("<div>Fresh</div>".into()),
+            ..VacationSettings::default()
+        };
+        mail.out_of_office_outcome(Outcome::Read {
+            generation: 2,
+            settings: Ok(fresh),
+            dialog: false,
+        });
+        assert_eq!(
+            mail.account
+                .settings()
+                .out_of_office_responder
+                .as_ref()
+                .map(|r| r.google.response_subject.as_str()),
+            Some("Fresh")
+        );
+
+        let stale = VacationSettings {
+            enable_auto_reply: Some(false),
+            response_subject: Some("Stale".into()),
+            response_body_html: Some("<div>Stale</div>".into()),
+            ..VacationSettings::default()
+        };
+        mail.out_of_office_outcome(Outcome::Read {
+            generation: 1,
+            settings: Ok(stale),
+            dialog: false,
+        });
+        assert_eq!(
+            mail.account
+                .settings()
+                .out_of_office_responder
+                .as_ref()
+                .map(|r| (r.is_enabled(), r.google.response_subject.as_str())),
+            Some((true, "Fresh")),
+            "out-of-order read with lower generation must be ignored"
+        );
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

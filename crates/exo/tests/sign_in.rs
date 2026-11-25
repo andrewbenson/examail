@@ -1,6 +1,6 @@
 //! Signing in and out, switching and adding accounts, what Exo opens on launch, and the
 //! teardowns for a store that can't be opened, end to end. The tests run the app on an in-process
-//! gmail-mock (its OAuth endpoints too, where a `login_hint` signs in another address on its
+//! mock-servers (its OAuth endpoints too, where a `login_hint` signs in another address on its
 //! mailbox), with refresh tokens in memory and a scripted browser.
 
 use std::{
@@ -34,10 +34,10 @@ const BUTTON: Pos2 = pos2(640.0, 440.0);
 /// A 60 fps frame.
 const FRAME: f64 = 1.0 / 60.0;
 
-/// A Mac Exo runs on: a gmail-mock, a state folder and the Keychain (in memory).
+/// A Mac Exo runs on: a mock server, a state folder and the Keychain (in memory).
 struct Device {
     runtime: tokio::runtime::Runtime,
-    server: gmail_mock::MockServer,
+    server: mock_servers::MockServer,
     dir: PathBuf,
     secrets: Arc<MemorySecrets>,
 }
@@ -51,25 +51,25 @@ impl Drop for Device {
 impl Device {
     /// A fresh device. `name` keeps concurrent tests' folders apart.
     fn new(name: &str) -> Self {
-        Self::on(name, gmail_mock::Config::default())
+        Self::on(name, mock_servers::Config::default())
     }
 
     /// A fresh device whose Google account has a profile photo of its own.
     fn with_photo(name: &str) -> Self {
         Self::on(
             name,
-            gmail_mock::Config {
+            mock_servers::Config {
                 photo: true,
-                ..gmail_mock::Config::default()
+                ..mock_servers::Config::default()
             },
         )
     }
 
     /// A fresh device on a mock made from `config`.
-    fn on(name: &str, config: gmail_mock::Config) -> Self {
+    fn on(name: &str, config: mock_servers::Config) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let server = runtime
-            .block_on(gmail_mock::MockServer::start(config))
+            .block_on(mock_servers::MockServer::start(config))
             .expect("mock starts");
         let dir = std::env::temp_dir().join(format!("exo-sign-in-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -128,7 +128,7 @@ impl Device {
         self.fault(serde_json::json!({ "method": "POST", "path": "/gmail/v1/users/me/", "status": 503, "times": 100_000 }));
     }
 
-    /// Arms a gmail-mock fault (`/__mock/faults`).
+    /// Arms a mock server fault (`/__mock/faults`).
     fn fault(&self, fault: serde_json::Value) {
         let url = self.server.url().join("/__mock/faults").unwrap();
         self.runtime
@@ -176,7 +176,7 @@ impl Device {
     fn launch_with(&self, sign_in: SignIn) -> Harness<'static, App> {
         self.launch_at(
             sign_in,
-            exo::Clock::fixed(gmail_mock::Config::default().now),
+            exo::Clock::fixed(mock_servers::Config::default().now),
         )
     }
 
@@ -689,7 +689,7 @@ fn signing_out_with_unsent_changes_asks_first() {
     // The change was dropped with the account, not sent on its way out.
     let gmail = gmail::Client::new(
         device.server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let thread = device
         .runtime
@@ -1217,7 +1217,7 @@ fn the_accounts_dialog_reorders_colors_signs_out_and_adds() {
 fn sent(device: &Device, subject: &str) -> usize {
     let gmail = gmail::Client::new(
         device.server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let query = gmail::ListQuery {
         q: Some(format!("subject:\"{subject}\" in:sent")),
@@ -1235,7 +1235,7 @@ fn sent(device: &Device, subject: &str) -> usize {
 fn gmail_messages(device: &Device, query: &str) -> Vec<(String, String)> {
     let gmail = gmail::Client::new(
         device.server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let list = gmail::ListQuery {
         q: Some(query.into()),
@@ -1269,7 +1269,7 @@ fn gmail_messages(device: &Device, query: &str) -> Vec<(String, String)> {
 fn gmail_drafts(device: &Device, query: &str) -> Vec<(String, String)> {
     let gmail = gmail::Client::new(
         device.server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let list = gmail::DraftQuery {
         q: Some(query.into()),
@@ -1725,7 +1725,7 @@ fn a_reminder_off_screen_comes_back_and_notifies() {
     let device = Device::new("off-screen-reminder");
     device.sign_in_as(Some(BEA));
     device.sign_in();
-    let now = Arc::new(Mutex::new(gmail_mock::Config::default().now));
+    let now = Arc::new(Mutex::new(mock_servers::Config::default().now));
     let clock = {
         let now = now.clone();
         exo::Clock::new(move || now.lock().unwrap().clone())
@@ -1915,7 +1915,7 @@ fn a_newer_exos_store_is_cleared_keeping_what_gmail_doesnt_have() {
             device.stores(),
             EMAIL,
             device.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         )
         .await
         .expect("opens");
@@ -1940,7 +1940,7 @@ fn a_newer_exos_store_is_cleared_keeping_what_gmail_doesnt_have() {
             device.stores(),
             EMAIL,
             device.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         )
         .await
         .expect("opens");
@@ -2210,10 +2210,10 @@ fn the_accounts_photo_shows_in_the_drawer_the_dialog_and_the_palette() {
 fn the_initial_shows_until_the_photo_comes_and_when_google_has_none() {
     let device = Device::on(
         "photo-loading",
-        gmail_mock::Config {
+        mock_servers::Config {
             photo: true,
             latency: Duration::from_millis(500),
-            ..gmail_mock::Config::default()
+            ..mock_servers::Config::default()
         },
     );
     device.sign_in();
@@ -2475,9 +2475,9 @@ const NO_THANKS: Pos2 = pos2(1095.0, 247.0);
 fn invited(name: &str) -> Device {
     let device = Device::on(
         name,
-        gmail_mock::Config {
+        mock_servers::Config {
             extra_messages: vec![INVITE.to_vec()],
-            ..gmail_mock::Config::default()
+            ..mock_servers::Config::default()
         },
     );
     device.sign_in();
@@ -2486,7 +2486,7 @@ fn invited(name: &str) -> Device {
             device.stores(),
             EMAIL,
             device.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         )
         .await
         .expect("opens");
@@ -2567,7 +2567,7 @@ fn an_invite_to_a_signed_out_calendar_account_signs_it_in_to_answer() {
     assert_eq!(add_calendar(app.state()), None);
     let theirs = gmail::Client::new(
         device.server.endpoints(),
-        gmail::StaticToken(format!("{}:{BEA}", gmail_mock::DEV_ACCESS_TOKEN)),
+        gmail::StaticToken(format!("{}:{BEA}", mock_servers::DEV_ACCESS_TOKEN)),
     );
     let query = gmail::calendar::EventsQuery {
         q: Some("Portfolio".into()),
@@ -2645,7 +2645,7 @@ fn a_calendar_account_without_its_grant_is_signed_out_and_signs_in_again() {
             device.stores(),
             EMAIL,
             device.server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         )
         .await
         .expect("opens");

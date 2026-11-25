@@ -277,7 +277,7 @@ mod tests {
         TimeZone::get("America/New_York").expect("zone")
     }
 
-    /// gmail-mock's now: Tuesday, November 17th 2026, 9:00 in New York.
+    /// mock-servers' now: Tuesday, November 17th 2026, 9:00 in New York.
     fn now() -> Zoned {
         date(2026, 11, 17)
             .at(9, 0, 0, 0)

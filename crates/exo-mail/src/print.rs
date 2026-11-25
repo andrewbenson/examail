@@ -30,11 +30,12 @@ pub const BLOCKED_SCHEME: &str = "exo-blocked";
 
 /// A remote URL's scheme (or a protocol-relative URL's `//`) in CSS: `url(…)` or `@import "…"`.
 static CSS_URL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(url\(\s*['"]?\s*|@import\s*['"]\s*)(https?:|//)"#).expect("valid regex")
+    Regex::new(r#"(?i)(url\(\s*['"]?\s*|@import\s*['"]\s*)((?:exo-)?https?:|//)"#)
+        .expect("valid regex")
 });
 /// A remote candidate's scheme in a `srcset`.
 static SRCSET_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(^|,)(\s*)(https?:|//)").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"(?i)(^|,)(\s*)((?:exo-)?https?:|//)").expect("valid regex"));
 
 /// `render`'s body as it prints: the markup that goes inside the message's shadow root. It has its
 /// quoted part when `show_quoted` (the `…` itself doesn't print), and loads nothing remote when
@@ -73,6 +74,13 @@ pub fn printable_body(
     view::shadow_root(&printed, show_quoted, &root_class, "", PRINT_CSS, zoom)
 }
 
+/// Rewrites an HTML fragment's remote URLs for the print view: to `exo-https:`/`exo-http:` when
+/// loading remote content, or to [`BLOCKED_SCHEME`] (with `data-exo-blocked` on remote images)
+/// when `block_remote_content` is set.
+pub fn rewrite_print_html(html: &str, block_remote_content: bool) -> String {
+    rewrite_html(html, block_remote_content)
+}
+
 /// `html` (a fragment) with its remote URLs rewritten, and with `block`, its remote images
 /// marked for `body.css`'s blocked-image box.
 fn rewrite_html(html: &str, block: bool) -> String {
@@ -86,13 +94,21 @@ fn rewrite_html(html: &str, block: bool) -> String {
     let Some(root) =
         dom::body(&document).and_then(|body| dom::element_children(&body).into_iter().next())
     else {
+        dom::drop_tree(document);
         return html.to_owned();
     };
     for element in dom::select(&root, dom::is_element) {
+        let svg_image = dom::is_svg_image(&element);
         if block
-            && dom::is(&element, "img")
-            && (remote::is_remote(&dom::attr(&element, "src").unwrap_or_default())
-                || remote::srcset_is_remote(&dom::attr(&element, "srcset").unwrap_or_default()))
+            && ((dom::is(&element, "img")
+                && (remote::is_remote(&dom::attr(&element, "src").unwrap_or_default())
+                    || remote::srcset_is_remote(
+                        &dom::attr(&element, "srcset").unwrap_or_default(),
+                    )))
+                || (svg_image
+                    && ["href", "xlink:href"].iter().any(|name| {
+                        remote::is_remote(&dom::attr(&element, name).unwrap_or_default())
+                    })))
         {
             // Marks the image for `body.css`'s box. The print view sizes it as Chromium sizes a
             // broken image.
@@ -102,7 +118,12 @@ fn rewrite_html(html: &str, block: bool) -> String {
         if dom::is(&element, "img") {
             dom::remove_attr(&element, "loading");
         }
-        for name in ["src", "background", "poster"] {
+        let attrs: &[&str] = if svg_image {
+            &["src", "background", "poster", "href", "xlink:href"]
+        } else {
+            &["src", "background", "poster"]
+        };
+        for &name in attrs {
             if let Some(url) = dom::attr(&element, name)
                 && let Some(printed) = rewrite_url(&url, block)
             {
@@ -126,7 +147,9 @@ fn rewrite_html(html: &str, block: bool) -> String {
             }
         }
     }
-    dom::inner_html(&root)
+    let out = dom::inner_html(&root);
+    dom::drop_tree(document);
+    out
 }
 
 /// `css` with the URLs it loads from the network rewritten.
@@ -154,14 +177,15 @@ fn rewrite_url(url: &str, block: bool) -> Option<String> {
     Some(format!("{}{rest}", scheme(start, block)))
 }
 
-/// What replaces a remote URL's `https:`, `http:` or `//`.
+/// What replaces a remote URL's `https:`, `http:`, `exo-https:`, `exo-http:` or `//`.
 fn scheme(start: &str, block: bool) -> String {
     let start = start.to_ascii_lowercase();
     match (start.as_str(), block) {
         ("//", false) => format!("{REMOTE_SCHEME_PREFIX}https://"),
         ("//", true) => format!("{BLOCKED_SCHEME}://"),
-        (_, false) => format!("{REMOTE_SCHEME_PREFIX}{start}"),
         (_, true) => format!("{BLOCKED_SCHEME}:"),
+        (already, false) if already.starts_with(REMOTE_SCHEME_PREFIX) => already.to_owned(),
+        (raw, false) => format!("{REMOTE_SCHEME_PREFIX}{raw}"),
     }
 }
 
@@ -205,11 +229,16 @@ mod tests {
     #[test]
     fn blocked_bodies_load_nothing_remote() {
         let html = rewrite_html(
-            r#"<img src="https://x.io/a.png" alt="A"><img src="cid:b"><div style="background:url(//x.io/c.png)">x</div>"#,
+            r#"<img src="https://x.io/a.png" alt="A"><img src="cid:b"><svg><image xlink:href="https://x.io/s.png"></image><feImage href="//x.io/f.png"></feImage></svg><div style="background:url(//x.io/c.png)">x</div>"#,
             true,
         );
         assert!(
             html.contains(r#"src="exo-blocked://x.io/a.png""#) && html.contains("data-exo-blocked"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"xlink:href="exo-blocked://x.io/s.png""#)
+                && html.contains(r#"href="exo-blocked://x.io/f.png""#),
             "{html}"
         );
         assert!(
@@ -261,6 +290,70 @@ mod tests {
                 "ShadowWrapper styleQuotedContent styleUnquotedContent\" style=\"zoom: 0.8\""
             ),
             "shrunk as on screen: {shrunk}"
+        );
+    }
+
+    #[test]
+    fn preexisting_exo_http_schemes_are_blocked_and_never_double_prefixed() {
+        let input = concat!(
+            r#"<img src="exo-https://evil.example/a.png" srcset="cid:b 1x, EXO-HTTP://evil.example/b.png 2x">"#,
+            r#"<div style="background:url('exo-https://evil.example/c.png')">x</div>"#,
+            r#"<style>@import "EXO-HTTPS://evil.example/a.css"; p { background: url(exo-http://evil.example/d.png) }</style>"#,
+        );
+        let blocked = rewrite_print_html(input, true);
+        assert!(
+            blocked.contains(r#"src="exo-blocked://evil.example/a.png""#)
+                && blocked.contains("data-exo-blocked"),
+            "{blocked}"
+        );
+        assert!(
+            blocked.contains(r#"srcset="cid:b 1x, exo-blocked://evil.example/b.png 2x""#),
+            "{blocked}"
+        );
+        assert!(
+            blocked.contains("url('exo-blocked://evil.example/c.png')"),
+            "{blocked}"
+        );
+        assert!(
+            blocked.contains(r#"@import "exo-blocked://evil.example/a.css""#)
+                && blocked.contains("url(exo-blocked://evil.example/d.png)"),
+            "{blocked}"
+        );
+        assert!(
+            !blocked.to_ascii_lowercase().contains("exo-http"),
+            "no exo-http(s) should survive blocking: {blocked}"
+        );
+
+        let allowed = rewrite_print_html(input, false);
+        assert!(
+            allowed.contains(r#"src="exo-https://evil.example/a.png""#)
+                && allowed.contains(r#"srcset="cid:b 1x, exo-http://evil.example/b.png 2x""#)
+                && allowed.contains("url('exo-https://evil.example/c.png')")
+                && allowed.contains(r#"@import "exo-https://evil.example/a.css""#)
+                && allowed.contains("url(exo-http://evil.example/d.png)"),
+            "{allowed}"
+        );
+        assert!(
+            !allowed.contains("exo-exo-"),
+            "must never double-prefix: {allowed}"
+        );
+
+        let render = Render {
+            unquoted_html: input.into(),
+            body_attributes: BodyAttributes {
+                style: Some("background:url(exo-https://evil.example/bg.png)".into()),
+                ..BodyAttributes::default()
+            },
+            ..Render::default()
+        };
+        let printed_blocked = printable_body(&render, false, true, 1.0);
+        assert!(
+            !printed_blocked.to_ascii_lowercase().contains("exo-http"),
+            "printable_body must block pre-existing exo-http(s): {printed_blocked}"
+        );
+        assert!(
+            printed_blocked.contains("url(exo-blocked://evil.example/bg.png)"),
+            "{printed_blocked}"
         );
     }
 }

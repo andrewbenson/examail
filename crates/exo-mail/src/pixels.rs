@@ -39,18 +39,15 @@ const TRACKERS: &[&str] = &[
     "infusionsoft.com/app/emailOpened",
     "via.intercom.io/o",
     "via.intercom-mail-",
-    "ec2-52-26-194-35.us-west-2.compute.amazonaws.com/x",
     "www.google.com/appserve/mkt/img/",
     "launchbit.com/taz-pixel",
     "emltrk.com",
     "list-manage.com/track",
     "/track/open.php",
     "mailbutler.io/tracking",
-    "email.mailgun.(.*)/o/",
     "mltrk.io/pixel/",
     "mailtrack.io",
     "mandrillapp.com/track",
-    "list-manage.com/track/open",
     "list-manage1.com/track/open",
     "ping.answerbook.com",
     "mkto-",
@@ -95,6 +92,9 @@ const TRACKERS: &[&str] = &[
     "ec2-52-26-194-35",
 ];
 
+static MAILGUN_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)email\.mailgun\.[^/?#\s]+/o/").expect("valid regex"));
+
 /// What a removed pixel's `src` becomes: a transparent 1×1 GIF.
 pub(crate) const BLANK_GIF: &str =
     "data:image/gif;base64,R0lGODlhAQABAPAAAAAAAAAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
@@ -102,7 +102,7 @@ pub(crate) const BLANK_GIF: &str =
 /// Whether an `<img>` is a read receipt: a known tracker, or at most 4×4 px.
 pub(crate) fn is_read_status_pixel(image: &NodeRef) -> bool {
     let src = decode_uri_component(&dom::attr(image, "src").unwrap_or_default());
-    if TRACKERS.iter().any(|tracker| src.contains(tracker)) {
+    if TRACKERS.iter().any(|tracker| src.contains(tracker)) || MAILGUN_OPEN.is_match(&src) {
         return true;
     }
     let style = Style::of(image);
@@ -187,6 +187,23 @@ mod tests {
     #[test]
     fn spots_trackers_and_tiny_images() {
         assert!(pixel("<img src=\"https://t.yesware.com/t/x.gif\">"));
+        assert!(pixel("<img src=\"https://email.mailgun.org/o/eJw123\">"));
+        assert!(pixel(
+            "<img src=\"https://email.mailgun.acme.co.uk/o/eJw456\">"
+        ));
+        assert!(pixel(
+            "<img src=\"https://x.io/r?u=https%3A%2F%2Femail.mailgun.acme.com%2Fo%2FeJw789\">"
+        ));
+        assert!(!pixel(
+            "<img src=\"https://email.mailgun.acme.com/assets/logo.png\">"
+        ));
+        assert!(pixel("<img src=\"https://via.intercom.io/o?h=abc\">"));
+        assert!(pixel(
+            "<img src=\"https://us1.list-manage.com/track/open.php?u=1\">"
+        ));
+        assert!(pixel(
+            "<img src=\"http://ec2-52-26-194-35.us-west-2.compute.amazonaws.com/x/1.gif\">"
+        ));
         // The tracker is in an encoded parameter after an `&`.
         assert!(pixel(
             "<img src=\"https://x.io/r?a=1&amp;u=https%3A%2F%2Fmailtrack.io%2Fp.gif\">"

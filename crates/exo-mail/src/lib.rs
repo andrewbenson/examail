@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Message bodies, rendered and shown.
 //!
 //! Two halves, kept apart so the first can run in the background and be cached:
@@ -45,7 +39,7 @@ mod classify;
 mod colors;
 mod content;
 mod dates;
-mod dom;
+pub mod dom;
 mod fonts;
 mod hints;
 mod linkify;
@@ -68,19 +62,24 @@ pub use actions::{Action, ActionSource, CalendarData, EventStatus, RsvpLinks};
 pub use animation::{Player, may_animate};
 pub use colors::css_color;
 pub use dates::{DateParts, date_parts, find_dates};
-pub use dom::html_text;
+pub use dom::{drop_tree, escape_html, escape_html_text, html_text};
 pub use fonts::{EMAIL_FACES, Fonts};
 pub use linkify::{links, match_link};
-pub use net::{Done, Fetch, decode_data_url};
+pub use links::split_mailto_addresses;
+pub use net::{
+    Done, Fetch, decode_data_url, decode_uri_component, is_public_host, is_public_ip,
+    is_public_ipv4, is_public_ipv6, percent_decode_bytes, percent_decode_lossy,
+};
 pub use paste::prepare_paste;
 pub use pipeline::{
-    Message, RenderOptions, html_from_payload, render, render_fragment, render_with, text_to_html,
+    Message, RenderOptions, render, render_fragment, render_with, text_to_html, visible_text,
+    visible_texts,
 };
 pub use pixels::is_read_receipt;
-pub use print::{BLOCKED_SCHEME, REMOTE_SCHEME_PREFIX, printable_body};
+pub use print::{BLOCKED_SCHEME, REMOTE_SCHEME_PREFIX, printable_body, rewrite_print_html};
 pub use remote::load_read_receipts;
 pub use render::{BodyAttributes, Link, Render};
-pub use sanitize::{sanitize_description, sanitize_fragment};
+pub use sanitize::{is_valid_email, sanitize_description, sanitize_fragment, strip_ascii_prefix};
 pub use view::{
     Animated, BodyView, ContextHit, ContextImage, Granularity, Hit, Image, Region,
     SCROLLBAR_HEIGHT, Theme, ViewOptions,

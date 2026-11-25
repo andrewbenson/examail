@@ -1,7 +1,7 @@
 //! Detected dates on screen: the hairline under each, and the tooltip under the one the caret is
 //! on.
 
-use egui::{Area, Color32, CornerRadius, Order, Pos2, Rect, Sense, Ui, pos2, text::CCursor};
+use egui::{Area, Color32, CornerRadius, Order, Pos2, Rect, Sense, Ui, pos2};
 use exo_ui::{KeyTooltip, ShortcutTooltip};
 
 use super::{BlockLayout, BodyText};
@@ -34,24 +34,15 @@ pub(super) fn paint_line(
 ) {
     let ppp = painter.pixels_per_point();
     let snap = |x: f32| (x * ppp).round() / ppp;
-    let mut start = 0;
-    for (row_index, row) in view.galley.rows.iter().enumerate() {
-        let count = row.char_count_excluding_newline().0;
-        let (from, to) = (chars.start.max(start), chars.end.min(start + count));
-        if from < to {
-            let x0 = snap(galley_origin.x + view.galley.pos_from_cursor(CCursor::new(from)).min.x);
-            let x1 = snap(galley_origin.x + view.galley.pos_from_cursor(CCursor::new(to)).min.x);
-            let line = view.lines[row_index.min(view.lines.len() - 1)];
-            let top =
-                galley_origin.y + line.top + line.shift + body.content_top + body.content_height
-                    - LINE_ABOVE_BOTTOM;
-            painter.rect_filled(
-                Rect::from_x_y_ranges(x0..=x1, top..=top + LINE_HEIGHT),
-                CornerRadius::ZERO,
-                LINE,
-            );
-        }
-        start += row.char_count_including_newline().0;
+    for (line, x0, x1) in view.row_spans(chars) {
+        let (x0, x1) = (snap(galley_origin.x + x0), snap(galley_origin.x + x1));
+        let top = galley_origin.y + line.top + line.shift + body.content_top + body.content_height
+            - LINE_ABOVE_BOTTOM;
+        painter.rect_filled(
+            Rect::from_x_y_ranges(x0..=x1, top..=top + LINE_HEIGHT),
+            CornerRadius::ZERO,
+            LINE,
+        );
     }
 }
 

@@ -146,8 +146,15 @@ pub(crate) fn start(
     let app = NSApplication::sharedApplication(mtm);
     let window = app.keyWindow().or_else(|| app.mainWindow())?;
     let view = window.contentView()?;
-    let icon = NSWorkspace::sharedWorkspace()
-        .iconForFile(&NSString::from_str(&super::file_name(part.name())));
+    let safe_name = super::file_name(part.name());
+    let ext = super::extension(&safe_name);
+    let uti = promise_uti(ext.as_deref().unwrap_or_default(), part_mime_type(&part));
+    let icon_kind = ext.as_deref().unwrap_or(uti);
+    #[expect(
+        deprecated,
+        reason = "`iconForFileType:` resolves extension and UTI icons without requiring the file on disk"
+    )]
+    let icon = NSWorkspace::sharedWorkspace().iconForFileType(&NSString::from_str(icon_kind));
     let source = Source::alloc(mtm).set_ivars(Promise {
         part,
         loader: loader.clone(),
@@ -156,16 +163,19 @@ pub(crate) fn start(
     let source: Retained<Source> = unsafe { msg_send![super(source), init] };
     let provider = NSFilePromiseProvider::initWithFileType_delegate(
         NSFilePromiseProvider::alloc(),
-        ns_string!("public.data"),
+        &NSString::from_str(uti),
         ProtocolObject::from_ref(&*source),
     );
     let item = NSDraggingItem::initWithPasteboardWriter(
         NSDraggingItem::alloc(),
         ProtocolObject::from_ref(&*provider),
     );
-    // The content view's coordinates start at its bottom left, in points (egui's are zoomed).
-    let height = view.frame().size.height;
-    let point = NSPoint::new(f64::from(at.x * zoom), height - f64::from(at.y * zoom));
+    let y = if view.isFlipped() {
+        f64::from(at.y * zoom)
+    } else {
+        view.frame().size.height - f64::from(at.y * zoom)
+    };
+    let point = NSPoint::new(f64::from(at.x * zoom), y);
     // SAFETY: an `NSImage` is what a dragging item's contents may be.
     unsafe {
         item.setDraggingFrame_contents(
@@ -195,4 +205,96 @@ pub(crate) fn start(
         ProtocolObject::from_ref(&*source),
     );
     Some(source)
+}
+
+fn part_mime_type(part: &Part) -> Option<&str> {
+    match part {
+        Part::Gmail(attachment) => Some(attachment.mime_type.as_str()),
+        Part::Kept(..) => None,
+    }
+}
+
+/// Uniform Type Identifier conforming to `public.data` for `NSFilePromiseProvider`.
+fn promise_uti(extension: &str, mime_type: Option<&str>) -> &'static str {
+    match extension {
+        "pdf" => return "com.adobe.pdf",
+        "png" => return "public.png",
+        "jpg" | "jpeg" | "jif" | "jfif" => return "public.jpeg",
+        "gif" => return "com.compuserve.gif",
+        "webp" => return "org.webmproject.webp",
+        "heic" => return "public.heic",
+        "svg" => return "public.svg-image",
+        "bmp" => return "com.microsoft.bmp",
+        "tif" | "tiff" => return "public.tiff",
+        "txt" | "log" => return "public.plain-text",
+        "md" | "markdown" => return "net.daringfireball.markdown",
+        "html" | "htm" => return "public.html",
+        "csv" => return "public.comma-separated-values-text",
+        "json" => return "public.json",
+        "xml" => return "public.xml",
+        "rtf" => return "public.rtf",
+        "eml" => return "com.apple.mail.email",
+        "ics" => return "com.apple.ical.ics",
+        "vcf" => return "public.vcard",
+        "zip" => return "public.zip-archive",
+        "gz" | "tgz" => return "org.gnu.gnu-zip-archive",
+        "mp3" => return "public.mp3",
+        "wav" => return "com.microsoft.waveform-audio",
+        "m4a" => return "com.apple.m4a-audio",
+        "mp4" => return "public.mpeg-4",
+        "mov" => return "com.apple.quicktime-movie",
+        "doc" => return "com.microsoft.word.doc",
+        "docx" => return "org.openxmlformats.wordprocessingml.document",
+        "xls" => return "com.microsoft.excel.xls",
+        "xlsx" => return "org.openxmlformats.spreadsheetml.sheet",
+        "ppt" => return "com.microsoft.powerpoint.ppt",
+        "pptx" => return "org.openxmlformats.presentationml.presentation",
+        _ => {}
+    }
+    let Some(mime) = mime_type.map(|m| m.split(';').next().unwrap_or(m).trim()) else {
+        return "public.data";
+    };
+    match mime.to_ascii_lowercase().as_str() {
+        "application/pdf" => "com.adobe.pdf",
+        "image/png" => "public.png",
+        "image/jpeg" | "image/jpg" | "image/jif" | "image/jfif" => "public.jpeg",
+        "image/gif" => "com.compuserve.gif",
+        "image/webp" => "org.webmproject.webp",
+        "image/heic" => "public.heic",
+        "image/svg+xml" => "public.svg-image",
+        "image/bmp" => "com.microsoft.bmp",
+        "image/tiff" => "public.tiff",
+        "text/plain" => "public.plain-text",
+        "text/html" => "public.html",
+        "text/csv" => "public.comma-separated-values-text",
+        "application/json" => "public.json",
+        "application/xml" | "text/xml" => "public.xml",
+        "application/rtf" | "text/rtf" => "public.rtf",
+        "message/rfc822" => "com.apple.mail.email",
+        "text/calendar" => "com.apple.ical.ics",
+        "text/vcard" => "public.vcard",
+        "application/zip" => "public.zip-archive",
+        "application/gzip" => "org.gnu.gnu-zip-archive",
+        "audio/mpeg" => "public.mp3",
+        "video/mp4" => "public.mpeg-4",
+        "video/quicktime" => "com.apple.quicktime-movie",
+        _ => "public.data",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::promise_uti;
+
+    #[test]
+    fn maps_extensions_and_mime_types_to_data_utis() {
+        assert_eq!(promise_uti("pdf", None), "com.adobe.pdf");
+        assert_eq!(promise_uti("jpeg", None), "public.jpeg");
+        assert_eq!(promise_uti("", Some("image/png; name=logo")), "public.png");
+        assert_eq!(
+            promise_uti("unknown", Some("application/octet-stream")),
+            "public.data"
+        );
+        assert_eq!(promise_uti("app", None), "public.data");
+    }
 }

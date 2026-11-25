@@ -210,11 +210,6 @@ pub(crate) fn show(
             None,
         );
     }
-    // The field's keys were taken from the page at the start of the frame, and the field gets
-    // them now.
-    let events = with(&ctx, |find| std::mem::take(&mut find.events));
-    let before = ctx.input(|input| input.events.len());
-    ctx.input_mut(|input| input.events.extend(events));
     if select {
         exo_ui::focus_field(
             &ctx,
@@ -227,6 +222,10 @@ pub(crate) fn show(
     } else if focused {
         ctx.memory_mut(|memory| memory.request_focus(field_id));
     }
+    // The field's keys were taken from the page at the start of the frame; swap them into
+    // `input.events` strictly around `text_field` so non-keyboard frame events are restored intact.
+    let mut events = with(&ctx, |find| std::mem::take(&mut find.events));
+    ctx.input_mut(|input| std::mem::swap(&mut input.events, &mut events));
     let mut edited = query.clone();
     let field = exo_ui::text_field(
         &mut child,
@@ -237,7 +236,7 @@ pub(crate) fn show(
         text,
         SELECTION,
     );
-    ctx.input_mut(|input| input.events.truncate(before));
+    ctx.input_mut(|input| std::mem::swap(&mut input.events, &mut events));
     if field.hovered() {
         ctx.set_cursor_icon(CursorIcon::Default);
     }
@@ -274,6 +273,7 @@ pub(crate) fn show(
             find.focused = inside && find.open;
             if !find.focused {
                 find.returns_focus_to = None;
+                find.composing = false;
             }
         });
         if !inside {

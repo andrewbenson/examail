@@ -14,13 +14,16 @@ const GROUPS: &[Option<Group>] = {
     &[
         None,
         Some(IsoTimestamp),
+        Some(Suffix),
         Some(Relative),
         Some(Dow),
         Some(LongDate),
+        Some(Suffix),
         Some(ShortDate),
         Some(Dom),
         Some(Month),
         Some(Year),
+        Some(Suffix),
         Some(Relative),
         Some(Dow),
         Some(Other),
@@ -34,12 +37,15 @@ const GROUPS: &[Option<Group>] = {
         Some(Other),
         Some(Month),
         Some(Dom),
+        Some(Suffix),
         Some(Month),
         Some(Dom),
         Some(Year),
+        Some(Suffix),
         Some(Dom),
         Some(Month),
         Some(Dow),
+        Some(Suffix),
         Some(Dom),
         Some(Month),
         Some(Year),
@@ -47,10 +53,13 @@ const GROUPS: &[Option<Group>] = {
         Some(Other),
         Some(Month),
         Some(Year),
+        Some(Suffix),
         Some(Dom),
         Some(Month),
         Some(Year),
+        Some(Suffix),
         Some(LongDate),
+        Some(Suffix),
         Some(ShortDate),
         Some(Relative),
         Some(Dow),
@@ -59,6 +68,7 @@ const GROUPS: &[Option<Group>] = {
         Some(Other),
         Some(Other),
         Some(Business),
+        Some(Suffix),
     ]
 };
 
@@ -76,12 +86,11 @@ enum Group {
     Business,
     /// Joiners, `today` and parts of day, which aren't used to filter.
     Other,
+    /// The non-word delimiter matched after a candidate date in place of a negative lookahead.
+    Suffix,
 }
 
-/// The lookarounds need a backtracking engine. Its default budget is per search, which a long
-/// stretch of text without dates uses up, so it's lifted. The pattern only backtracks a bounded
-/// amount at each position.
-static DATE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
+static DATE: LazyLock<Regex> = LazyLock::new(|| {
     let r2 = r"[0-9]{1,2}";
     let r3 = r"[0-9]{2,4}";
     let r4 = r"(?:(on|this|next|last)\s+)";
@@ -94,22 +103,28 @@ static DATE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
     let nt = r"[./\\]";
     let nr = r"[./\\-]";
     let nn = r"[./\\\-\s,]*";
-    let no = format!(r"((?:{r2}{nt}{r2}|{r3}{nt}{r2})(?!\s*(?:[ap]m|day|week|mon|year|:(?!\s))))");
-    let ni = format!(r"((?:{r3}{nr}{r2}{nr}{r2}|{r2}{nr}{r2}{nr}{r3})(?!{nr}[0-9]))");
+    let no = format!(r"({r2}{nt}{r2}|{r3}{nt}{r2})");
+    let ni = format!(r"({r3}{nr}{r2}{nr}{r2}|{r2}{nr}{r2}{nr}{r3})");
     let na = format!(r"({r2}){nn}{r9}{nn}({r3})?");
     let iso = r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:[0-9]{2}))";
-    fancy_regex::RegexBuilder::new(&format!(
-        r"(?i)(?<![A-Za-z0-9_.-])(?:{iso}|{r4}?{r8}[,\s]+(?:{ni}|{no}|{na})|{r4}?{r8}[,\s]+{r6}?{ne}{r6}?{r9}?|{r4}?{r8}[,\s]+{r9}[,\s]+{ne}|{r5}[,\s]+{r9}\s+{ne}|{r9}\s+{ne}(?:[,\s])*({r3})?(?!:)|{ne}\s+{r9}\s+{r8}|{ne}\s+{r9}(?:[,\s])*({r3})?(?!:)|{ne}{r6}{r9}(?:[,\s]*({r3}))?(?!:)|{na}|{ni}|{no}|{r4}?{r8}|this\s+{r7}|{r5}\s+{r7}|{r5}|(eod|eob|eow|eom|eoq|eoy))(?![A-Za-z0-9_-])"
+    let s_std = r"(\z|[^A-Za-z0-9_-])";
+    let s_nocolon = r"(\z|[^A-Za-z0-9_:-])";
+    let s_ni = r"(\z|[./\\](?:\z|[^0-9])|[^A-Za-z0-9_./\\-])";
+    Regex::new(&format!(
+        r"(?i)(?:{iso}{s_std}|{r4}?{r8}[,\s]+(?:{ni}{s_ni}|(?:{no}|{na}){s_std})|(?:{r4}?{r8}[,\s]+{r6}?{ne}{r6}?{r9}?|{r4}?{r8}[,\s]+{r9}[,\s]+{ne}|{r5}[,\s]+{r9}\s+{ne}){s_std}|{r9}\s+{ne}(?:[,\s])*({r3})?{s_nocolon}|{ne}\s+{r9}\s+{r8}{s_std}|(?:{ne}\s+{r9}(?:[,\s])*({r3})?|{ne}{r6}{r9}(?:[,\s]*({r3}))?){s_nocolon}|{na}{s_std}|{ni}{s_ni}|(?:{no}|{r4}?{r8}|this\s+{r7}|{r5}\s+{r7}|{r5}|(eod|eob|eow|eom|eoq|eoy)){s_std})"
     ))
-    .backtrack_limit(usize::MAX)
-    .build()
     .expect("valid regex")
+});
+
+/// Suffixes after a short date (`3/4`, `11/25`) that mark it as a time, unit or ratio instead.
+static BAD_SHORT_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\A(?i)\s*(?:[ap]m|day|week|mon|year|:(?:\z|\S))").expect("valid regex")
 });
 
 /// Words near a date that make a bare one more likely to be meant.
 static CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(^|\s)(day|week|month|year|on|at|free|available|[0-9]{1,2}(?:am|pm|:d{2}))(?-u:\b)",
+        r"(?i)(^|\s)(day|week|month|year|on|at|free|available|[0-9]{1,2}(?:am|pm|:[0-9]{2}))(?-u:\b)",
     )
     .expect("valid regex")
 });
@@ -160,7 +175,7 @@ pub struct DateParts {
 /// The parts of the first date in `text`, a detected date's own text. Unlike `find`, it needs no
 /// context around the date, and it only drops a short date with neither a slash nor a weekday.
 pub fn date_parts(text: &str) -> Option<DateParts> {
-    let captures = DATE.captures(text).ok()??;
+    let (_, captures) = next_date(text, 0)?;
     let group = |wanted: Group| last_group(&captures, wanted).map(str::to_owned);
     let parts = DateParts {
         iso_timestamp: group(Group::IsoTimestamp),
@@ -184,7 +199,7 @@ pub fn date_parts(text: &str) -> Option<DateParts> {
 }
 
 /// The capture of group `wanted`. A later group of the same name wins.
-fn last_group<'t>(captures: &fancy_regex::Captures<'t>, wanted: Group) -> Option<&'t str> {
+fn last_group<'t>(captures: &regex::Captures<'t>, wanted: Group) -> Option<&'t str> {
     GROUPS
         .iter()
         .enumerate()
@@ -193,6 +208,72 @@ fn last_group<'t>(captures: &fancy_regex::Captures<'t>, wanted: Group) -> Option
         .filter_map(|(i, _)| captures.get(i))
         .map(|m| m.as_str())
         .find(|s| !s.is_empty())
+}
+
+fn suffix_len(captures: &regex::Captures<'_>) -> usize {
+    GROUPS
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| **g == Some(Group::Suffix))
+        .find_map(|(i, _)| captures.get(i))
+        .map_or(0, |m| m.len())
+}
+
+fn is_prev_boundary_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+fn valid_start(text: &str, start: usize) -> bool {
+    start == 0 || !is_prev_boundary_char(text.as_bytes()[start - 1])
+}
+
+/// Advances past a contiguous `[A-Za-z0-9_.-]+` run starting at `from`, plus the separator
+/// character after it, landing on the next UTF-8 boundary that could satisfy [`valid_start`].
+fn skip_word_run(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while at < bytes.len() && is_prev_boundary_char(bytes[at]) {
+        at += 1;
+    }
+    if at < text.len() {
+        at += text[at..].chars().next().map_or(0, char::len_utf8);
+    }
+    at
+}
+
+/// Finds the next date match in `text` at or after `pos`, enforcing the leading word boundary and
+/// short-date suffix exclusions.
+fn next_date<'t>(text: &'t str, mut pos: usize) -> Option<(Span, regex::Captures<'t>)> {
+    while pos < text.len() {
+        let captures = DATE.captures_at(text, pos)?;
+        let whole = captures.get(0)?;
+        let start = whole.start();
+        if !valid_start(text, start) {
+            pos = skip_word_run(text, start);
+            continue;
+        }
+        let end = whole.end() - suffix_len(&captures);
+        if let Some(short) = last_group(&captures, Group::ShortDate)
+            && BAD_SHORT_SUFFIX.is_match(&text[end..])
+        {
+            if last_group(&captures, Group::Dow).is_some()
+                && let Some(sep) = short.find(['.', '/', '\\'])
+            {
+                let truncated = end - short.len() + sep + 1;
+                if let Some(fallback) = DATE.captures_at(&text[..truncated], start)
+                    && let Some(fb_whole) = fallback.get(0)
+                    && fb_whole.start() == start
+                {
+                    let fb_end = fb_whole.end() - suffix_len(&fallback);
+                    return Some((Span { start, end: fb_end }, fallback));
+                }
+            }
+            pos = skip_word_run(text, start);
+            continue;
+        }
+        return Some((Span { start, end }, captures));
+    }
+    None
 }
 
 /// The dates in `text` that get marked, as byte ranges, in order. Compose's editor wraps them in
@@ -217,39 +298,37 @@ fn find(text: &str) -> Vec<Span> {
     };
     let context = spans(&CONTEXT, 20);
     let headers = spans(&HEADER, 0);
-    DATE.captures_iter(text)
-        .map_while(Result::ok)
-        .filter_map(|captures| {
-            let whole = captures.get(0)?;
-            let date = Span {
-                start: whole.start(),
-                end: whole.end(),
-            };
-            if date.touches(&headers) {
-                return None;
-            }
-            let group = |wanted: Group| last_group(&captures, wanted);
-            let keep = if group(Group::IsoTimestamp).is_some() || group(Group::LongDate).is_some() {
-                true
-            } else if let Some(short) = group(Group::ShortDate) {
-                group(Group::Dow).is_some()
-                    || (short.contains('/')
-                        && (date.touches(&context)
-                            || text[date.end..]
-                                .strip_prefix(':')
-                                .is_some_and(|rest| rest.starts_with(char::is_whitespace))))
-            } else {
-                let concrete = group(Group::Dom).is_some() && group(Group::Month).is_some();
-                let short_weekday = group(Group::Dow).is_some_and(|dow| dow.chars().count() <= 5);
-                concrete
-                    || !short_weekday
-                    || group(Group::Relative).is_some()
-                    || group(Group::Dom).is_some()
-                    || date.end < text.len()
-            };
-            keep.then_some(date)
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some((date, captures)) = next_date(text, pos) {
+        pos = date.end.max(date.start + 1);
+        if date.touches(&headers) {
+            continue;
+        }
+        let group = |wanted: Group| last_group(&captures, wanted);
+        let keep = if group(Group::IsoTimestamp).is_some() || group(Group::LongDate).is_some() {
+            true
+        } else if let Some(short) = group(Group::ShortDate) {
+            group(Group::Dow).is_some()
+                || (short.contains('/')
+                    && (date.touches(&context)
+                        || text[date.end..]
+                            .strip_prefix(':')
+                            .is_some_and(|rest| rest.starts_with(char::is_whitespace))))
+        } else {
+            let concrete = group(Group::Dom).is_some() && group(Group::Month).is_some();
+            let short_weekday = group(Group::Dow).is_some_and(|dow| dow.chars().count() <= 5);
+            concrete
+                || !short_weekday
+                || group(Group::Relative).is_some()
+                || group(Group::Dom).is_some()
+                || date.end < text.len()
+        };
+        if keep {
+            out.push(date);
+        }
+    }
+    out
 }
 
 /// Wraps every detected date that lies within one text node in `<span class="exo-date">`,
@@ -277,9 +356,10 @@ pub(crate) fn decorate(root: &NodeRef) {
     for (node, text) in texts {
         let node_start = start;
         start += text.len() + 1;
-        let in_link = dom::parent(&node)
-            .and_then(|parent| dom::tag(&parent).map(str::to_ascii_lowercase))
-            .is_some_and(|tag| matches!(tag.as_str(), "a" | "title" | "style" | "script"));
+        let in_link = dom::closest(&node, |ancestor| {
+            dom::tag(ancestor).is_some_and(|tag| matches!(tag, "a" | "title" | "style" | "script"))
+        })
+        .is_some();
         if in_link {
             continue;
         }
@@ -388,6 +468,13 @@ mod tests {
             ["tomorrow", "on Friday"]
         );
         assert_eq!(dates("Wed Nov 25, 2026 9:00am"), ["Wed Nov 25"]);
+        assert_eq!(dates("Nov 25 10:00am"), ["Nov 25"]);
+        assert_eq!(dates("14:30 11/25"), ["11/25"]);
+        assert_eq!(
+            dates("foo-tomorrow bar_friday v1.2026-11-25"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(dates("a_mon, 2026-11-25"), ["2026-11-25"]);
         assert_eq!(dates("version 1.2.3 and 3/4 cup"), Vec::<&str>::new());
         assert_eq!(
             dates("On Mon, Nov 16, 2026 at 5:54 PM Tom <t@x.co> wrote:"),
@@ -435,12 +522,14 @@ mod tests {
 
     #[test]
     fn wraps_dates_within_text_nodes() {
-        let document = dom::parse("<p>Let's meet tomorrow, <a href=x>or Friday</a></p>");
+        let document = dom::parse(
+            "<p>Let's meet tomorrow, <a href=x>or Friday</a>, <a href=y><b>next Monday</b></a></p>",
+        );
         let body = dom::body(&document).unwrap();
         decorate(&body);
         assert_eq!(
             dom::inner_html(&body),
-            "<p>Let's meet <span class=\"exo-date\">tomorrow</span>, <a href=\"x\">or Friday</a></p>"
+            "<p>Let's meet <span class=\"exo-date\">tomorrow</span>, <a href=\"x\">or Friday</a>, <a href=\"y\"><b>next Monday</b></a></p>"
         );
     }
 

@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! The Exo desktop app.
 
 use std::sync::Arc;
@@ -17,9 +11,9 @@ use exo_auth::{Auth, ClientConfig, MemorySecrets};
 /// Where Exo keeps its files: `~/Library/Application Support/Examail` on macOS.
 const DIRS: fastframe_dirs::App = fastframe_dirs::App::new("examail", "", "", "Examail");
 
-/// gmail-mock takes any OAuth client.
+/// mock-servers takes any OAuth client.
 const MOCK_CLIENT_ID: &str = "exo-dev.apps.googleusercontent.com";
-const MOCK_CLIENT_SECRET: &str = "GOCSPX-gmail-mock";
+const MOCK_CLIENT_SECRET: &str = "GOCSPX-mock-servers";
 
 fn main() -> anyhow::Result<()> {
     // This goes first. An update's helper runs here and exits, and a relaunch's update flags
@@ -53,15 +47,15 @@ fn main() -> anyhow::Result<()> {
         .discover(|_, _| Ok(()))
         .dirs
         .context("finding Examail's folders")?;
-    // `EXO_GMAIL_MOCK=http://127.0.0.1:8787/` signs in against a running gmail-mock instead of
+    // `EXO_MOCK_SERVERS=http://127.0.0.1:8787/` signs in against a running mock server instead of
     // Google. Its grants and mail die with it, so the account list and the accounts' stores go
     // in a folder that lasts this run only, away from the real ones.
-    let mock = std::env::var("EXO_GMAIL_MOCK")
+    let mock = std::env::var("EXO_MOCK_SERVERS")
         .ok()
         .map(|origin| origin.parse::<url::Url>())
         .transpose()
-        .context("EXO_GMAIL_MOCK isn't a URL")?;
-    // One Exo at a time. One on gmail-mock runs beside the real one.
+        .context("EXO_MOCK_SERVERS isn't a URL")?;
+    // One Exo at a time. One on mock-servers runs beside the real one.
     let launcher = Launcher::default();
     let claimed = desktop::claim(
         mock.as_ref().map(url::Url::as_str),
@@ -69,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         &launcher,
     );
     // The log file starts afresh each run, so only the running Exo on real mail keeps one. A
-    // later launch, or one on gmail-mock, would start the running Exo's file over.
+    // later launch, or one on mock-servers, would start the running Exo's file over.
     exo::logging::init(
         exo::logging::folder()
             .filter(|_| claimed.is_ok() && mock.is_none())
@@ -93,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     {
         return Ok(());
     }
-    // Exo updates itself, but not on gmail-mock. An update an earlier run downloaded installs now,
+    // Exo updates itself, but not on mock-servers. An update an earlier run downloaded installs now,
     // before anything opens, and the updated Exo opens in this launch's place, with its arguments.
     let updater = mock.is_none().then(exo::update::updater).flatten();
     if let Some(updater) = &updater
@@ -103,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mock_state = mock
         .is_some()
-        .then(|| std::env::temp_dir().join(format!("exo-gmail-mock-{}", std::process::id())));
+        .then(|| std::env::temp_dir().join(format!("exo-mock-servers-{}", std::process::id())));
     if let Some(dir) = &mock_state {
         // A crashed run's, should its process ID come round again.
         let _ = std::fs::remove_dir_all(dir);

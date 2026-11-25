@@ -30,6 +30,8 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build, sign and notarize
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}

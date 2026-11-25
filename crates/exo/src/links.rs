@@ -210,23 +210,8 @@ fn week_day(text: &str) -> Option<Date> {
 
 /// `segment` with its `%XX` escapes decoded. A malformed one stays.
 fn decode(segment: &str) -> String {
-    let bytes = segment.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = |at: usize| bytes.get(at).and_then(|byte| (*byte as char).to_digit(16));
-        match (bytes[i], hex(i + 1), hex(i + 2)) {
-            (b'%', Some(high), Some(low)) => {
-                out.push((high * 16 + low) as u8);
-                i += 3;
-            }
-            (byte, ..) => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| segment.to_owned())
+    String::from_utf8(exo_mail::percent_decode_bytes(segment))
+        .unwrap_or_else(|_| segment.to_owned())
 }
 
 /// Where `route` is, as a link: the account, its list, search or week, the conversation open and

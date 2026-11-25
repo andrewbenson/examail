@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use egui::{
-    Color32, FontId, Galley, Painter, Pos2, Rect, Response, Sense, TextFormat, Ui, Vec2, Widget,
+    Color32, FontId, Galley, Painter, Pos2, Rect, TextFormat, Vec2,
     epaint::text::{ByteIndex, Glyph, LayoutSection, Row},
     text::{LayoutJob, TextWrapping},
 };
@@ -119,22 +119,6 @@ impl TextStyle {
         )
     }
 
-    /// [`TextStyle::paint_line`] without kerning (`font-kerning: none`). Returns the width.
-    pub fn paint_line_unkerned(
-        &self,
-        painter: &Painter,
-        line_top_left: Pos2,
-        text: &str,
-        color: Color32,
-    ) -> f32 {
-        paint_job(
-            painter,
-            line_top_left,
-            unkerned(self.line_job(text, color, None)),
-            self,
-        )
-    }
-
     /// The width of `text` on one line.
     pub fn width(&self, ctx: &egui::Context, text: &str) -> f32 {
         layout(
@@ -164,29 +148,116 @@ impl TextStyle {
     /// the last, because egui's own wrapping puts continuation rows off the sub-pixel position
     /// Chromium gives them.
     pub fn wrap(&self, ctx: &egui::Context, text: &str, width: f32) -> Vec<String> {
+        #[derive(Clone, Copy)]
+        struct WrapPiece {
+            candidate_end: usize,
+            start: usize,
+            end: usize,
+        }
+
         let mut lines = Vec::new();
         for paragraph in text.split('\n') {
-            let mut line = String::new();
+            let mut pieces = Vec::new();
+            let mut cursor = 0;
             for (at, word) in paragraph.split(' ').enumerate() {
-                // An empty word (two spaces in a row) keeps its space.
-                let pieces = std::iter::once(word)
-                    .filter(|word| word.is_empty())
-                    .chain(word.split_inclusive(WBR));
-                for (part, piece) in pieces.enumerate() {
-                    let joiner = if at > 0 && part == 0 { " " } else { "" };
-                    let candidate = if line.is_empty() {
-                        piece.to_owned()
-                    } else {
-                        format!("{line}{joiner}{piece}")
-                    };
-                    if !line.is_empty() && self.width(ctx, &candidate) > width {
-                        lines.push(std::mem::replace(&mut line, piece.to_owned()));
-                    } else {
-                        line = candidate;
+                if at > 0 {
+                    cursor += 1;
+                }
+                if word.is_empty() {
+                    pieces.push(WrapPiece {
+                        candidate_end: cursor,
+                        start: cursor,
+                        end: cursor,
+                    });
+                } else {
+                    let mut part_start = cursor;
+                    for piece in word.split_inclusive(WBR) {
+                        let part_end = part_start + piece.len();
+                        pieces.push(WrapPiece {
+                            candidate_end: part_end,
+                            start: part_start,
+                            end: part_end,
+                        });
+                        part_start = part_end;
                     }
+                    cursor += word.len();
                 }
             }
-            lines.push(line);
+
+            let mut idx = 0;
+            while idx < pieces.len() && pieces[idx].start == pieces[idx].end {
+                idx += 1;
+            }
+            if idx == pieces.len() {
+                lines.push(String::new());
+                continue;
+            }
+
+            let first_start = pieces[idx].start;
+            let full = layout(
+                ctx,
+                LayoutJob::single_section(
+                    paragraph[first_start..].to_owned(),
+                    self.format(Color32::WHITE),
+                ),
+            );
+            if full.size().x + 1.0 <= width {
+                lines.push(paragraph[first_start..].to_owned());
+                continue;
+            }
+
+            let x_at = |byte_offset: usize| -> f32 {
+                let Some(row) = full.rows.first() else {
+                    return 0.0;
+                };
+                let rel = byte_offset.saturating_sub(first_start);
+                if rel == 0 {
+                    return 0.0;
+                }
+                let pos = row
+                    .glyphs
+                    .partition_point(|glyph| (glyph.cluster as usize) < rel);
+                row.glyphs
+                    .get(pos)
+                    .map_or_else(|| full.size().x, |glyph| glyph.pos.x)
+            };
+
+            while idx < pieces.len() {
+                while idx < pieces.len() && pieces[idx].start == pieces[idx].end {
+                    idx += 1;
+                }
+                if idx == pieces.len() {
+                    lines.push(String::new());
+                    break;
+                }
+                let line_start = pieces[idx].start;
+                if idx + 1 == pieces.len() {
+                    lines.push(paragraph[line_start..pieces[idx].end].to_owned());
+                    break;
+                }
+                let start_x = x_at(line_start);
+                let approx = pieces[idx + 1..]
+                    .partition_point(|piece| x_at(piece.candidate_end) - start_x <= width);
+                let mut fit = (idx + approx).min(pieces.len() - 1);
+                while fit > idx
+                    && self.width(ctx, &paragraph[line_start..pieces[fit].candidate_end]) > width
+                {
+                    fit -= 1;
+                }
+                while fit + 1 < pieces.len()
+                    && self.width(ctx, &paragraph[line_start..pieces[fit + 1].candidate_end])
+                        <= width
+                {
+                    fit += 1;
+                }
+                let line_end = if fit == idx {
+                    pieces[idx].end
+                } else {
+                    pieces[fit].candidate_end
+                };
+                lines.push(paragraph[line_start..line_end].to_owned());
+                idx = fit + 1;
+            }
         }
         lines
     }
@@ -218,19 +289,47 @@ impl TextStyle {
 }
 
 /// `job` as `font-kerning: none` lays it out, with each character a section of its own, since egui
-/// shapes each section apart and kerns only within one.
+/// shapes each section apart and kerns only within one. Multi-codepoint emoji clusters stay in one
+/// section so their sequence isn't torn apart.
 pub(crate) fn unkerned(mut job: LayoutJob) -> LayoutJob {
+    let base_ptr = job.text.as_ptr() as usize;
     for section in std::mem::take(&mut job.sections) {
-        let start = section.byte_range.start.0;
+        let slice = &job.text[section.byte_range.start.0..section.byte_range.end.0];
         let mut leading_space = section.leading_space;
-        for (at, ch) in job.text[start..section.byte_range.end.0].char_indices() {
-            let from = start + at;
-            let byte_range = ByteIndex(from)..ByteIndex(from + ch.len_utf8());
-            job.sections.push(LayoutSection {
-                leading_space: std::mem::take(&mut leading_space),
-                byte_range,
-                format: section.format.clone(),
-            });
+        if slice.is_ascii() {
+            for (at, ch) in slice.char_indices() {
+                let from = section.byte_range.start.0 + at;
+                let byte_range = ByteIndex(from)..ByteIndex(from + ch.len_utf8());
+                job.sections.push(LayoutSection {
+                    leading_space: std::mem::take(&mut leading_space),
+                    byte_range,
+                    format: section.format.clone(),
+                });
+            }
+            continue;
+        }
+        for piece in fastframe_emoji::pieces(slice) {
+            match piece {
+                fastframe_emoji::Piece::Text(part) => {
+                    let start = part.as_ptr() as usize - base_ptr;
+                    for (at, ch) in part.char_indices() {
+                        let from = start + at;
+                        job.sections.push(LayoutSection {
+                            leading_space: std::mem::take(&mut leading_space),
+                            byte_range: ByteIndex(from)..ByteIndex(from + ch.len_utf8()),
+                            format: section.format.clone(),
+                        });
+                    }
+                }
+                fastframe_emoji::Piece::Emoji(cluster) => {
+                    let from = cluster.as_ptr() as usize - base_ptr;
+                    job.sections.push(LayoutSection {
+                        leading_space: std::mem::take(&mut leading_space),
+                        byte_range: ByteIndex(from)..ByteIndex(from + cluster.len()),
+                        format: section.format.clone(),
+                    });
+                }
+            }
         }
     }
     job
@@ -240,6 +339,7 @@ pub(crate) fn unkerned(mut job: LayoutJob) -> LayoutJob {
 /// at 12px and 16px). Lay text out through this rather than egui's fonts, or [`TextStyle`]'s
 /// helpers that use it, so it takes the room it takes in Chromium.
 pub fn layout(ctx: &egui::Context, job: LayoutJob) -> Arc<Galley> {
+    let job = crate::emoji::split_sections(ctx, job);
     let mut galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
     crate::emoji::fit_advances(ctx, &mut galley);
     galley
@@ -304,18 +404,69 @@ pub fn paint_text(
 }
 
 /// Where egui put the baseline of `galley`'s text, below its rows' tops. That's the baseline of
-/// the first glyph of the first row in its own font, or where that font's would go.
+/// the first non-emoji glyph of the first row in its own font, or where that font's would go.
 fn own_baseline(galley: &Galley, pixels_per_point: f32) -> Option<f32> {
     let glyphs = &galley.rows.first()?.glyphs;
+    let emoji_family = crate::emoji::family();
+    let is_emoji_glyph = |glyph: &Glyph| {
+        let byte = glyph.cluster as usize;
+        let idx = galley
+            .job
+            .sections
+            .partition_point(|section| section.byte_range.end.0 <= byte);
+        galley.job.sections.get(idx).is_some_and(|section| {
+            section.byte_range.start.0 <= byte && section.format.font_id.family == emoji_family
+        })
+    };
     let own = glyphs.iter().find(|glyph| {
-        glyph.font_face_ascent == glyph.font_ascent && glyph.font_face_height == glyph.font_height
+        !is_emoji_glyph(glyph)
+            && glyph.font_face_ascent == glyph.font_ascent
+            && glyph.font_face_height == glyph.font_height
     });
     match own {
         Some(glyph) => Some(glyph.pos.y),
         None => glyphs
-            .first()
-            .map(|glyph| (glyph.font_ascent * pixels_per_point).round() / pixels_per_point),
+            .iter()
+            .find(|glyph| !is_emoji_glyph(glyph))
+            .map(|glyph| (glyph.font_ascent * pixels_per_point).round() / pixels_per_point)
+            .or_else(|| glyphs.first().map(|glyph| glyph.pos.y)),
     }
+}
+
+/// Returns a copy of `galley` with all glyph vertices and section colors set to `color`, without
+/// re-shaping text.
+pub(crate) fn recolor_galley(galley: &Arc<Galley>, color: Color32) -> Arc<Galley> {
+    if galley
+        .job
+        .sections
+        .iter()
+        .all(|section| section.format.color == color)
+    {
+        return galley.clone();
+    }
+    let mut out = galley.clone();
+    let made = Arc::make_mut(&mut out);
+    let mut job = (*made.job).clone();
+    for section in &mut job.sections {
+        section.format.color = color;
+    }
+    made.job = Arc::new(job);
+    for placed in &mut made.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        for glyph in &row.glyphs {
+            let first = glyph.first_vertex as usize;
+            if glyph.uv_rect.is_nothing()
+                || glyph.uv_rect.size.x <= 0.0
+                || !row.visuals.glyph_vertex_range.contains(&first)
+            {
+                continue;
+            }
+            for vertex in &mut row.visuals.mesh.vertices[first..first + 4] {
+                vertex.color = color;
+            }
+        }
+    }
+    out
 }
 
 /// Puts every glyph of `galley` on one baseline, `baseline` below its row's top, as CSS puts
@@ -378,60 +529,6 @@ pub(crate) fn update_bounds(galley: &mut Galley) {
     });
 }
 
-/// A run of text in one style. It wraps to the available width (`white-space: normal`), or with
-/// [`Text::truncate`] stays on one line and ends in an ellipsis (`text-overflow: ellipsis`).
-#[must_use]
-pub struct Text<'a> {
-    text: &'a str,
-    style: TextStyle,
-    color: Color32,
-    truncate: bool,
-}
-
-impl<'a> Text<'a> {
-    /// Black text in `style`.
-    pub fn new(text: &'a str, style: TextStyle) -> Self {
-        Self {
-            text,
-            style,
-            color: Color32::BLACK,
-            truncate: false,
-        }
-    }
-
-    /// Sets the text color.
-    pub fn color(self, color: Color32) -> Self {
-        Self { color, ..self }
-    }
-
-    /// Keeps the text on one line, ending in "…" if it doesn't fit.
-    pub fn truncate(self) -> Self {
-        Self {
-            truncate: true,
-            ..self
-        }
-    }
-}
-
-impl Widget for Text<'_> {
-    fn ui(self, ui: &mut Ui) -> Response {
-        let mut job =
-            LayoutJob::single_section(self.text.to_owned(), self.style.format(self.color));
-        let width = ui.available_width();
-        job.wrap = if self.truncate {
-            TextWrapping::truncate_at_width(width)
-        } else {
-            TextWrapping::wrap_at_width(width)
-        };
-        let galley = layout(ui.ctx(), job);
-        let lines = galley.rows.len().max(1) as f32;
-        let size = Vec2::new(galley.size().x, lines * self.style.line_height);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-        paint_text(ui.painter(), rect.min, galley, &self.style);
-        response
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +581,93 @@ mod tests {
         ] {
             assert_eq!(css_baseline(SANS, size, 30.0), baseline, "{size}px");
         }
+    }
+
+    #[test]
+    fn keycap_and_vs16_heart_emoji_draw_no_monochrome_outlines_and_fit_optical_advance() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("the system fonts load");
+        let style = TextStyle::new(Font::new(crate::Family::Sans, 400), 16.0, 24.0);
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for cluster in ["1️⃣", "❤️"] {
+                let galley = layout(
+                    ui.ctx(),
+                    LayoutJob::single_section(cluster.to_owned(), style.format(Color32::BLACK)),
+                );
+                assert_eq!(galley.rows.len(), 1, "{cluster}");
+                assert!(
+                    galley.rows[0].visuals.mesh.vertices.is_empty(),
+                    "{cluster} must not emit monochrome fallback glyph outlines underneath emoji artwork"
+                );
+                // At 16px, Apple Color Emoji's optical advance in Chromium is `1.25 * 16 = 20px`.
+                assert!(
+                    (galley.size().x - 20.0).abs() < 0.01,
+                    "{cluster} width {} != 20.0",
+                    galley.size().x
+                );
+            }
+
+            style.paint_line(
+                ui.painter(),
+                Pos2::new(10.0, 10.0),
+                "1️⃣ ❤️ ok",
+                Color32::BLACK,
+                None,
+            );
+        });
+        assert!(
+            output.textures_delta.set.len() >= 2,
+            "painting uploads colour bitmap textures for both 1️⃣ and ❤️"
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn wrap_matches_word_by_word_reference_across_spaces_wbr_and_newlines() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("the system fonts load");
+        let style = TextStyle::new(Font::new(crate::Family::Sans, 400), 13.0, 20.0);
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let reference = |text: &str, width: f32| -> Vec<String> {
+                let mut lines = Vec::new();
+                for paragraph in text.split('\n') {
+                    let mut line = String::new();
+                    for (at, word) in paragraph.split(' ').enumerate() {
+                        let pieces = std::iter::once(word)
+                            .filter(|word| word.is_empty())
+                            .chain(word.split_inclusive(WBR));
+                        for (part, piece) in pieces.enumerate() {
+                            let joiner = if at > 0 && part == 0 { " " } else { "" };
+                            let candidate = if line.is_empty() {
+                                piece.to_owned()
+                            } else {
+                                format!("{line}{joiner}{piece}")
+                            };
+                            if !line.is_empty() && style.width(ui.ctx(), &candidate) > width {
+                                lines.push(std::mem::replace(&mut line, piece.to_owned()));
+                            } else {
+                                line = candidate;
+                            }
+                        }
+                    }
+                    lines.push(line);
+                }
+                lines
+            };
+
+            let sample = format!(
+                "  Quick brown  fox jumps over https://example.com/{WBR}very/{WBR}long/{WBR}path \n\nsecond line with 1️⃣ and ❤️ trailing "
+            );
+            for width in [0.0, 35.0, 80.0, 140.0, 260.0, 1000.0] {
+                assert_eq!(
+                    style.wrap(ui.ctx(), &sample, width),
+                    reference(&sample, width),
+                    "width {width}"
+                );
+            }
+        });
+        output.drop_without_applying_deltas();
     }
 }

@@ -284,22 +284,25 @@ impl Tabs {
     }
 
     /// Adds a tab at `parked`, last, with `pill` until it shows. At the limit, the active tab's
-    /// neighbour closes first. Returns its place.
-    pub(crate) fn push(&mut self, pill: Pill, parked: Parked) -> usize {
-        if self.tabs.len() >= MAX_TABS {
-            // The one right of the active tab, or left of it when the active tab is last.
-            let index = if self.active + 1 < self.tabs.len() {
-                self.active + 1
-            } else {
-                self.active - 1
-            };
-            self.close(index);
-        }
+    /// neighbour closes first. Returns its place, and where any evicted tab was so its page can
+    /// close cleanly.
+    pub(crate) fn push(&mut self, pill: Pill, parked: Parked) -> (usize, Option<Parked>) {
+        let evicted = (self.tabs.len() >= MAX_TABS)
+            .then(|| {
+                // The one right of the active tab, or left of it when the active tab is last.
+                let index = if self.active + 1 < self.tabs.len() {
+                    self.active + 1
+                } else {
+                    self.active - 1
+                };
+                self.close(index)
+            })
+            .flatten();
         self.tabs.push(Tab {
             pill,
             parked: Some(parked),
         });
-        self.tabs.len() - 1
+        (self.tabs.len() - 1, evicted)
     }
 
     /// Removes tab `index`, which isn't on screen, remembering it for ⌘⇧T. Returns where it
@@ -764,7 +767,8 @@ mod tests {
         let names: Vec<String> = (0..20).map(|n| n.to_string()).collect();
         let mut tabs = tabs(&names.iter().map(String::as_str).collect::<Vec<_>>());
         select(&mut tabs, 5, "0");
-        tabs.push(pill("new"), route("new"));
+        let (_, evicted) = tabs.push(pill("new"), route("new"));
+        assert!(matches!(evicted, Some(Parked::Route(ref r)) if r.email == "6"));
         assert_eq!(tabs.len(), MAX_TABS);
         assert!(
             !titles(&tabs).contains(&"6".to_owned()),
@@ -776,7 +780,8 @@ mod tests {
         );
         // With the active tab last, the one left of it.
         select(&mut tabs, 19, "5");
-        tabs.push(pill("newer"), route("newer"));
+        let (_, evicted) = tabs.push(pill("newer"), route("newer"));
+        assert!(matches!(evicted, Some(Parked::Route(ref r)) if r.email == "19"));
         assert_eq!(
             titles(&tabs)[18..],
             ["new".to_owned(), "newer".to_owned()],

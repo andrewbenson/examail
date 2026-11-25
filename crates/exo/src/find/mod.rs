@@ -70,6 +70,8 @@ struct Find {
     returns_focus_to: Option<Id>,
     /// Whether the field opened or took the keyboard again this frame.
     revealed: bool,
+    /// Whether an IME preedit composition is currently active in the find field.
+    composing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +188,7 @@ fn reveal(ctx: &Context) {
 fn close(ctx: &Context) {
     let returns = with(ctx, |find| {
         let returns = find.focused.then(|| find.returns_focus_to.take()).flatten();
-        (find.open, find.focused, find.searching) = (false, false, false);
+        (find.open, find.focused, find.searching, find.composing) = (false, false, false, false);
         find.events.clear();
         returns
     });
@@ -279,15 +281,30 @@ fn take_field_keys(ctx: &Context) {
             !keyboard || zoom
         });
     });
+    let mut composing = with(ctx, |find| find.composing);
     let mut kept = Vec::new();
+    let mut should_close = false;
     for event in taken {
         match event {
+            Event::Ime(ref ime) => {
+                #[expect(deprecated, reason = "egui retains ImeEvent::Disabled in Event::Ime")]
+                match ime {
+                    egui::ImeEvent::Preedit { text, .. } => {
+                        composing = !text.is_empty() && text != "\n" && text != "\r";
+                    }
+                    egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
+                        composing = false;
+                    }
+                    _ => {}
+                }
+                kept.push(event);
+            }
             Event::Key {
                 key: Key::Enter,
                 pressed: true,
                 modifiers,
                 ..
-            } => {
+            } if !composing => {
                 // Enter finds the next match, ⇧Enter the previous.
                 let query = with(ctx, |find| find.query.clone());
                 if !query.is_empty() {
@@ -300,20 +317,188 @@ fn take_field_keys(ctx: &Context) {
                 key: Key::Escape,
                 pressed: true,
                 ..
-            } => close(ctx),
+            } if !composing => {
+                should_close = true;
+            }
             Event::Key {
                 key: Key::OpenBracket,
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.ctrl => close(ctx),
+            } if !composing && modifiers.ctrl => {
+                should_close = true;
+            }
             // The field's own keys go no further, nor does Tab, which would move egui's focus.
+            Event::Key { key: Key::Tab, .. } => {}
             Event::Key {
-                key: Key::Enter | Key::Escape | Key::Tab,
+                key: Key::Enter | Key::Escape,
                 ..
-            } => {}
+            } if !composing => {}
             event => kept.push(event),
         }
     }
-    with(ctx, |find| find.events = kept);
+    if should_close {
+        close(ctx);
+        return;
+    }
+    with(ctx, |find| {
+        find.composing = composing;
+        find.events.extend(kept);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Color32, ImeEvent, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    use super::*;
+
+    #[test]
+    fn keystrokes_typed_during_the_open_delay_are_buffered_and_inserted_once_open() {
+        let ctx = Context::default();
+        exo_ui::install(&ctx).expect("the system fonts load");
+
+        let run_frame = |time: f64, events: Vec<Event>| {
+            ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    begin(ui.ctx(), true);
+                    let (_, width) = layout(ui.ctx());
+                    let rect = Rect::from_min_size(pos2(10.0, 4.0), vec2(width, 24.0));
+                    show(ui, rect, 1.0, Color32::GRAY, |_, _, _| false);
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // Frame 0 (t = 1.000): ⌘F opens the find bar (`width` is 0 during the 25ms delay) and `'a'`
+        // arrives immediately.
+        run_frame(
+            1.0,
+            vec![
+                Event::Key {
+                    key: Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                },
+                Event::Text("a".into()),
+            ],
+        );
+        // Frame 1 (t = 1.010, still inside the 25ms delay): `'b'` arrives.
+        run_frame(1.01, vec![Event::Text("b".into())]);
+        // Frame 2 (t = 1.020, still inside the 25ms delay): an idle frame with no keys must NOT
+        // wipe out `'a'` and `'b'`.
+        run_frame(1.02, Vec::new());
+
+        // Frame 3 (t = 1.100, past the 25ms delay): the bar has positive width and receives `"ab"`.
+        run_frame(1.1, Vec::new());
+        assert_eq!(with(&ctx, |find| find.query.clone()), "ab");
+    }
+
+    #[test]
+    fn ime_preedit_prevents_enter_and_escape_from_stepping_or_closing_find() {
+        let ctx = Context::default();
+        exo_ui::install(&ctx).expect("the system fonts load");
+
+        let run_frame = |time: f64, events: Vec<Event>| -> Vec<Event> {
+            let mut remaining = Vec::new();
+            ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    begin(ui.ctx(), true);
+                    let (_, width) = layout(ui.ctx());
+                    let rect = Rect::from_min_size(pos2(10.0, 4.0), vec2(width, 24.0));
+                    show(ui, rect, 1.0, Color32::GRAY, |_, _, _| false);
+                    remaining = ui.input(|input| input.events.clone());
+                },
+            )
+            .drop_without_applying_deltas();
+            remaining
+        };
+
+        open(&ctx);
+        run_frame(1.0, Vec::new());
+        run_frame(1.1, Vec::new());
+
+        // Start IME preedit, then press Escape and Enter while composing: find must stay open!
+        run_frame(
+            1.2,
+            vec![
+                Event::Ime(ImeEvent::Preedit {
+                    text: "にほん".into(),
+                    active_range_chars: None,
+                }),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(with(&ctx, |find| find.open && find.composing));
+
+        run_frame(
+            1.25,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(
+            with(&ctx, |find| find.open),
+            "Escape during IME preedit cancels preedit instead of closing find"
+        );
+
+        // Commit ends IME composition, and also verify non-keyboard events survive `bar::show`'s
+        // event swap intact.
+        let pointer_event = Event::PointerButton {
+            pos: Pos2::new(300.0, 300.0),
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        };
+        let remaining = run_frame(
+            1.3,
+            vec![
+                Event::Ime(ImeEvent::Commit("日本".into())),
+                pointer_event.clone(),
+            ],
+        );
+        assert!(!with(&ctx, |find| find.composing));
+        assert_eq!(with(&ctx, |find| find.query.clone()), "日本");
+        assert!(
+            remaining.contains(&pointer_event),
+            "non-keyboard frame events are restored around text_field via mem::swap"
+        );
+
+        // Once composition has ended, Escape closes the find bar normally.
+        run_frame(
+            1.4,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(!with(&ctx, |find| find.open));
+    }
 }

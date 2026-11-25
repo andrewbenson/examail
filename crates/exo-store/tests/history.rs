@@ -178,8 +178,37 @@ async fn labels_made_elsewhere_are_picked_up() {
 #[tokio::test]
 async fn deleted_mail_disappears() {
     let harness = Harness::synced().await;
-    let inbox = harness.all(&ListId::Inbox).await;
-    let doomed = inbox.iter().find(|t| t.drafts == 0).unwrap().id.clone();
+    let delivered = harness
+        .deliver(json!({
+            "from": "Unique Person <unique.deleted@example.com>",
+            "subject": "Ephemeral xylophone",
+            "text": "Xylophone token for deletion unindex check",
+        }))
+        .await;
+    let doomed = ThreadId::new(delivered.thread_id.unwrap());
+    harness.store.sync().await.unwrap();
+    harness.store.load_bodies(&doomed).await.unwrap();
+    assert_eq!(
+        harness
+            .store
+            .recent_threads("unique.deleted@example.com", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut s = exo_store::Search::new("xylophone");
+    assert_eq!(
+        harness
+            .store
+            .search(&mut s, 20, false, 15)
+            .await
+            .unwrap()
+            .results
+            .len(),
+        1
+    );
+
     harness
         .gmail
         .gmail()
@@ -189,6 +218,26 @@ async fn deleted_mail_disappears() {
     harness.store.sync().await.unwrap();
     assert!(!harness.ids(&ListId::Inbox).await.contains(doomed.as_str()));
     assert!(harness.store.thread(&doomed).await.unwrap().is_none());
+    assert!(
+        harness
+            .store
+            .recent_threads("unique.deleted@example.com", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "ParticipantEntry was unindexed"
+    );
+    let mut s2 = exo_store::Search::new("xylophone");
+    assert!(
+        harness
+            .store
+            .search(&mut s2, 20, false, 15)
+            .await
+            .unwrap()
+            .results
+            .is_empty(),
+        "search_fts was unindexed"
+    );
 }
 
 #[tokio::test]

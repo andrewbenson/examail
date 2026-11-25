@@ -492,6 +492,9 @@ impl crate::Mail {
                 self.compose_run(compose::Action::ReplyAllWith(Field::Body), now);
                 if self.compose.focused().is_some() {
                     self.compose_apply_snippet(&snippet, false, now);
+                } else {
+                    self.compose_attach_pending_snippet(snippet);
+                    return;
                 }
             }
             _ => {
@@ -504,17 +507,31 @@ impl crate::Mail {
                     body: String::new(),
                 };
                 self.compose_new(fields, Some(Field::Body));
-                // The recipients came with the fields. Applying the snippet adds the rest
-                // (subject, body, variables, files).
-                let only = exo_store::Snippet {
-                    to: Vec::new(),
-                    cc: Vec::new(),
-                    bcc: Vec::new(),
-                    ..snippet
-                };
-                self.compose_apply_snippet(&only, false, now);
+                if self.compose_alert().is_none()
+                    && self
+                        .compose
+                        .focused()
+                        .is_some_and(|open| !open.is_snippet())
+                {
+                    // The recipients came with the fields. Applying the snippet adds the rest
+                    // (subject, body, variables, files).
+                    let only = exo_store::Snippet {
+                        to: Vec::new(),
+                        cc: Vec::new(),
+                        bcc: Vec::new(),
+                        ..snippet
+                    };
+                    self.compose_apply_snippet(&only, false, now);
+                } else {
+                    return;
+                }
             }
         }
+        self.record_snippet_used(id);
+    }
+
+    /// Marks snippet `id` as used now in the account's snippet ordering.
+    pub(crate) fn record_snippet_used(&mut self, id: &str) {
         self.account.update_settings(|settings| {
             settings
                 .snippets_last_used
@@ -531,5 +548,193 @@ impl crate::Mail {
         };
         self.close_snippet_view();
         self.discard_saved_snippet(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use exo_store::{Body, Contact, MessageDetail, Snippet, ThreadDetail, ThreadId};
+    use jiff::Timestamp;
+
+    use super::*;
+    use crate::{
+        Clock, Mail,
+        account::{Account, Credentials},
+        thread::ThreadView,
+    };
+
+    fn test_mail(name: &str) -> (Mail, std::path::PathBuf) {
+        let ctx = egui::Context::default();
+        let _ = exo_ui::install(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "exo-snippets-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = Account::open(
+            &dir,
+            Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let mail = Mail::new(&ctx, &crate::assets_dir(), account, Clock::system());
+        (mail, dir)
+    }
+
+    fn saved_snippet(id: &str, body: &str) -> Snippet {
+        Snippet {
+            id: id.into(),
+            name: "Thanks".into(),
+            subject: "Thank you".into(),
+            body: body.into(),
+            ..Snippet::default()
+        }
+    }
+
+    #[test]
+    fn thread_origin_applies_snippet_once_pending_reply_opens() {
+        let (mut mail, dir) = test_mail("pending-reply");
+        let snippet = saved_snippet("snip-1", "<div>Thanks a lot!</div>");
+        mail.account
+            .update_settings(|settings| settings.snippets.push(snippet));
+
+        // Open a thread whose detail hasn't loaded yet, so ReplyAllWith queues PendingReply.
+        mail.thread = Some(ThreadView::new(
+            "thread-pending".into(),
+            mail.now.clone(),
+            "maya@brightmoor.co".into(),
+            mail.images.clone(),
+        ));
+        mail.snippets.origin = Some(Origin::Thread);
+        mail.use_snippet("snip-1", 1.0);
+
+        assert!(
+            mail.compose.focused().is_none(),
+            "reply waits for thread detail"
+        );
+        assert!(
+            !mail
+                .account
+                .settings()
+                .snippets_last_used
+                .contains_key("snip-1"),
+            "last-used waits until snippet is actually applied"
+        );
+
+        // Once the thread detail loads, compose_sync opens the reply and applies the snippet.
+        let detail = Arc::new(ThreadDetail {
+            id: ThreadId::new("thread-pending"),
+            subject: "Quick question".into(),
+            labels: vec!["INBOX".into()],
+            muted: false,
+            reminder: None,
+            messages: vec![MessageDetail {
+                id: "msg-1".into(),
+                labels: vec!["INBOX".into()],
+                date: Timestamp::UNIX_EPOCH,
+                from: Some(Contact {
+                    name: Some("Tom Becker".into()),
+                    email: "tom@brightmoor.co".into(),
+                    is_me: false,
+                }),
+                to: vec![Contact {
+                    name: Some("Maya Okafor".into()),
+                    email: "maya@brightmoor.co".into(),
+                    is_me: true,
+                }],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                reply_to: Vec::new(),
+                subject: "Quick question".into(),
+                snippet: "Ping".into(),
+                rfc822_id: Some("m1@brightmoor.co".into()),
+                in_reply_to: None,
+                references: Vec::new(),
+                list_id: None,
+                list_unsubscribe: None,
+                list_unsubscribe_post: None,
+                headers: Vec::new(),
+                body: Body {
+                    html: Some("<div>Ping</div>".into()),
+                    text: Some("Ping".into()),
+                },
+                attachments: Vec::new(),
+                failure: None,
+                scheduled: None,
+                sending: false,
+            }],
+        });
+        mail.thread.as_mut().expect("thread").set_detail(detail);
+        mail.compose_sync();
+
+        let open = mail.compose.focused().expect("reply opened");
+        assert!(
+            open.editor.html().contains("Thanks a lot!"),
+            "pending snippet applied: {}",
+            open.editor.html()
+        );
+        assert!(
+            mail.account
+                .settings()
+                .snippets_last_used
+                .contains_key("snip-1"),
+            "last-used recorded once applied"
+        );
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elsewhere_origin_does_not_mutate_unsaved_snippet_when_save_prompt_blocks_compose_new() {
+        let (mut mail, dir) = test_mail("unsaved-snippet");
+        let snippet = saved_snippet("snip-2", "<div>INJECTED</div>");
+        mail.account
+            .update_settings(|settings| settings.snippets.push(snippet));
+
+        // Open an unsaved snippet with content so compose_new triggers "Save Snippet?".
+        mail.create_snippet("Draft snippet".into());
+        assert!(
+            mail.compose
+                .focused()
+                .is_some_and(compose::Open::is_snippet)
+        );
+        mail.snippets.origin = Some(Origin::Elsewhere);
+        mail.use_snippet("snip-2", 2.0);
+
+        assert!(
+            mail.compose_alert().is_some(),
+            "Save Snippet? alert was shown"
+        );
+        let focused = mail
+            .compose
+            .focused()
+            .expect("unsaved snippet still focused");
+        assert!(focused.is_snippet());
+        assert!(
+            !focused.editor.html().contains("INJECTED"),
+            "unsaved snippet must not be mutated in place: {}",
+            focused.editor.html()
+        );
+        assert!(
+            !mail
+                .account
+                .settings()
+                .snippets_last_used
+                .contains_key("snip-2"),
+            "last-used must not update when blocked by Save Snippet?"
+        );
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

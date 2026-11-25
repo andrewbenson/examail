@@ -5,7 +5,7 @@ use egui::{
     pos2, text::LayoutJob, vec2,
 };
 use exo_ui::{
-    Family, Font, IconButton, KeyTooltip, LabelChip, Placement, TextStyle, chip_hover,
+    Family, Font, KeyTooltip, LabelChip, Placement, TextStyle, chip_hover,
     motion::{self, CubicBezier},
     paint_icon, paint_job,
 };
@@ -20,6 +20,7 @@ use crate::{
         row as text,
     },
     mailbox::{Attachments, ThreadSummary},
+    triage_copy::{DONE_ICON, TriageAction, TriageRemind, TriageStrip},
 };
 use exo_store::ReminderStatus;
 
@@ -1051,109 +1052,34 @@ fn actions(
     archivable: bool,
     now: &Zoned,
 ) -> (f32, Option<Hit>) {
-    let done = thread.done;
-    let mut hit = None;
-    let mut left = right + 4.0;
-    let remind = if thread.has_reminder() {
-        REMIND_SET_ICON
-    } else {
-        REMIND_ICON
-    };
-    let buttons = [
-        ("legacy/DEPRECATED_threadActionsCommand", Hit::Command),
-        (remind, Hit::Remind),
-        (DONE_ICON, Hit::Done),
-    ];
-    let shown = |action: &Hit| match action {
-        Hit::Done => archivable,
-        Hit::Remind => !thread.draft_only,
-        _ => true,
-    };
-    for (icon, action) in buttons.into_iter().filter(|(_, action)| shown(action)) {
-        let width = if matches!(action, Hit::Done) {
-            20.0
-        } else {
-            24.0
-        };
-        let button = Rect::from_min_size(pos2(left - width, row.top() + 5.0), vec2(width, 24.0));
-        let icon_rect = match action {
-            Hit::Done => Rect::from_min_size(button.min + vec2(0.0, 5.0), vec2(16.0, 14.0)),
-            _ => Rect::from_min_size(button.min + vec2(5.0, 5.0), Vec2::splat(14.0)),
-        };
-        let response = if done && matches!(action, Hit::Done) {
-            done_check(ui, id.with(icon), button, icon_rect)
-        } else if icon == REMIND_SET_ICON {
-            IconButton::new(icon)
-                .colors(
-                    Color32::from_rgb(0xe0, 0xbf, 0xe0),
-                    Color32::from_rgb(0xcd, 0x7a, 0xcf),
-                )
-                .show(ui, id.with(icon), button, icon_rect)
-        } else {
-            IconButton::new(icon).show(ui, id.with(icon), button, icon_rect)
-        };
-        // Under the button, 10px right of its centre.
-        let tooltip = match action {
-            Hit::Done if done => KeyTooltip {
-                text: "Mark not Done",
-                keys: &["shift", "E"],
-            },
-            Hit::Done => KeyTooltip {
-                text: "Mark Done",
-                keys: &["E"],
-            },
-            Hit::Remind => KeyTooltip {
-                text: "Remind Me",
-                keys: &["H"],
-            },
-            _ => KeyTooltip {
-                text: "Examail Command",
-                keys: &["⌘", "K"],
-            },
-        };
-        let placement = Placement::Below {
-            gap: 8.0,
-            shift: 10.0,
-        };
-        match thread
-            .reminder
-            .as_ref()
-            .filter(|_| matches!(action, Hit::Remind))
-        {
-            Some(reminder) => tooltip.show_at_with_status(
-                ui,
-                &response,
-                placement,
-                &crate::remind::status(reminder, now),
-                egui::Rangef::new(row.left(), row.right()),
-            ),
-            None => tooltip.show_at(ui, &response, placement),
-        }
-        if response.clicked() {
-            hit = Some(action);
-        }
-        left = button.left() - 4.0;
-    }
-    (left + 4.0, hit)
+    let status = thread
+        .reminder
+        .as_ref()
+        .map(|reminder| crate::remind::status(reminder, now));
+    let remind = (!thread.draft_only).then(|| TriageRemind {
+        set: thread.has_reminder(),
+        status: status.as_deref(),
+        keys: &["H"],
+        within: egui::Rangef::new(row.left(), row.right()),
+    });
+    let (left, clicked) = (TriageStrip {
+        right: right + 4.0,
+        top: row.top() + 5.0,
+        done_width: 20.0,
+        done_inset: vec2(0.0, 5.0),
+        other_inset: vec2(5.0, 5.0),
+        done: archivable.then_some(thread.done),
+        remind,
+    })
+    .show(ui, id);
+    let hit = clicked.map(|action| match action {
+        TriageAction::Done => Hit::Done,
+        TriageAction::Remind => Hit::Remind,
+        TriageAction::Command => Hit::Command,
+    });
+    (left, hit)
 }
 
-/// The done check.
-pub(super) const DONE_ICON: &str = "legacy/DEPRECATED_threadActionsDone";
-
-/// The check of a done selection, which is Mark not Done, in `button` with its glyph at `icon`:
-/// `#8892b9` and 2 units wide, `#5f74aa` while hovered.
-pub(super) fn done_check(ui: &Ui, id: egui::Id, button: Rect, icon: Rect) -> egui::Response {
-    let response = ui
-        .interact(button, id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let color = if response.hovered() {
-        Color32::from_rgb(0x5f, 0x74, 0xaa)
-    } else {
-        exo_ui::palette(ui.ctx()).actions_done_default
-    };
-    exo_ui::paint_icon_stroked(ui, DONE_ICON, exo_ui::pixel_snap(icon), color, 2.0);
-    response
-}
 /// The clock, bolder when a reminder is set.
 pub(crate) const REMIND_ICON: &str = "legacy/DEPRECATED_threadActionsRemind-unset";
 pub(crate) const REMIND_SET_ICON: &str = "legacy/DEPRECATED_threadActionsRemind";

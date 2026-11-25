@@ -22,15 +22,15 @@ use tokio::sync::MutexGuard;
 
 use crate::api::{Api, Failure};
 use crate::db::{
-    self, ALIASES, AttachmentRow, BodyRow, HISTORY_ID, IDENTITY, KvRow, LabelRow, ListCursor,
-    ListEntry, MessageRow, ParticipantEntry, ThreadRow,
+    self, ALIASES, AttachmentRow, BodyRow, EVICTED_BEFORE, HISTORY_ID, IDENTITY, KvRow, LabelRow,
+    ListCursor, ListEntry, MessageRow, ParticipantEntry, TextDue, ThreadRow,
 };
 use crate::error::Result;
 use crate::ids::ListId;
 use crate::ids::labels::{CHAT, EXO_MUTED, EXO_PARENT, EXO_REMINDER_UNREAD, EXO_SNOOZED};
 use crate::model::Alias;
 use crate::quota::Lane;
-use crate::store::{Inner, Store, reindex};
+use crate::store::{Inner, Store, reindex_many};
 use crate::view::{Identity, Router};
 
 /// Tries per sync call before giving up.
@@ -342,9 +342,7 @@ impl Inner {
             me: identity.clone(),
             ..self.router()
         };
-        for thread in &threads {
-            reindex(write.exec(), thread, &router).await?;
-        }
+        reindex_many(write.exec(), &threads, &router).await?;
         // Only once it's stored, so a failure above leaves the old identity and the next
         // bootstrap tries again.
         write.commit().await?;
@@ -400,9 +398,13 @@ impl Inner {
         BodyRow::all().delete().exec(write.exec()).await?;
         ListEntry::all().delete().exec(write.exec()).await?;
         ParticipantEntry::all().delete().exec(write.exec()).await?;
+        TextDue::all().delete().exec(write.exec()).await?;
+        toasty::sql::statement("DELETE FROM search_fts")
+            .exec(write.exec())
+            .await?;
         ListCursor::all().delete().exec(write.exec()).await?;
         LabelRow::all().delete().exec(write.exec()).await?;
-        KvRow::filter_by_key(HISTORY_ID)
+        KvRow::filter(KvRow::fields().key().in_list([HISTORY_ID, EVICTED_BEFORE]))
             .delete()
             .exec(write.exec())
             .await?;
@@ -712,5 +714,81 @@ mod tests {
             needs_structure(&outlook),
             "an Exchange invite's calendar part is an alternative"
         );
+    }
+
+    #[tokio::test]
+    async fn bankrupt_clears_search_fts_text_due_and_evicted_before() {
+        let dir = std::env::temp_dir().join(format!("exo-store-bankrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            gmail::StaticToken("unused".into()),
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        let msg = gmail::Message {
+            id: Some("m1".into()),
+            thread_id: Some("t1".into()),
+            internal_date: Some(1_794_900_000_000),
+            label_ids: vec!["INBOX".into()],
+            payload: Some(gmail::MessagePart {
+                mime_type: Some("text/plain".into()),
+                headers: vec![gmail::MessagePartHeader {
+                    name: "Subject".into(),
+                    value: "BankruptSubject".into(),
+                }],
+                body: Some(gmail::MessagePartBody {
+                    data: Some(b"uniquebankruptword".to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            let parsed = crate::parse::parse(&msg, true).expect("parses");
+            crate::provider::save_message(write.exec(), parsed)
+                .await
+                .expect("saves");
+            crate::store::reindex(write.exec(), "t1", &store.inner.router())
+                .await
+                .expect("indexes");
+            db::kv_set(write.exec(), HISTORY_ID, &42_u64)
+                .await
+                .expect("kv");
+            db::kv_set(write.exec(), EVICTED_BEFORE, &1_700_000_000_000_i64)
+                .await
+                .expect("kv");
+            write.commit().await.expect("commits");
+        }
+
+        store.inner.bankrupt().await.expect("bankrupts");
+        assert!(
+            TextDue::all().exec(&mut db).await.expect("due").is_empty(),
+            "text_due cleared"
+        );
+        assert_eq!(
+            db::kv_get::<i64>(&mut db, EVICTED_BEFORE)
+                .await
+                .expect("kv"),
+            None,
+            "EVICTED_BEFORE cleared"
+        );
+        let mut s = crate::Search::new("uniquebankruptword");
+        assert!(
+            store
+                .search(&mut s, 10, false, 10)
+                .await
+                .expect("search")
+                .results
+                .is_empty(),
+            "search_fts cleared"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

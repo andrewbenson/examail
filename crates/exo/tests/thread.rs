@@ -679,7 +679,8 @@ fn multi_click(app: &mut Fixture, at: egui::Pos2, count: usize) {
     app.settle();
 }
 
-/// ⌘C, and the text it put on the clipboard (in whichever frame the body worker answered).
+/// ⌘C as egui-winit reports it (`Event::Copy`, then the key let go), and the text it put on the
+/// clipboard (in whichever frame the body worker answered).
 fn copy(app: &mut Fixture) -> Option<String> {
     let command = Modifiers {
         mac_cmd: true,
@@ -688,12 +689,13 @@ fn copy(app: &mut Fixture) -> Option<String> {
     };
     let mut copied = None;
     for frame in 0..200 {
-        if frame < 2 {
-            let pressed = frame == 0;
+        if frame == 0 {
+            app.harness.input_mut().events.push(egui::Event::Copy);
+        } else if frame == 1 {
             app.harness.input_mut().events.push(egui::Event::Key {
                 key: Key::C,
                 physical_key: None,
-                pressed,
+                pressed: false,
                 repeat: false,
                 modifiers: command,
             });
@@ -828,4 +830,55 @@ fn a_full_headers_addresses_select_and_suggest_copy_recipients() {
     );
     let copied = copy(&mut app).expect("copied");
     assert!(copied.contains("Tom"), "{copied}");
+}
+
+#[test]
+fn dragging_across_a_bodys_text_and_pressing_cmd_c_copies_it() {
+    let mut app = start("thread-body-drag-copy");
+    let html = "<div>First sentence to copy from the email body.</div><div>Second line.</div>";
+    let delivery = serde_json::json!({
+        "from": "Ann Lee <ann@example.com>",
+        "subject": "Copy body",
+        "html": html,
+    });
+    let deliver = app.mock_url().join("__mock/deliver").expect("a URL");
+    app.block_on(async {
+        reqwest::Client::new()
+            .post(deliver)
+            .json(&delivery)
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .expect("delivered");
+    app.sync();
+    while app.cursor() != "Copy body" {
+        app.key(Key::K);
+    }
+    app.key(Key::Enter);
+    let line = (140..400)
+        .step_by(4)
+        .map(|y| egui::pos2(260.0, y as f32))
+        .find(|at| app.hover(*at) == egui::CursorIcon::Text)
+        .expect("the body's first line")
+        + egui::vec2(0.0, 4.0);
+    let from = (230..300)
+        .map(|x| egui::pos2(x as f32, line.y))
+        .find(|at| app.hover(*at) == egui::CursorIcon::Text)
+        .expect("the start of the first line");
+    drag(&mut app, from, egui::pos2(700.0, line.y));
+    assert_eq!(
+        copy(&mut app).as_deref(),
+        Some("First sentence to copy from the email body.")
+    );
+    // Moving focus to the thread header leaves the selection copyable with ⌘C.
+    app.key(Key::ArrowUp);
+    assert_eq!(
+        app.mail().thread().expect("open").region(),
+        exo_commands::Region::ThreadMessagesHeader
+    );
+    assert_eq!(
+        copy(&mut app).as_deref(),
+        Some("First sentence to copy from the email body.")
+    );
 }

@@ -8,10 +8,8 @@
 
 mod setup;
 
-use std::sync::mpsc;
-
 use egui::{Key, Rect, Ui, pos2, vec2};
-use exo_commands::{Command, Commands, Region};
+use exo_commands::{Commands, Region};
 use exo_store::{Definitions, ListCount, ListId, SplitChanges, SplitInbox};
 use exo_ui::{ALERT_TEXT, ALERT_TEXT_INK};
 
@@ -96,10 +94,12 @@ pub(crate) struct State {
     setup: Option<setup::Setup>,
     /// The flow shows in Snow until it ends.
     snow: bool,
+    /// Bumped when account setup opens, so an earlier preview never lands on a new run.
+    generation: u64,
     /// The preview is being worked out.
-    preview: Option<mpsc::Receiver<Option<exo_store::SplitPreview>>>,
+    previewing: bool,
     /// Setup is over and the inbox is being counted.
-    count: Option<mpsc::Receiver<Option<ListCount>>>,
+    counting: bool,
     /// `Welcome to Exo` is up.
     welcome: bool,
 }
@@ -109,11 +109,7 @@ pub(crate) struct State {
 pub(crate) fn register(commands: &mut Commands<commands::Action>, state: &State) {
     let act = commands::Action::FirstRun;
     if state.welcome {
-        commands.add(
-            Command::shortcut("WELCOME_GET_STARTED", act(Action::GetStarted))
-                .keys(["enter", "space", "esc"])
-                .regions(&[Region::Alert]),
-        );
+        crate::notice::register_alert_dismiss(commands, act(Action::GetStarted));
     }
 }
 
@@ -163,7 +159,9 @@ impl crate::Mail {
             .map(|library| setup::candidates(library, &splits, definitions))
             .unwrap_or_default();
         self.first_run.setup = Some(setup::Setup::new(&self.ctx, &self.images, candidates));
-        self.first_run.preview = None;
+        self.first_run.snow = true;
+        self.first_run.generation += 1;
+        self.first_run.previewing = false;
     }
 
     /// Whether the flow covers the window or its alert is up, so that its keys are the only ones.
@@ -187,8 +185,8 @@ impl crate::Mail {
 
     /// Whether nothing in the flow is still being worked out. For screenshots and tests.
     pub(crate) fn first_run_idle(&self) -> bool {
-        self.first_run.preview.is_none()
-            && self.first_run.count.is_none()
+        !self.first_run.previewing
+            && !self.first_run.counting
             && self
                 .first_run
                 .setup
@@ -269,7 +267,7 @@ impl crate::Mail {
             self.first_run.setup.as_ref().map(|setup| &setup.step),
             Some(setup::Step::Loading { preview: None, .. })
         );
-        if wants && self.first_run.preview.is_none() && !self.snapshot.loading {
+        if wants && !self.first_run.previewing && !self.snapshot.loading {
             let candidates: Vec<SplitInbox> = self
                 .first_run
                 .setup
@@ -281,8 +279,9 @@ impl crate::Mail {
                         .map(|candidate| candidate.split.clone())
                 })
                 .collect();
-            let (sender, receiver) = mpsc::channel();
-            let ctx = self.ctx.clone();
+            let generation = self.first_run.generation;
+            self.first_run.previewing = true;
+            let ui = self.ui_sender();
             self.account.loader().run(
                 move |store| async move {
                     store
@@ -292,37 +291,19 @@ impl crate::Mail {
                         .ok()
                 },
                 move |preview| {
-                    let _ = sender.send(preview);
-                    ctx.request_repaint();
+                    ui.send(move |mail| {
+                        if mail.first_run.generation != generation {
+                            return;
+                        }
+                        mail.first_run.previewing = false;
+                        if let Some(setup::Step::Loading { preview: slot, .. }) =
+                            mail.first_run.setup.as_mut().map(|setup| &mut setup.step)
+                        {
+                            *slot = Some(preview.unwrap_or_default());
+                        }
+                    });
                 },
             );
-            self.first_run.preview = Some(receiver);
-        }
-        if let Some(preview) = self
-            .first_run
-            .preview
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok())
-        {
-            self.first_run.preview = None;
-            if let Some(setup::Step::Loading { preview: slot, .. }) =
-                self.first_run.setup.as_mut().map(|setup| &mut setup.step)
-            {
-                *slot = Some(preview.unwrap_or_default());
-            }
-        }
-        if let Some(count) = self
-            .first_run
-            .count
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok())
-        {
-            self.first_run.count = None;
-            if ends_in_get_me_to_zero(count) {
-                self.open_first_get_me_to_zero();
-            } else {
-                self.first_run.welcome = true;
-            }
         }
     }
 
@@ -522,8 +503,8 @@ impl crate::Mail {
         self.account
             .update_device_settings(|device| device.account_setup_pending = false);
         self.command_nudge_first_open();
-        let (sender, receiver) = mpsc::channel();
-        let ctx = self.ctx.clone();
+        self.first_run.counting = true;
+        let ui = self.ui_sender();
         self.account.loader().run(
             // Counts every inbox conversation, including the splits'.
             |store| async move {
@@ -534,23 +515,20 @@ impl crate::Mail {
                     .ok()
             },
             move |count| {
-                let _ = sender.send(count);
-                ctx.request_repaint();
+                ui.send(move |mail| {
+                    mail.first_run.counting = false;
+                    if ends_in_get_me_to_zero(count) {
+                        mail.open_first_get_me_to_zero();
+                    } else {
+                        mail.first_run.welcome = true;
+                    }
+                });
             },
         );
-        self.first_run.count = Some(receiver);
     }
 
     /// `Welcome to Exo`, over `page` dimmed.
     fn show_welcome_alert(&mut self, ui: &mut Ui, page: Rect) {
-        // The overlay dims the page to half and leaves nothing behind it clickable.
-        ui.painter()
-            .rect_filled(page, 0.0, egui::Color32::from_black_alpha(128));
-        let _ = ui.interact(
-            page,
-            ui.id().with("welcome-alert-overlay"),
-            egui::Sense::click(),
-        );
         let alert = exo_ui::Alert {
             title: WELCOME_TITLE,
             text: "",
@@ -558,7 +536,7 @@ impl crate::Mail {
             selected: 0,
         };
         let height = WELCOME_LINES.len() as f32 * ALERT_TEXT.line_height;
-        let clicked =
+        let (clicked, _) = exo_ui::Alert::modal(ui.ctx(), "welcome-alert", page, |ui| {
             alert.show_body_with_title_emoji(ui, page, ROCKET, ROCKET_SIZE, height, |ui, body| {
                 for (index, line) in WELCOME_LINES.iter().enumerate() {
                     ALERT_TEXT.paint_line(
@@ -572,7 +550,8 @@ impl crate::Mail {
                         None,
                     );
                 }
-            });
+            })
+        });
         if clicked.is_some() {
             self.first_run_run(Action::GetStarted);
         }
@@ -607,5 +586,41 @@ mod tests {
             "Gmail has more than the store"
         );
         assert!(ends_in_get_me_to_zero(None));
+    }
+
+    #[test]
+    fn account_setup_forces_snow_theme_until_finished() {
+        let ctx = egui::Context::default();
+        let _ = exo_ui::install(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "exo-first-run-snow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = crate::account::Account::open(
+            &dir,
+            crate::account::Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: std::sync::Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let mut mail =
+            crate::Mail::new(&ctx, &crate::assets_dir(), account, crate::Clock::system());
+        assert_eq!(mail.first_run_theme(), None);
+
+        mail.open_account_setup();
+        assert_eq!(mail.first_run_theme(), Some(exo_store::Theme::Snow));
+
+        mail.finish_setup();
+        assert_eq!(mail.first_run_theme(), None);
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

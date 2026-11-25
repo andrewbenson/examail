@@ -1,5 +1,5 @@
 //! The thread list's commands, with their keys, regions, palette titles, aliases and scores,
-//! registered every frame for what's on screen, and the toast copy for what they do.
+//! registered every frame for what's on screen.
 //!
 //! Only what works end to end is registered, so there's no AI. Compose, search and the list filters
 //! register their own (`compose::register_shortcuts`, `search::register`,
@@ -10,8 +10,12 @@ use exo_store::{Label, ListId, Mutation};
 
 use crate::{
     account::UndoToken,
+    folders::Key as FolderKey,
     lists::{self, GoTo},
     mailbox::ThreadSummary,
+    pickers::Action as Pick,
+    remind::Action as Remind,
+    thread::{GutterKey, HeaderKey as ThreadHeader},
 };
 
 /// Where list navigation and selection keys live.
@@ -233,43 +237,450 @@ pub enum Action {
     Backdrop(crate::backdrop::Action),
 }
 
-/// The header's and the back gutter's keys (`ThreadMessagesHeader`, `ActionPane`).
-fn header_keys(commands: &mut Commands<Action>) {
-    use crate::thread::{GutterKey, HeaderKey};
-    const HEADER: &[Region] = &[Region::ThreadMessagesHeader];
-    const GUTTER: &[Region] = &[Region::ActionPane];
-    let header = |id: &'static str, key: HeaderKey| {
-        Command::shortcut(id, Action::ThreadHeader(key)).regions(HEADER)
-    };
-    commands.add(header("HEADER_ESCAPE", HeaderKey::Escape).key("esc"));
-    commands.add(header("HEADER_UP", HeaderKey::Up).keys(["up", "p", "ctralt+k", "ctralt+p"]));
-    commands
-        .add(header("HEADER_DOWN", HeaderKey::Down).keys(["down", "n", "ctralt+j", "ctralt+n"]));
-    commands.add(header("HEADER_LEFT", HeaderKey::Step(-1)).key("left"));
-    commands.add(header("HEADER_RIGHT", HeaderKey::Step(1)).key("right"));
-    commands.add(header("HEADER_ENTER", HeaderKey::Enter).key("enter"));
-    // Enter goes back as the button does. ↑ and ↓ move between conversations.
-    commands.add(
-        Command::shortcut("ACTION_PANE_ENTER", Action::LeaveThread)
-            .key("enter")
-            .regions(GUTTER),
-    );
-    commands.add(
-        Command::shortcut("ACTION_PANE_RIGHT", Action::ThreadGutter(GutterKey::Right))
-            .keys(["right", "tab"])
-            .regions(GUTTER),
-    );
-    commands.add(
-        Command::shortcut("ACTION_PANE_UP", Action::NextConversation(-1))
-            .keys(["up", "ctralt+k", "ctralt+p"])
-            .regions(GUTTER),
-    );
-    commands.add(
-        Command::shortcut("ACTION_PANE_DOWN", Action::NextConversation(1))
-            .keys(["down", "ctralt+j", "ctralt+n"])
-            .regions(GUTTER),
-    );
+/// Declarative specification for a static shortcut or palette command.
+struct CommandSpec {
+    id: &'static str,
+    title: Option<&'static str>,
+    action: Action,
+    repeat: Option<Action>,
+    keys: &'static [&'static str],
+    key_code: Option<&'static [&'static str]>,
+    typing: Option<&'static str>,
+    regions: Option<&'static [Region]>,
+    aliases: &'static [&'static str],
+    operative_word: Option<&'static str>,
+    default_score: f64,
+    scale: Option<f64>,
+    follow: Option<&'static str>,
+    multiple: bool,
+    icon: Option<&'static str>,
 }
+
+const fn sc(
+    id: &'static str,
+    keys: &'static [&'static str],
+    regions: &'static [Region],
+    action: Action,
+) -> CommandSpec {
+    CommandSpec {
+        id,
+        title: None,
+        action,
+        repeat: None,
+        keys,
+        key_code: None,
+        typing: None,
+        regions: Some(regions),
+        aliases: &[],
+        operative_word: None,
+        default_score: 0.0,
+        scale: None,
+        follow: None,
+        multiple: false,
+        icon: None,
+    }
+}
+
+const fn sc_rep(
+    id: &'static str,
+    keys: &'static [&'static str],
+    regions: &'static [Region],
+    action: Action,
+    repeat: Action,
+) -> CommandSpec {
+    CommandSpec {
+        id,
+        title: None,
+        action,
+        repeat: Some(repeat),
+        keys,
+        key_code: None,
+        typing: None,
+        regions: Some(regions),
+        aliases: &[],
+        operative_word: None,
+        default_score: 0.0,
+        scale: None,
+        follow: None,
+        multiple: false,
+        icon: None,
+    }
+}
+
+const fn row(id: &'static str, title: &'static str, action: Action) -> CommandSpec {
+    CommandSpec {
+        id,
+        title: Some(title),
+        action,
+        repeat: None,
+        keys: &[],
+        key_code: None,
+        typing: None,
+        regions: None,
+        aliases: &[],
+        operative_word: None,
+        default_score: 0.0,
+        scale: None,
+        follow: None,
+        multiple: false,
+        icon: None,
+    }
+}
+
+const fn conv(
+    id: &'static str,
+    title: &'static str,
+    icon: &'static str,
+    score: f64,
+    action: Action,
+) -> CommandSpec {
+    row(id, title, action)
+        .icon(icon)
+        .score(score)
+        .multiple()
+        .regions(CONVERSATION)
+}
+
+impl CommandSpec {
+    const fn keys(mut self, keys: &'static [&'static str]) -> Self {
+        self.keys = keys;
+        self
+    }
+    const fn key_code(mut self, key_code: &'static [&'static str]) -> Self {
+        self.key_code = Some(key_code);
+        self
+    }
+    const fn when_typing(mut self, typing: &'static str) -> Self {
+        self.typing = Some(typing);
+        self
+    }
+    const fn regions(mut self, regions: &'static [Region]) -> Self {
+        self.regions = Some(regions);
+        self
+    }
+    const fn aliases(mut self, aliases: &'static [&'static str]) -> Self {
+        self.aliases = aliases;
+        self
+    }
+    const fn operative_word(mut self, word: &'static str) -> Self {
+        self.operative_word = Some(word);
+        self
+    }
+    const fn score(mut self, score: f64) -> Self {
+        self.default_score = score;
+        self
+    }
+    const fn scale(mut self, scale: f64) -> Self {
+        self.scale = Some(scale);
+        self
+    }
+    const fn follow(mut self, follow: &'static str) -> Self {
+        self.follow = Some(follow);
+        self
+    }
+    const fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+    const fn icon(mut self, icon: &'static str) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    fn build(&self) -> Command<Action> {
+        let mut cmd = match self.title {
+            Some(title) => Command::new(self.id, title, self.action.clone()),
+            None => Command::shortcut(self.id, self.action.clone()),
+        };
+        if !self.keys.is_empty() {
+            cmd = cmd.keys(self.keys.iter().copied());
+        }
+        if let Some(tokens) = self.key_code {
+            cmd = cmd.key_code(tokens.iter().copied());
+        }
+        if let Some(typing) = self.typing {
+            cmd = cmd.when_typing(typing);
+        }
+        if let Some(regions) = self.regions {
+            cmd = cmd.regions(regions);
+        }
+        if let Some(repeat) = &self.repeat {
+            cmd = cmd.repeat(repeat.clone());
+        }
+        if !self.aliases.is_empty() {
+            cmd = cmd.aliases(self.aliases.iter().copied());
+        }
+        if let Some(word) = self.operative_word {
+            cmd = cmd.operative_word(word);
+        }
+        if self.default_score != 0.0 {
+            cmd = cmd.default_score(self.default_score);
+        }
+        if let Some(scale) = self.scale {
+            cmd = cmd.scale(scale);
+        }
+        if let Some(follow) = self.follow {
+            cmd = cmd.follow(follow);
+        }
+        if self.multiple {
+            cmd = cmd.multiple();
+        }
+        if let Some(icon) = self.icon {
+            cmd = cmd.icon(icon);
+        }
+        cmd
+    }
+}
+
+fn register_specs(commands: &mut Commands<Action>, specs: &[CommandSpec]) {
+    for spec in specs {
+        commands.add(spec.build());
+    }
+}
+
+const THREAD_HDR: &[Region] = &[Region::ThreadMessagesHeader];
+const GUTTER: &[Region] = &[Region::ActionPane];
+const NEW_BAR: &[Region] = &[Region::ThreadMessagesNewMessages];
+const LIST_HDR: &[Region] = &[Region::ThreadListHeader];
+const LABEL_SW: &[Region] = &[Region::LabelSwitcher];
+/// ⌘⇧H is compose's own in the reply pane.
+const SHIFT_H_REGIONS: &[Region] = &[
+    Region::ThreadList,
+    Region::ThreadMessagesHeader,
+    Region::ThreadMessages,
+    Region::ThreadMessageCalendarInvite,
+    Region::ThreadMessagesNewMessages,
+];
+
+const THREAD_HEADER_SPECS: &[CommandSpec] = &[
+    sc(
+        "HEADER_ESCAPE",
+        &["esc"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Escape),
+    ),
+    sc(
+        "HEADER_UP",
+        &["up", "p", "ctralt+k", "ctralt+p"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Up),
+    ),
+    sc(
+        "HEADER_DOWN",
+        &["down", "n", "ctralt+j", "ctralt+n"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Down),
+    ),
+    sc(
+        "HEADER_LEFT",
+        &["left"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Step(-1)),
+    ),
+    sc(
+        "HEADER_RIGHT",
+        &["right"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Step(1)),
+    ),
+    sc(
+        "HEADER_ENTER",
+        &["enter"],
+        THREAD_HDR,
+        Action::ThreadHeader(ThreadHeader::Enter),
+    ),
+    // Enter goes back as the button does. ↑ and ↓ move between conversations.
+    sc("ACTION_PANE_ENTER", &["enter"], GUTTER, Action::LeaveThread),
+    sc(
+        "ACTION_PANE_RIGHT",
+        &["right", "tab"],
+        GUTTER,
+        Action::ThreadGutter(GutterKey::Right),
+    ),
+    sc(
+        "ACTION_PANE_UP",
+        &["up", "ctralt+k", "ctralt+p"],
+        GUTTER,
+        Action::NextConversation(-1),
+    ),
+    sc(
+        "ACTION_PANE_DOWN",
+        &["down", "ctralt+j", "ctralt+n"],
+        GUTTER,
+        Action::NextConversation(1),
+    ),
+];
+
+const THREAD_TOP_SPECS: &[CommandSpec] = &[
+    sc(
+        "BACK",
+        &["esc", "backspace"],
+        THREAD_BACK,
+        Action::ThreadBack,
+    ),
+    sc("GO_TO_LIST", &["g u"], GO_TO, Action::LeaveThread),
+];
+
+const THREAD_FOCUS_SPECS: &[CommandSpec] = &[
+    sc(
+        "NEXT_CONVERSATION",
+        &["j"],
+        NEXT_CONVERSATION,
+        Action::NextConversation(1),
+    ),
+    sc(
+        "PREVIOUS_CONVERSATION",
+        &["k"],
+        NEXT_CONVERSATION,
+        Action::NextConversation(-1),
+    ),
+    sc_rep(
+        "NEXT_MESSAGE",
+        &["n", "ctralt+n"],
+        MESSAGES_AND_NEW,
+        Action::NextMessage(1),
+        Action::NextMessage(1),
+    ),
+    sc_rep(
+        "PREVIOUS_MESSAGE",
+        &["p", "ctralt+p"],
+        MESSAGES_AND_NEW,
+        Action::NextMessage(-1),
+        Action::NextMessage(-1),
+    ),
+    sc_rep(
+        "FOCUS_DOWN",
+        &["down", "ctralt+j"],
+        MESSAGES_AND_NEW,
+        Action::Arrow(1),
+        Action::ArrowHeld(1),
+    ),
+    sc_rep(
+        "FOCUS_UP",
+        &["up", "ctralt+k"],
+        MESSAGES_AND_NEW,
+        Action::Arrow(-1),
+        Action::ArrowHeld(-1),
+    ),
+    sc_rep(
+        "FOCUS_LEFT",
+        &["left"],
+        MESSAGES_AND_NEW,
+        Action::ThreadLeft,
+        Action::ThreadLeftHeld,
+    ),
+    sc_rep(
+        "FOCUS_RIGHT",
+        &["right"],
+        MESSAGES_AND_NEW,
+        Action::ThreadRight,
+        Action::ThreadRight,
+    ),
+];
+
+const EXPAND_MESSAGE_SPEC: CommandSpec = sc(
+    "EXPAND_MESSAGE",
+    &["enter"],
+    THREAD_MESSAGES,
+    Action::ExpandMessage,
+);
+const SHOW_NEW_MESSAGES_ENTER_SPEC: CommandSpec = sc(
+    "SHOW_NEW_MESSAGES_ENTER",
+    &["enter"],
+    NEW_BAR,
+    Action::ShowNewMessages,
+);
+
+const THREAD_BODY_SPECS: &[CommandSpec] = &[
+    row(
+        "EXPAND_COLLAPSE_HEADER",
+        "Expand / collapse Message header",
+        Action::ToggleHeader,
+    )
+    .keys(&["shift+h"])
+    .key_code(&["shift", "H"])
+    .regions(THREAD_MESSAGES),
+    row(
+        "EXPAND_COLLAPSE_CURRENT",
+        "Expand / collapse current Message",
+        Action::ToggleMessage,
+    )
+    .keys(&["o"])
+    .key_code(&["O"])
+    .regions(THREAD_MESSAGES),
+    row(
+        "EXPAND_COLLAPSE_ALL",
+        "Expand / collapse all Messages",
+        Action::ToggleAllMessages,
+    )
+    .keys(&["shift+o"])
+    .key_code(&["shift", "O"])
+    .regions(THREAD_MESSAGES),
+    sc_rep(
+        "PAGE_DOWN",
+        &["space", "pagedown"],
+        THREAD_MESSAGES,
+        Action::PageThread(1),
+        Action::PageThread(1),
+    ),
+    sc_rep(
+        "PAGE_UP",
+        &["shift+space", "pageup"],
+        THREAD_MESSAGES,
+        Action::PageThread(-1),
+        Action::PageThread(-1),
+    ),
+    sc(
+        "JUMP_TO_TOP",
+        &["mod+up", "home", "shift+p"],
+        THREAD_MESSAGES,
+        Action::JumpThread(false),
+    ),
+    sc(
+        "JUMP_TO_TOP_SEQUENCE",
+        &["g g"],
+        MESSAGES_AND_NEW,
+        Action::JumpThread(false),
+    ),
+    sc(
+        "JUMP_TO_BOTTOM",
+        &["mod+down", "end"],
+        THREAD_MESSAGES,
+        Action::JumpThread(true),
+    ),
+    sc(
+        "JUMP_TO_BOTTOM_SHIFT",
+        &["shift+g"],
+        MESSAGES_AND_NEW,
+        Action::JumpThread(true),
+    ),
+    sc(
+        "SHOW_NEW_MESSAGES",
+        &["shift+n"],
+        THREAD_PANE,
+        Action::ShowNewMessages,
+    ),
+];
+
+/// Print and Save as PDF, in the thread view. ⌘P belongs in the File menu, but until Exo's menu
+/// has Print, the key is the row's.
+const THREAD_PRINT_SPECS: &[CommandSpec] = &[
+    row("PRINT", "Print", Action::Print)
+        .keys(&["mod+p"])
+        .key_code(&["⌘", "P"])
+        .score(1.45)
+        .icon("data/print"),
+    row("PRINT_TO_PDF", "Save as PDF", Action::SaveAsPdf)
+        .aliases(&["Print to PDF", "Save to PDF", "Export to PDF"])
+        .score(1.45)
+        .icon("data/download"),
+];
+
+const SHOW_IMAGES_SPEC: CommandSpec = row("SHOW_IMAGES", "Show Images", Action::ShowImages)
+    .aliases(&["Load Images", "See Images", "View Images"])
+    .operative_word("show images")
+    .follow("INSERT_IMAGE")
+    .icon("data/insert-image");
 
 /// What the thread view's commands depend on this frame.
 pub struct ThreadContext {
@@ -277,6 +688,8 @@ pub struct ThreadContext {
     pub focus_collapsed: bool,
     /// Whether the Show New Messages bar has the keyboard, so Enter shows the new messages.
     pub new_messages_focused: bool,
+    /// Whether text is selected in the thread, so ⌘C copies it anywhere in the thread pane.
+    pub has_selection: bool,
     /// Whether the focused message has remote images and they're blocked (`SHOW_IMAGES`).
     pub show_images: bool,
 }
@@ -284,165 +697,28 @@ pub struct ThreadContext {
 /// Registers the open thread's commands for this frame. Reply, forward and compose are compose's
 /// (`compose::register_shortcuts`).
 pub fn register_thread(commands: &mut Commands<Action>, cx: &ThreadContext) {
-    commands.add(
-        Command::shortcut("BACK", Action::ThreadBack)
-            .keys(["esc", "backspace"])
-            .regions(THREAD_BACK),
-    );
-    commands.add(
-        Command::shortcut("GO_TO_LIST", Action::LeaveThread)
-            .key("g u")
-            .regions(GO_TO),
-    );
+    register_specs(commands, THREAD_TOP_SPECS);
     commands.add(from_week("GO_TO_LIST", &["g u"], Action::LeaveThread));
-    commands.add(
-        Command::shortcut("NEXT_CONVERSATION", Action::NextConversation(1))
-            .key("j")
-            .regions(NEXT_CONVERSATION),
-    );
-    commands.add(
-        Command::shortcut("PREVIOUS_CONVERSATION", Action::NextConversation(-1))
-            .key("k")
-            .regions(NEXT_CONVERSATION),
-    );
-    commands.add(
-        Command::shortcut("NEXT_MESSAGE", Action::NextMessage(1))
-            .keys(["n", "ctralt+n"])
-            .repeat(Action::NextMessage(1))
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("PREVIOUS_MESSAGE", Action::NextMessage(-1))
-            .keys(["p", "ctralt+p"])
-            .repeat(Action::NextMessage(-1))
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("FOCUS_DOWN", Action::Arrow(1))
-            .keys(["down", "ctralt+j"])
-            .repeat(Action::ArrowHeld(1))
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("FOCUS_UP", Action::Arrow(-1))
-            .keys(["up", "ctralt+k"])
-            .repeat(Action::ArrowHeld(-1))
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("FOCUS_LEFT", Action::ThreadLeft)
-            .key("left")
-            .repeat(Action::ThreadLeftHeld)
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("FOCUS_RIGHT", Action::ThreadRight)
-            .key("right")
-            .repeat(Action::ThreadRight)
-            .regions(MESSAGES_AND_NEW),
-    );
+    register_specs(commands, THREAD_FOCUS_SPECS);
     if cx.focus_collapsed {
-        commands.add(
-            Command::shortcut("EXPAND_MESSAGE", Action::ExpandMessage)
-                .key("enter")
-                .regions(THREAD_MESSAGES),
-        );
+        commands.add(EXPAND_MESSAGE_SPEC.build());
     }
-    commands.add(
-        Command::new(
-            "EXPAND_COLLAPSE_HEADER",
-            "Expand / collapse Message header",
-            Action::ToggleHeader,
-        )
-        .key("shift+h")
-        .key_code(["shift", "H"])
-        .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::new(
-            "EXPAND_COLLAPSE_CURRENT",
-            "Expand / collapse current Message",
-            Action::ToggleMessage,
-        )
-        .key("o")
-        .key_code(["O"])
-        .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::new(
-            "EXPAND_COLLAPSE_ALL",
-            "Expand / collapse all Messages",
-            Action::ToggleAllMessages,
-        )
-        .key("shift+o")
-        .key_code(["shift", "O"])
-        .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::shortcut("PAGE_DOWN", Action::PageThread(1))
-            .keys(["space", "pagedown"])
-            .repeat(Action::PageThread(1))
-            .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::shortcut("PAGE_UP", Action::PageThread(-1))
-            .keys(["shift+space", "pageup"])
-            .repeat(Action::PageThread(-1))
-            .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_TOP", Action::JumpThread(false))
-            .keys(["mod+up", "home", "shift+p"])
-            .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_TOP_SEQUENCE", Action::JumpThread(false))
-            .key("g g")
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_BOTTOM", Action::JumpThread(true))
-            .keys(["mod+down", "end"])
-            .regions(THREAD_MESSAGES),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_BOTTOM_SHIFT", Action::JumpThread(true))
-            .key("shift+g")
-            .regions(MESSAGES_AND_NEW),
-    );
-    commands.add(
-        Command::shortcut("SHOW_NEW_MESSAGES", Action::ShowNewMessages)
-            .key("shift+n")
-            .regions(THREAD_PANE),
-    );
+    register_specs(commands, THREAD_BODY_SPECS);
     if cx.new_messages_focused {
-        commands.add(
-            Command::shortcut("SHOW_NEW_MESSAGES_ENTER", Action::ShowNewMessages)
-                .key("enter")
-                .regions(&[Region::ThreadMessagesNewMessages]),
-        );
+        commands.add(SHOW_NEW_MESSAGES_ENTER_SPEC.build());
     }
+    let copy_regions = if cx.has_selection {
+        THREAD_PANE
+    } else {
+        MESSAGES_AND_NEW
+    };
     commands.add(
         Command::shortcut("COPY", Action::Copy)
             .key("mod+c")
-            .regions(MESSAGES_AND_NEW),
+            .regions(copy_regions),
     );
-    header_keys(commands);
-    // Print and Save as PDF, in the thread view. ⌘P belongs in the File menu, but until Exo's
-    // menu has Print, the key is the row's.
-    commands.add(
-        Command::new("PRINT", "Print", Action::Print)
-            .key("mod+p")
-            .key_code(["⌘", "P"])
-            .default_score(1.45)
-            .icon("data/print"),
-    );
-    commands.add(
-        Command::new("PRINT_TO_PDF", "Save as PDF", Action::SaveAsPdf)
-            .aliases(["Print to PDF", "Save to PDF", "Export to PDF"])
-            .default_score(1.45)
-            .icon("data/download"),
-    );
+    register_specs(commands, THREAD_HEADER_SPECS);
+    register_specs(commands, THREAD_PRINT_SPECS);
     if cx.show_images {
         register_show_images(commands);
     }
@@ -451,13 +727,7 @@ pub fn register_thread(commands: &mut Commands<Action>, cx: &ThreadContext) {
 /// Registers `Show Images`, which shows the remote images that the Images setting blocks in the
 /// focused message or the focused draft.
 pub fn register_show_images(commands: &mut Commands<Action>) {
-    commands.add(
-        Command::new("SHOW_IMAGES", "Show Images", Action::ShowImages)
-            .aliases(["Load Images", "See Images", "View Images"])
-            .operative_word("show images")
-            .follow("INSERT_IMAGE")
-            .icon("data/insert-image"),
-    );
+    commands.add(SHOW_IMAGES_SPEC.build());
 }
 
 /// What the commands depend on this frame.
@@ -501,321 +771,390 @@ pub struct CopyRows {
 
 /// Registers the list's commands for this frame.
 pub fn register(commands: &mut Commands<Action>, cx: &Context<'_>) {
-    navigation(commands);
+    register_specs(commands, NAVIGATION_SPECS);
     if !cx.threads.is_empty() {
         conversation(commands, cx);
     }
-    selection(commands);
+    register_specs(commands, SELECTION_SPECS);
     go_to(commands, cx);
 }
 
-fn navigation(commands: &mut Commands<Action>) {
-    commands.add(
-        Command::shortcut("NEXT", Action::Move(1))
-            .keys(["j", "down", "n", "ctralt+j", "ctralt+n"])
-            .repeat(Action::Move(1))
-            .regions(THREAD_LIST),
-    );
+const NAVIGATION_SPECS: &[CommandSpec] = &[
+    sc_rep(
+        "NEXT",
+        &["j", "down", "n", "ctralt+j", "ctralt+n"],
+        THREAD_LIST,
+        Action::Move(1),
+        Action::Move(1),
+    ),
     // K and P stay in the list. ↑ leaves it from the first row.
-    commands.add(
-        Command::shortcut("PREVIOUS", Action::Move(-1))
-            .keys(["k", "p", "ctralt+k", "ctralt+p"])
-            .repeat(Action::Move(-1))
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("PREVIOUS_UP", Action::Up)
-            .key("up")
-            .repeat(Action::Up)
-            .regions(THREAD_LIST),
-    );
-    const HEADER: &[Region] = &[Region::ThreadListHeader];
-    let header = |id: &'static str, key: HeaderKey| {
-        Command::shortcut(id, Action::Header(key)).regions(HEADER)
-    };
-    commands.add(header("HEADER_DOWN", HeaderKey::Down).keys(["down", "j", "ctralt+j", "esc"]));
-    commands.add(header("HEADER_ENTER", HeaderKey::Enter).key("enter"));
-    commands.add(header("HEADER_BACKSPACE", HeaderKey::Backspace).key("backspace"));
-    commands.add(
-        header("HEADER_LEFT", HeaderKey::Move(-1))
-            .key("left")
-            .repeat(Action::Header(HeaderKey::Move(-1))),
-    );
-    commands.add(
-        header("HEADER_RIGHT", HeaderKey::Move(1))
-            .key("right")
-            .repeat(Action::Header(HeaderKey::Move(1))),
-    );
-    commands.add(
-        Command::shortcut("OPEN", Action::Open)
-            .keys(["enter", "o"])
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("COPY_LISTED", Action::CopyListed)
-            .key("mod+c")
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_TOP", Action::Top)
-            .keys(["mod+up", "home", "g g"])
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("JUMP_TO_BOTTOM", Action::Bottom)
-            .keys(["mod+down", "end", "shift+g"])
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("PAGE_DOWN", Action::Page(1))
-            .keys(["space", "pagedown"])
-            .repeat(Action::Page(1))
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("PAGE_UP", Action::Page(-1))
-            .keys(["shift+space", "pageup"])
-            .repeat(Action::Page(-1))
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("BACK", Action::Back { escape: true })
-            .key("esc")
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("BACK_BACKSPACE", Action::Back { escape: false })
-            .key("backspace")
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("TOGGLE_LABEL_SWITCHER", Action::ToggleFolders)
-            .key("left")
-            .regions(THREAD_LIST),
-    );
-}
+    sc_rep(
+        "PREVIOUS",
+        &["k", "p", "ctralt+k", "ctralt+p"],
+        THREAD_LIST,
+        Action::Move(-1),
+        Action::Move(-1),
+    ),
+    sc_rep("PREVIOUS_UP", &["up"], THREAD_LIST, Action::Up, Action::Up),
+    sc(
+        "HEADER_DOWN",
+        &["down", "j", "ctralt+j", "esc"],
+        LIST_HDR,
+        Action::Header(HeaderKey::Down),
+    ),
+    sc(
+        "HEADER_ENTER",
+        &["enter"],
+        LIST_HDR,
+        Action::Header(HeaderKey::Enter),
+    ),
+    sc(
+        "HEADER_BACKSPACE",
+        &["backspace"],
+        LIST_HDR,
+        Action::Header(HeaderKey::Backspace),
+    ),
+    sc_rep(
+        "HEADER_LEFT",
+        &["left"],
+        LIST_HDR,
+        Action::Header(HeaderKey::Move(-1)),
+        Action::Header(HeaderKey::Move(-1)),
+    ),
+    sc_rep(
+        "HEADER_RIGHT",
+        &["right"],
+        LIST_HDR,
+        Action::Header(HeaderKey::Move(1)),
+        Action::Header(HeaderKey::Move(1)),
+    ),
+    sc("OPEN", &["enter", "o"], THREAD_LIST, Action::Open),
+    sc("COPY_LISTED", &["mod+c"], THREAD_LIST, Action::CopyListed),
+    sc(
+        "JUMP_TO_TOP",
+        &["mod+up", "home", "g g"],
+        THREAD_LIST,
+        Action::Top,
+    ),
+    sc(
+        "JUMP_TO_BOTTOM",
+        &["mod+down", "end", "shift+g"],
+        THREAD_LIST,
+        Action::Bottom,
+    ),
+    sc_rep(
+        "PAGE_DOWN",
+        &["space", "pagedown"],
+        THREAD_LIST,
+        Action::Page(1),
+        Action::Page(1),
+    ),
+    sc_rep(
+        "PAGE_UP",
+        &["shift+space", "pageup"],
+        THREAD_LIST,
+        Action::Page(-1),
+        Action::Page(-1),
+    ),
+    sc("BACK", &["esc"], THREAD_LIST, Action::Back { escape: true }),
+    sc(
+        "BACK_BACKSPACE",
+        &["backspace"],
+        THREAD_LIST,
+        Action::Back { escape: false },
+    ),
+    sc(
+        "TOGGLE_LABEL_SWITCHER",
+        &["left"],
+        THREAD_LIST,
+        Action::ToggleFolders,
+    ),
+];
+
+const FOLDER_SPECS: &[CommandSpec] = &[
+    // Held, ↑ stops at the first folder like K does.
+    sc_rep(
+        "UP",
+        &["up"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Up),
+        Action::Folders(FolderKey::UpWithin),
+    ),
+    sc_rep(
+        "UP_WITHIN",
+        &["k", "ctralt+k", "p", "ctralt+p"],
+        LABEL_SW,
+        Action::Folders(FolderKey::UpWithin),
+        Action::Folders(FolderKey::UpWithin),
+    ),
+    sc_rep(
+        "DOWN",
+        &["down", "j", "ctralt+j", "n", "ctralt+n"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Down),
+        Action::Folders(FolderKey::Down),
+    ),
+    sc(
+        "OPEN",
+        &["enter"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Enter),
+    ),
+    sc(
+        "CLOSE",
+        &["esc", "mod+right"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Close),
+    ),
+    sc(
+        "RIGHT",
+        &["right"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Right),
+    ),
+    sc(
+        "BOTTOM",
+        &["mod+down", "end", "shift+j"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Bottom),
+    ),
+    sc(
+        "TOP",
+        &["mod+up", "home", "shift+k"],
+        LABEL_SW,
+        Action::Folders(FolderKey::Top),
+    ),
+    sc_rep(
+        "PAGE_DOWN",
+        &["pagedown", "space"],
+        LABEL_SW,
+        Action::Folders(FolderKey::PageDown),
+        Action::Folders(FolderKey::PageDown),
+    ),
+    sc_rep(
+        "PAGE_UP",
+        &["pageup", "shift+space"],
+        LABEL_SW,
+        Action::Folders(FolderKey::PageUp),
+        Action::Folders(FolderKey::PageUp),
+    ),
+];
 
 /// Registers the folder drawer's keys for this frame, while it's open.
 pub fn register_folders(commands: &mut Commands<Action>) {
-    use crate::folders::Key;
-    const LABEL_SWITCHER: &[Region] = &[Region::LabelSwitcher];
-    let key = |id: &'static str, key: Key| {
-        Command::shortcut(id, Action::Folders(key)).regions(LABEL_SWITCHER)
-    };
-    // Held, ↑ stops at the first folder like K does.
-    commands.add(
-        key("UP", Key::Up)
-            .key("up")
-            .repeat(Action::Folders(Key::UpWithin)),
-    );
-    commands.add(
-        key("UP_WITHIN", Key::UpWithin)
-            .keys(["k", "ctralt+k", "p", "ctralt+p"])
-            .repeat(Action::Folders(Key::UpWithin)),
-    );
-    commands.add(
-        key("DOWN", Key::Down)
-            .keys(["down", "j", "ctralt+j", "n", "ctralt+n"])
-            .repeat(Action::Folders(Key::Down)),
-    );
-    commands.add(key("OPEN", Key::Enter).key("enter"));
-    commands.add(key("CLOSE", Key::Close).keys(["esc", "mod+right"]));
-    commands.add(key("RIGHT", Key::Right).key("right"));
-    commands.add(key("BOTTOM", Key::Bottom).keys(["mod+down", "end", "shift+j"]));
-    commands.add(key("TOP", Key::Top).keys(["mod+up", "home", "shift+k"]));
-    commands.add(
-        key("PAGE_DOWN", Key::PageDown)
-            .keys(["pagedown", "space"])
-            .repeat(Action::Folders(Key::PageDown)),
-    );
-    commands.add(
-        key("PAGE_UP", Key::PageUp)
-            .keys(["pageup", "shift+space"])
-            .repeat(Action::Folders(Key::PageUp)),
-    );
+    register_specs(commands, FOLDER_SPECS);
 }
 
-fn selection(commands: &mut Commands<Action>) {
-    commands.add(
-        Command::shortcut("SELECT", Action::ToggleSelected)
-            .key("x")
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("EXTEND_DOWN", Action::Extend(1))
-            .keys(["shift+j", "shift+down"])
-            .repeat(Action::Extend(1))
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("EXTEND_UP", Action::Extend(-1))
-            .keys(["shift+k", "shift+up"])
-            .repeat(Action::Extend(-1))
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::shortcut("DESELECT_ALL", Action::DeselectAll)
-            .key("mod+alt+a")
-            .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::new(
-            "SELECT_ALL_FROM_HERE",
-            "Select All From Here",
-            Action::SelectAllFromHere,
-        )
-        .key("mod+a")
-        .key_code(["⌘", "A"])
+const SELECTION_SPECS: &[CommandSpec] = &[
+    sc("SELECT", &["x"], THREAD_LIST, Action::ToggleSelected),
+    sc_rep(
+        "EXTEND_DOWN",
+        &["shift+j", "shift+down"],
+        THREAD_LIST,
+        Action::Extend(1),
+        Action::Extend(1),
+    ),
+    sc_rep(
+        "EXTEND_UP",
+        &["shift+k", "shift+up"],
+        THREAD_LIST,
+        Action::Extend(-1),
+        Action::Extend(-1),
+    ),
+    sc(
+        "DESELECT_ALL",
+        &["mod+alt+a"],
+        THREAD_LIST,
+        Action::DeselectAll,
+    ),
+    row(
+        "SELECT_ALL_FROM_HERE",
+        "Select All From Here",
+        Action::SelectAllFromHere,
+    )
+    .keys(&["mod+a"])
+    .key_code(&["⌘", "A"])
+    .icon("data/select-all")
+    .multiple()
+    .regions(THREAD_LIST),
+    row("SELECT_ALL", "Select All", Action::SelectAll)
+        .keys(&["mod+shift+a"])
+        .key_code(&["⌘", "shift", "A"])
+        .follow("SELECT_ALL_FROM_HERE")
         .icon("data/select-all")
         .multiple()
         .regions(THREAD_LIST),
-    );
-    commands.add(
-        Command::new("SELECT_ALL", "Select All", Action::SelectAll)
-            .key("mod+shift+a")
-            .key_code(["⌘", "shift", "A"])
-            .follow("SELECT_ALL_FROM_HERE")
-            .icon("data/select-all")
-            .multiple()
-            .regions(THREAD_LIST),
-    );
-}
+];
+
+const STAR_PAIR: [CommandSpec; 2] = [
+    conv(
+        "STAR",
+        "Star",
+        "data/star",
+        9.0,
+        Action::Apply(Mutation::Star),
+    )
+    .keys(&["s"])
+    .aliases(&["Flag"]),
+    conv(
+        "STAR",
+        "Unstar",
+        "data/star",
+        9.0,
+        Action::Apply(Mutation::Unstar),
+    )
+    .keys(&["s"])
+    .aliases(&["Remove Flag"]),
+];
+const TRASH_PAIR: [CommandSpec; 2] = [
+    conv(
+        "TRASH",
+        "Trash",
+        "data/discard",
+        6.0,
+        Action::Apply(Mutation::Trash),
+    )
+    .keys(&["#", "del"])
+    .aliases(&["Delete"]),
+    conv(
+        "TRASH",
+        "Remove from Trash",
+        "data/discard",
+        6.0,
+        Action::Apply(Mutation::Untrash),
+    )
+    .keys(&["#", "del"]),
+];
+/// On UK keyboards ⇧3 types `£`, and `#` is the key by Enter, or ⌥3 on a Mac.
+const TRASH_UK_PAIR: [CommandSpec; 2] = [
+    sc(
+        "TRASH_UK",
+        &["\\", "alt+3"],
+        CONVERSATION,
+        Action::Apply(Mutation::Trash),
+    )
+    .when_typing("#"),
+    sc(
+        "TRASH_UK",
+        &["\\", "alt+3"],
+        CONVERSATION,
+        Action::Apply(Mutation::Untrash),
+    )
+    .when_typing("#"),
+];
+/// For a single sender, `!` opens the Mark Spam picker, which offers blocking. Otherwise it
+/// reports spam directly (`crate::pickers`).
+const SPAM_PAIR: [CommandSpec; 2] = [
+    conv(
+        "MARK_SPAM",
+        "Mark Spam",
+        "data/spam",
+        5.0,
+        Action::Pick(Pick::MarkSpam),
+    )
+    .keys(&["!"])
+    .aliases(&["Mark Junk"]),
+    conv(
+        "MARK_SPAM",
+        "Mark not Spam",
+        "data/spam",
+        5.0,
+        Action::Apply(Mutation::NotSpam),
+    )
+    .keys(&["!"])
+    .aliases(&["Mark not Junk"]),
+];
+const UNREAD_PAIR: [CommandSpec; 2] = [
+    conv(
+        "MARK_UNREAD",
+        "Mark Unread",
+        "data/mark-unread",
+        4.5,
+        Action::Apply(Mutation::MarkUnread),
+    )
+    .keys(&["u"])
+    .aliases(&["Mark as Unread", "Toggle Read"]),
+    conv(
+        "MARK_UNREAD",
+        "Mark Read",
+        "data/mark-unread",
+        4.0,
+        Action::Apply(Mutation::MarkRead),
+    )
+    .keys(&["u"])
+    .aliases(&["Mark as Read", "Toggle Read"]),
+];
+const MUTE_PAIR: [CommandSpec; 2] = [
+    conv(
+        "MUTE",
+        "Mute",
+        "data/mute",
+        4.0,
+        Action::Apply(Mutation::Mute),
+    )
+    .keys(&["shift+m"])
+    .aliases(&["Ignore", "Unfollow"]),
+    conv(
+        "MUTE",
+        "Unmute",
+        "data/mute",
+        4.0,
+        Action::Apply(Mutation::Unmute),
+    )
+    .keys(&["shift+m"])
+    .aliases(&["Stop Ignoring", "Follow"]),
+];
+const MUTE_INTENT_SPEC: CommandSpec = sc("MUTE_INTENT", &["m"], CONVERSATION, Action::MuteHint);
+const DONE_KEY_SPECS: &[CommandSpec] = &[
+    sc(
+        "MARK_DONE_KEY",
+        &["e"],
+        CONVERSATION,
+        Action::Apply(Mutation::MarkDone),
+    ),
+    sc(
+        "MARK_NOT_DONE_KEY",
+        &["shift+e"],
+        CONVERSATION,
+        Action::Apply(Mutation::MarkNotDone),
+    ),
+];
+const DONE_PAIR: [CommandSpec; 2] = [
+    conv(
+        "MARK_DONE",
+        "Mark Done",
+        "data/done",
+        11.0,
+        Action::Apply(Mutation::MarkDone),
+    )
+    .key_code(&["E"])
+    .aliases(&["Archive"]),
+    conv(
+        "MARK_DONE",
+        "Mark not Done",
+        "data/done",
+        11.0,
+        Action::Apply(Mutation::MarkNotDone),
+    )
+    .key_code(&["shift", "E"])
+    .aliases(&["Unarchive", "Move to Inbox"]),
+];
 
 /// The actions on the actionable threads, in the palette's order (provider defaults, label
 /// commands, then Mark Done).
 fn conversation(commands: &mut Commands<Action>, cx: &Context<'_>) {
     let all = |test: fn(&ThreadSummary) -> bool| cx.threads.iter().all(|thread| test(thread));
-    let row =
-        |id: &'static str, title: &'static str, action: Action, icon: &'static str, score: f64| {
-            Command::new(id, title, action)
-                .icon(icon)
-                .default_score(score)
-                .multiple()
-                .regions(CONVERSATION)
-        };
+    let trashed = usize::from(all(|thread| thread.has_label("TRASH")));
+    let spam = usize::from(all(|thread| thread.has_label("SPAM")) || *cx.list == ListId::Spam);
 
-    let starred = all(|thread| thread.starred);
-    commands.add(
-        if starred {
-            row(
-                "STAR",
-                "Unstar",
-                Action::Apply(Mutation::Unstar),
-                "data/star",
-                9.0,
-            )
-            .aliases(["Remove Flag"])
-        } else {
-            row(
-                "STAR",
-                "Star",
-                Action::Apply(Mutation::Star),
-                "data/star",
-                9.0,
-            )
-            .aliases(["Flag"])
-        }
-        .key("s"),
-    );
+    commands.add(STAR_PAIR[usize::from(all(|thread| thread.starred))].build());
+    commands.add(TRASH_PAIR[trashed].build());
+    commands.add(TRASH_UK_PAIR[trashed].build());
+    commands.add(SPAM_PAIR[spam].build());
+    commands.add(UNREAD_PAIR[usize::from(all(|thread| thread.unread))].build());
+    commands.add(MUTE_PAIR[usize::from(all(|thread| thread.muted))].build());
+    commands.add(MUTE_INTENT_SPEC.build());
 
-    let trashed = all(|thread| thread.has_label("TRASH"));
-    let trash_action = Action::Apply(if trashed {
-        Mutation::Untrash
-    } else {
-        Mutation::Trash
-    });
-    let trash = if trashed {
-        row(
-            "TRASH",
-            "Remove from Trash",
-            trash_action.clone(),
-            "data/discard",
-            6.0,
-        )
-    } else {
-        row("TRASH", "Trash", trash_action.clone(), "data/discard", 6.0).aliases(["Delete"])
-    };
-    commands.add(trash.keys(["#", "del"]));
-    // On UK keyboards ⇧3 types `£`, and `#` is the key by Enter, or ⌥3 on a Mac.
-    commands.add(
-        Command::shortcut("TRASH_UK", trash_action)
-            .keys(["\\", "alt+3"])
-            .when_typing("#")
-            .regions(CONVERSATION),
-    );
-
-    // For a single sender, `!` opens the Mark Spam picker, which offers blocking. Otherwise it
-    // reports spam directly (`crate::pickers`).
-    let spam = if all(|thread| thread.has_label("SPAM")) || *cx.list == ListId::Spam {
-        row(
-            "MARK_SPAM",
-            "Mark not Spam",
-            Action::Apply(Mutation::NotSpam),
-            "data/spam",
-            5.0,
-        )
-        .aliases(["Mark not Junk"])
-    } else {
-        row(
-            "MARK_SPAM",
-            "Mark Spam",
-            Action::Pick(crate::pickers::Action::MarkSpam),
-            "data/spam",
-            5.0,
-        )
-        .aliases(["Mark Junk"])
-    };
-    commands.add(spam.key("!"));
-
-    let read = if all(|thread| thread.unread) {
-        row(
-            "MARK_UNREAD",
-            "Mark Read",
-            Action::Apply(Mutation::MarkRead),
-            "data/mark-unread",
-            4.0,
-        )
-        .aliases(["Mark as Read", "Toggle Read"])
-    } else {
-        row(
-            "MARK_UNREAD",
-            "Mark Unread",
-            Action::Apply(Mutation::MarkUnread),
-            "data/mark-unread",
-            4.5,
-        )
-        .aliases(["Mark as Unread", "Toggle Read"])
-    };
-    commands.add(read.key("u"));
-
-    let muted = all(|thread| thread.muted);
-    commands.add(
-        if muted {
-            row(
-                "MUTE",
-                "Unmute",
-                Action::Apply(Mutation::Unmute),
-                "data/mute",
-                4.0,
-            )
-            .aliases(["Stop Ignoring", "Follow"])
-        } else {
-            row(
-                "MUTE",
-                "Mute",
-                Action::Apply(Mutation::Mute),
-                "data/mute",
-                4.0,
-            )
-            .aliases(["Ignore", "Unfollow"])
-        }
-        .key("shift+m"),
-    );
-    commands.add(
-        Command::shortcut("MUTE_INTENT", Action::MuteHint)
-            .key("m")
-            .regions(CONVERSATION),
-    );
     unsubscribe(commands, cx);
     block(commands, cx);
     important_or_other(commands, cx);
@@ -828,41 +1167,21 @@ fn conversation(commands: &mut Commands<Action>, cx: &Context<'_>) {
     if *cx.list == ListId::Spam {
         return;
     }
-    commands.add(
-        Command::shortcut("MARK_DONE_KEY", Action::Apply(Mutation::MarkDone))
-            .key("e")
-            .regions(CONVERSATION),
-    );
-    commands.add(
-        Command::shortcut("MARK_NOT_DONE_KEY", Action::Apply(Mutation::MarkNotDone))
-            .key("shift+e")
-            .regions(CONVERSATION),
-    );
+    register_specs(commands, DONE_KEY_SPECS);
     if !cx.threads.iter().any(|thread| thread.draft_only) {
-        let row = if all(|thread| thread.done) {
-            row(
-                "MARK_DONE",
-                "Mark not Done",
-                Action::Apply(Mutation::MarkNotDone),
-                "data/done",
-                11.0,
-            )
-            .key_code(["shift", "E"])
-            .aliases(["Unarchive", "Move to Inbox"])
-        } else {
-            row(
-                "MARK_DONE",
-                "Mark Done",
-                Action::Apply(Mutation::MarkDone),
-                "data/done",
-                11.0,
-            )
-            .key_code(["E"])
-            .aliases(["Archive"])
-        };
-        commands.add(row);
+        commands.add(DONE_PAIR[usize::from(all(|thread| thread.done))].build());
     }
 }
+
+const UNSUBSCRIBE_SPEC: CommandSpec = row(
+    "UNSUBSCRIBE",
+    "Unsubscribe",
+    Action::Unsubscribe(crate::unsubscribe::Action::Launch),
+)
+.keys(&["mod+u"])
+.key_code(&["⌘", "U"])
+.icon("data/unsubscribe")
+.regions(CONVERSATION);
 
 /// `Unsubscribe` (`⌘U`) for one conversation, in the list and in a thread. A Gmail account always
 /// has it, and with nothing to unsubscribe from, it offers to block the sender.
@@ -871,14 +1190,7 @@ fn unsubscribe(commands: &mut Commands<Action>, cx: &Context<'_>) {
         && !thread.draft_only
         && cx.exact
     {
-        let action = Action::Unsubscribe(crate::unsubscribe::Action::Launch);
-        commands.add(
-            Command::new("UNSUBSCRIBE", "Unsubscribe", action)
-                .key("mod+u")
-                .key_code(["⌘", "U"])
-                .icon("data/unsubscribe")
-                .regions(CONVERSATION),
-        );
+        commands.add(UNSUBSCRIBE_SPEC.build());
     }
 }
 
@@ -886,8 +1198,8 @@ fn unsubscribe(commands: &mut Commands<Action>, cx: &Context<'_>) {
 /// for one conversation with a sender.
 fn block(commands: &mut Commands<Action>, cx: &Context<'_>) {
     let Some(sender) = cx.sender else { return };
-    let row = |id: &'static str, title: String, from: &str, domain: bool| {
-        let action = Action::Pick(crate::pickers::Action::Block {
+    let block_row = |id: &'static str, title: String, from: &str, domain: bool| {
+        let action = Action::Pick(Pick::Block {
             from: from.to_owned(),
             domain,
             spam: false,
@@ -898,7 +1210,7 @@ fn block(commands: &mut Commands<Action>, cx: &Context<'_>) {
             .default_score(0.98)
             .regions(CONVERSATION)
     };
-    commands.add(row(
+    commands.add(block_row(
         "BLOCK_SENDER",
         format!("Block Sender: {}", sender.email),
         &sender.email,
@@ -907,7 +1219,7 @@ fn block(commands: &mut Commands<Action>, cx: &Context<'_>) {
     if let Some(domain) = sender.domain.as_ref().filter(|domain| {
         !crate::format::names::is_popular_domain(domain) && !cx.own_domains.contains(domain)
     }) {
-        commands.add(row(
+        commands.add(block_row(
             "BLOCK_DOMAIN",
             format!("Block Domain: {domain}"),
             domain,
@@ -916,6 +1228,27 @@ fn block(commands: &mut Commands<Action>, cx: &Context<'_>) {
     }
 }
 
+const MOVE_TO_IMPORTANT_SPEC: CommandSpec = row(
+    "MOVE_TO_IMPORTANT",
+    "Move to Important",
+    Action::Pick(Pick::OpenImportantOrOther(false)),
+)
+.icon("data/move")
+.aliases(&["Mark as Important"])
+.operative_word("move")
+.follow("MOVE")
+.regions(CONVERSATION);
+const MOVE_TO_OTHER_SPEC: CommandSpec = row(
+    "MOVE_TO_OTHER",
+    "Move to Other",
+    Action::Pick(Pick::OpenImportantOrOther(true)),
+)
+.icon("data/move")
+.aliases(&["Mark as not Important"])
+.operative_word("move")
+.follow("MOVE")
+.regions(CONVERSATION);
+
 /// `Move to Important` and `Move to Other` for one conversation while Important and Other are
 /// on, each except where the list on screen is that one.
 fn important_or_other(commands: &mut Commands<Action>, cx: &Context<'_>) {
@@ -923,242 +1256,243 @@ fn important_or_other(commands: &mut Commands<Action>, cx: &Context<'_>) {
     if cx.unified || thread.draft_only {
         return;
     }
-    let row = |id: &'static str, title: &'static str, other: bool, alias: &'static str| {
-        let action = Action::Pick(crate::pickers::Action::OpenImportantOrOther(other));
-        Command::new(id, title, action)
-            .icon("data/move")
-            .aliases([alias])
-            .operative_word("move")
-            .follow("MOVE")
-            .regions(CONVERSATION)
-    };
     if *cx.list != ListId::Important {
-        commands.add(row(
-            "MOVE_TO_IMPORTANT",
-            "Move to Important",
-            false,
-            "Mark as Important",
-        ));
+        commands.add(MOVE_TO_IMPORTANT_SPEC.build());
     }
     if *cx.list != ListId::Other {
-        commands.add(row(
-            "MOVE_TO_OTHER",
-            "Move to Other",
-            true,
-            "Mark as not Important",
-        ));
+        commands.add(MOVE_TO_OTHER_SPEC.build());
     }
 }
+
+const MOVE_SPEC: CommandSpec = conv(
+    "MOVE",
+    "Move",
+    "data/move",
+    8.0,
+    Action::Pick(Pick::OpenMove),
+)
+.keys(&["v"])
+.key_code(&["V"])
+.aliases(&["Folder", "File"])
+.operative_word("move");
+const REMOVE_ALL_PAIR: [CommandSpec; 2] = [
+    sc(
+        "REMOVE_ALL_LABELS",
+        &["shift+y"],
+        CONVERSATION,
+        Action::Pick(Pick::RemoveAll),
+    ),
+    conv(
+        "REMOVE_ALL_LABELS",
+        "Remove all Labels",
+        "data/label",
+        6.9,
+        Action::Pick(Pick::RemoveAll),
+    )
+    .keys(&["shift+y"])
+    .key_code(&["shift", "Y"])
+    .aliases(&[
+        "Remove all Labels and Mark Done",
+        "Remove all Labels and Archive",
+    ]),
+];
+const LABEL_TAIL_SPECS: &[CommandSpec] = &[
+    conv(
+        "LABEL",
+        "Label",
+        "data/label",
+        7.0,
+        Action::Pick(Pick::OpenLabel),
+    )
+    .keys(&["l"])
+    .key_code(&["L"])
+    .follow("CREATE_EVENT")
+    .aliases(&[
+        "Add Label",
+        "Remove Label",
+        "Create Label",
+        "New Label",
+        "Tag",
+        "Create Tag",
+        "Remove Tag",
+    ]),
+    conv(
+        "REMOVE_FROM_LABEL",
+        "Remove from Label",
+        "data/label",
+        7.0,
+        Action::Pick(Pick::RemoveFromList(0)),
+    )
+    .keys(&["y"])
+    .key_code(&["Y"])
+    .aliases(&["Remove from List"]),
+    // `]` is -1 and `[` is 1: the previous and the next conversation.
+    sc(
+        "REMOVE_FROM_LABEL_PREVIOUS",
+        &["]"],
+        CONVERSATION,
+        Action::Pick(Pick::RemoveFromList(-1)),
+    ),
+    sc(
+        "REMOVE_FROM_LABEL_NEXT",
+        &["["],
+        CONVERSATION,
+        Action::Pick(Pick::RemoveFromList(1)),
+    ),
+];
 
 /// Move, then the label commands, and the keys that take threads out of the list on screen.
 /// Without an exact selection, `⇧Y` only says why it can't.
 fn labels(commands: &mut Commands<Action>, exact: bool) {
-    use crate::pickers::Action::{OpenLabel, OpenMove, RemoveAll, RemoveFromList};
-    let row = |id: &'static str, title: &'static str, action, icon: &'static str, score: f64| {
-        Command::new(id, title, Action::Pick(action))
-            .icon(icon)
-            .default_score(score)
-            .multiple()
-            .regions(CONVERSATION)
-    };
-    commands.add(
-        row("MOVE", "Move", OpenMove, "data/move", 8.0)
-            .key("v")
-            .key_code(["V"])
-            .aliases(["Folder", "File"])
-            .operative_word("move"),
-    );
-    commands.add(if exact {
-        row(
-            "REMOVE_ALL_LABELS",
-            "Remove all Labels",
-            RemoveAll,
-            "data/label",
-            6.9,
-        )
-        .key("shift+y")
-        .key_code(["shift", "Y"])
-        .aliases([
-            "Remove all Labels and Mark Done",
-            "Remove all Labels and Archive",
-        ])
-    } else {
-        Command::shortcut("REMOVE_ALL_LABELS", Action::Pick(RemoveAll))
-            .key("shift+y")
-            .regions(CONVERSATION)
-    });
-    commands.add(
-        row("LABEL", "Label", OpenLabel, "data/label", 7.0)
-            .key("l")
-            .key_code(["L"])
-            .aliases([
-                "Add Label",
-                "Remove Label",
-                "Create Label",
-                "New Label",
-                "Tag",
-                "Create Tag",
-                "Remove Tag",
-            ])
-            .follow("CREATE_EVENT"),
-    );
-    commands.add(
-        row(
-            "REMOVE_FROM_LABEL",
-            "Remove from Label",
-            RemoveFromList(0),
-            "data/label",
-            7.0,
-        )
-        .key("y")
-        .key_code(["Y"])
-        .aliases(["Remove from List"]),
-    );
-    // `]` is -1 and `[` is 1: the previous and the next conversation.
-    commands.add(
-        Command::shortcut(
-            "REMOVE_FROM_LABEL_PREVIOUS",
-            Action::Pick(RemoveFromList(-1)),
-        )
-        .key("]")
-        .regions(CONVERSATION),
-    );
-    commands.add(
-        Command::shortcut("REMOVE_FROM_LABEL_NEXT", Action::Pick(RemoveFromList(1)))
-            .key("[")
-            .regions(CONVERSATION),
-    );
+    commands.add(MOVE_SPEC.build());
+    commands.add(REMOVE_ALL_PAIR[usize::from(exact)].build());
+    register_specs(commands, LABEL_TAIL_SPECS);
 }
+
+const SNOOZE_OPEN: Action = Action::Remind(Remind::Open { button: false });
+const SNOOZE_SHIFT_SPEC: CommandSpec = sc(
+    "SNOOZE_SHIFT",
+    &["mod+shift+h"],
+    SHIFT_H_REGIONS,
+    SNOOZE_OPEN,
+);
+const SNOOZE_SHORTCUT_SPEC: CommandSpec = sc("SNOOZE", &["h"], CONVERSATION, SNOOZE_OPEN);
+const SNOOZE_ROW_SPEC: CommandSpec = conv("SNOOZE", "Remind Me", "data/snooze", 10.0, SNOOZE_OPEN)
+    .keys(&["h"])
+    .key_code(&["H"])
+    .scale(1.01)
+    .aliases(&["Snooze", "Boomerang", "Add Reminder"]);
+const REMOVE_REMINDER_PAIR: [CommandSpec; 2] = [
+    conv(
+        "REMOVE_REMINDER",
+        "Remove Reminder",
+        "data/snooze",
+        6.5,
+        Action::Remind(Remind::Remove {
+            threads: None,
+            to_inbox: true,
+        }),
+    )
+    .scale(1.01),
+    conv(
+        "REMOVE_REMINDER",
+        "Remove Reminders",
+        "data/snooze",
+        6.5,
+        Action::Remind(Remind::Remove {
+            threads: None,
+            to_inbox: true,
+        }),
+    )
+    .scale(1.01),
+];
 
 /// `Remind Me` and, for threads with one, `Remove Reminder(s)`. They're not for drafts being
 /// written, and only for an exact selection. Without one, `H` says why it can't.
 fn reminders(commands: &mut Commands<Action>, cx: &Context<'_>) {
-    use crate::remind::Action::{Open, Remove};
-    // ⌘⇧H is compose's own in the reply pane.
-    const SHIFT_H: &[Region] = &[
-        Region::ThreadList,
-        Region::ThreadMessagesHeader,
-        Region::ThreadMessages,
-        Region::ThreadMessageCalendarInvite,
-        Region::ThreadMessagesNewMessages,
-    ];
     if cx.threads.iter().any(|thread| thread.draft_only) {
         return;
     }
-    let open = Action::Remind(Open { button: false });
-    commands.add(
-        Command::shortcut("SNOOZE_SHIFT", open.clone())
-            .key("mod+shift+h")
-            .regions(SHIFT_H),
-    );
+    commands.add(SNOOZE_SHIFT_SPEC.build());
     if !cx.exact {
-        commands.add(
-            Command::shortcut("SNOOZE", open)
-                .key("h")
-                .regions(CONVERSATION),
-        );
+        commands.add(SNOOZE_SHORTCUT_SPEC.build());
         return;
     }
-    let row = |id: &'static str, title: &'static str, action: Action, score: f64| {
-        Command::new(id, title, action)
-            .icon("data/snooze")
-            .default_score(score)
-            .scale(1.01)
-            .multiple()
-            .regions(CONVERSATION)
-    };
-    commands.add(
-        row("SNOOZE", "Remind Me", open, 10.0)
-            .key("h")
-            .key_code(["H"])
-            .aliases(["Snooze", "Boomerang", "Add Reminder"]),
-    );
+    commands.add(SNOOZE_ROW_SPEC.build());
     let reminded = cx
         .threads
         .iter()
         .filter(|thread| thread.has_reminder())
         .count();
     if reminded > 0 {
-        let title = if reminded > 1 {
-            "Remove Reminders"
-        } else {
-            "Remove Reminder"
-        };
-        commands.add(row(
-            "REMOVE_REMINDER",
-            title,
-            Action::Remind(Remove {
-                threads: None,
-                to_inbox: true,
-            }),
-            6.5,
-        ));
+        commands.add(REMOVE_REMINDER_PAIR[usize::from(reminded > 1)].build());
     }
 }
 
-/// The copy rows, for one conversation at a time.
-fn copy(commands: &mut Commands<Action>, rows: CopyRows) {
-    let row = |id: &'static str, title: &'static str, action: Action, score: f64| {
-        Command::new(id, title, action)
+struct CopySpec {
+    enabled: fn(CopyRows) -> bool,
+    query_only_in_list: bool,
+    spec: CommandSpec,
+}
+
+const COPY_SPECS: &[CopySpec] = &[
+    // Both copy the message, and pasting it (⌘V) makes the new draft.
+    CopySpec {
+        enabled: |r| r.message,
+        query_only_in_list: false,
+        spec: row(
+            "COPY_MESSAGE_TO_DRAFT",
+            "Copy Message to new Draft",
+            Action::CopyMessage,
+        )
+        .icon("data/copy")
+        .score(4.3)
+        .regions(CONVERSATION)
+        .key_code(&["⌘", "C"]),
+    },
+    CopySpec {
+        enabled: |r| r.message,
+        query_only_in_list: false,
+        spec: row("COPY_MESSAGE", "Copy Message Contents", Action::CopyMessage)
             .icon("data/copy")
-            .default_score(score)
+            .score(4.2)
             .regions(CONVERSATION)
-    };
-    if rows.message {
-        // Both copy the message, and pasting it (⌘V) makes the new draft.
-        commands.add(
-            row(
-                "COPY_MESSAGE_TO_DRAFT",
-                "Copy Message to new Draft",
-                Action::CopyMessage,
-                4.3,
-            )
-            .key_code(["⌘", "C"]),
-        );
-        commands.add(
-            row(
-                "COPY_MESSAGE",
-                "Copy Message Contents",
-                Action::CopyMessage,
-                4.2,
-            )
-            .key_code(["⌘", "C"]),
-        );
-    }
-    if rows.thread {
-        commands.add(
-            row(
-                "COPY_CONVERSATION",
-                "Copy Conversation Contents",
-                Action::CopyConversation,
-                4.1,
-            )
-            .key_code(["⌘", "C"]),
-        );
-    }
-    if rows.message {
-        commands.add(row(
-            "COPY_RECIPIENTS",
-            "Copy Recipients",
-            Action::CopyRecipients,
-            4.05,
-        ));
-    }
-    if rows.attachments {
-        commands.add(row(
+            .key_code(&["⌘", "C"]),
+    },
+    CopySpec {
+        enabled: |r| r.thread,
+        query_only_in_list: false,
+        spec: row(
+            "COPY_CONVERSATION",
+            "Copy Conversation Contents",
+            Action::CopyConversation,
+        )
+        .icon("data/copy")
+        .score(4.1)
+        .regions(CONVERSATION)
+        .key_code(&["⌘", "C"]),
+    },
+    CopySpec {
+        enabled: |r| r.message,
+        query_only_in_list: false,
+        spec: row("COPY_RECIPIENTS", "Copy Recipients", Action::CopyRecipients)
+            .icon("data/copy")
+            .score(4.05)
+            .regions(CONVERSATION),
+    },
+    CopySpec {
+        enabled: |r| r.attachments,
+        query_only_in_list: false,
+        spec: row(
             "COPY_ATTACHMENTS",
             "Copy Attachments",
             Action::CopyAttachments,
-            4.005,
-        ));
-    }
-    if rows.subject {
-        let subject = row("COPY_SUBJECT", "Copy Subject", Action::CopySubject, 4.01);
-        commands.add(if rows.thread {
-            subject
-        } else {
-            subject.query_only()
-        });
+        )
+        .icon("data/copy")
+        .score(4.005)
+        .regions(CONVERSATION),
+    },
+    CopySpec {
+        enabled: |r| r.subject,
+        query_only_in_list: true,
+        spec: row("COPY_SUBJECT", "Copy Subject", Action::CopySubject)
+            .icon("data/copy")
+            .score(4.01)
+            .regions(CONVERSATION),
+    },
+];
+
+/// The copy rows, for one conversation at a time.
+fn copy(commands: &mut Commands<Action>, rows: CopyRows) {
+    for entry in COPY_SPECS {
+        if (entry.enabled)(rows) {
+            let command = entry.spec.build();
+            commands.add(if entry.query_only_in_list && !rows.thread {
+                command.query_only()
+            } else {
+                command
+            });
+        }
     }
 }
 
@@ -1254,63 +1588,270 @@ pub(crate) fn from_week(id: &str, keys: &[&'static str], action: Action) -> Comm
     .regions(WEEK_GO_TO)
 }
 
-/// What the toast says after `mutation`.
-pub fn toast(mutation: &Mutation, labels: &[Label]) -> String {
-    let label = |id: &str| lists::name(&ListId::Label(id.to_owned()), labels, &[]);
-    match mutation {
-        Mutation::MarkDone => "Marked as Done.".into(),
-        Mutation::MarkNotDone => "Marked not Done.".into(),
-        Mutation::Star => "Starred.".into(),
-        Mutation::Unstar => "Unstarred.".into(),
-        Mutation::MarkRead => "Marked as Read.".into(),
-        Mutation::MarkUnread => "Marked as Unread.".into(),
-        Mutation::Trash => "Moved to Trash.".into(),
-        Mutation::Untrash => "Moved to Inbox.".into(),
-        Mutation::Spam => "Marked as Spam.".into(),
-        Mutation::NotSpam => "Marked as Not Spam.".into(),
-        Mutation::Mute => "Muted.".into(),
-        Mutation::Unmute => "Unmuted.".into(),
-        Mutation::AddLabel(id) => format!("Added to label {}.", label(id)),
-        Mutation::RemoveLabel(id) => format!("Removed from label {}.", label(id)),
-        Mutation::RemoveLabels(_) => "Removed all labels.".into(),
-        Mutation::Move { from, to } => crate::pickers::move_toast(from.as_deref(), to, labels),
-        // Remind me's toasts say when, which only the picker knows (`remind::toast`).
-        Mutation::CancelReminder { .. } => "Reminder removed.".into(),
-        Mutation::Remind { .. } | Mutation::ReturnFromReminder => String::new(),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use exo_store::Attachments;
+    use jiff::Timestamp;
 
-/// What the error toast says when `mutation` (or its undo) failed, for those with copy of their
-/// own.
-pub fn failure(mutation: &Mutation, undo: bool) -> Option<&'static str> {
-    Some(match (mutation, undo) {
-        (Mutation::MarkDone, false) => "Sorry! Failed to mark as Done.",
-        (Mutation::MarkNotDone, false) => "Sorry! Failed to mark not Done.",
-        (Mutation::Trash, false) => "Sorry! Failed to move to Trash.",
-        (Mutation::Untrash, false) => "Sorry! Failed to move to Inbox.",
-        (Mutation::Star, false) => "Sorry! Failed to star.",
-        (Mutation::Unstar, false) => "Sorry! Failed to unstar.",
-        (Mutation::Star, true) => "Sorry! Failed to undo star.",
-        (Mutation::Unstar, true) => "Sorry! Failed to undo unstar.",
-        (Mutation::Mute, false) => "Sorry! Failed to mute the conversation.",
-        (Mutation::Unmute, false) => "Sorry! Failed to Unmute the conversation.",
-        (Mutation::Spam | Mutation::NotSpam, false) => "Sorry! Failed to mark as Spam.",
-        (Mutation::AddLabel(_), false) => "Sorry! Failed to add label.",
-        (Mutation::RemoveLabel(_), false) => "Sorry! Failed to remove from label.",
-        (Mutation::AddLabel(_), true) => "Sorry! Failed to undo add label.",
-        (Mutation::RemoveLabel(_), true) => "Sorry! Failed to undo remove from label.",
-        (Mutation::RemoveLabels(_), false) => "Sorry! Failed to remove labels.",
-        (Mutation::RemoveLabels(_), true) => "Sorry! Failed to undo remove labels.",
-        (Mutation::Move { .. }, _) => "Sorry! Failed to move conversation.",
-        (
-            Mutation::MarkRead
-            | Mutation::MarkUnread
-            | Mutation::Mute
-            | Mutation::Unmute
-            | Mutation::Spam
-            | Mutation::NotSpam,
-            true,
-        ) => "Sorry! Failed to undo.",
-        _ => return None,
-    })
+    use super::*;
+
+    fn sample_thread() -> ThreadSummary {
+        ThreadSummary {
+            id: "t1".into(),
+            participants: Vec::new(),
+            recipients: false,
+            drafts: 0,
+            draft_only: false,
+            subject: "Quarterly Review".into(),
+            snippet: String::new(),
+            labels: Vec::new(),
+            label_ids: Vec::new(),
+            received: Timestamp::UNIX_EPOCH,
+            unread: false,
+            starred: false,
+            done: false,
+            muted: false,
+            attachment: Attachments::None,
+            contact: None,
+            removed_by: Vec::new(),
+            messages: 1,
+            search: None,
+            failure: None,
+            sending: false,
+            scheduled: None,
+            reminder: None,
+            files: Vec::new(),
+        }
+    }
+
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("system fonts load");
+        ctx
+    }
+
+    fn dispatch_key(
+        ctx: &egui::Context,
+        commands: &mut Commands<Action>,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> Vec<Action> {
+        let page = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut primed = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = commands.show(ui.ctx(), page);
+        });
+        primed.textures_delta.clear();
+
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        raw.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            actions = commands.dispatch(ui.ctx());
+        });
+        out.textures_delta.clear();
+        actions
+    }
+
+    #[test]
+    fn list_and_conversation_tables_preserve_shortcuts_toggles_and_spam_gating() {
+        let ctx = test_ctx();
+        let mut thread = sample_thread();
+
+        let run_in_list = |list: &ListId, thread: &ThreadSummary, key, modifiers| {
+            let mut commands = Commands::new();
+            commands.set_region(Region::ThreadList);
+            let threads = [thread];
+            register(
+                &mut commands,
+                &Context {
+                    list,
+                    threads: &threads,
+                    labels: &[],
+                    copy: CopyRows::default(),
+                    home: ListId::Important,
+                    other: ListId::Other,
+                    unified: false,
+                    sender: None,
+                    own_domains: &[],
+                    exact: true,
+                },
+            );
+            dispatch_key(&ctx, &mut commands, key, modifiers)
+        };
+
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::J,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Move(1)]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::S,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Apply(Mutation::Star)]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::E,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Apply(Mutation::MarkDone)]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::M,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::MuteHint]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::M,
+                egui::Modifiers::SHIFT
+            ),
+            vec![Action::Apply(Mutation::Mute)]
+        );
+
+        thread.starred = true;
+        thread.unread = true;
+        thread.muted = true;
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::S,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Apply(Mutation::Unstar)]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::U,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Apply(Mutation::MarkRead)]
+        );
+        assert_eq!(
+            run_in_list(
+                &ListId::Important,
+                &thread,
+                egui::Key::M,
+                egui::Modifiers::SHIFT
+            ),
+            vec![Action::Apply(Mutation::Unmute)]
+        );
+
+        assert!(
+            run_in_list(&ListId::Spam, &thread, egui::Key::E, egui::Modifiers::NONE).is_empty(),
+            "Spam list must not bind Mark Done"
+        );
+    }
+
+    #[test]
+    fn thread_and_folder_tables_dispatch_expected_actions_and_palette_ranking() {
+        let ctx = test_ctx();
+        let page = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let mut thread_commands = Commands::new();
+        thread_commands.set_region(Region::ThreadMessages);
+        register_thread(
+            &mut thread_commands,
+            &ThreadContext {
+                focus_collapsed: true,
+                new_messages_focused: false,
+                has_selection: false,
+                show_images: true,
+            },
+        );
+        assert_eq!(
+            dispatch_key(
+                &ctx,
+                &mut thread_commands,
+                egui::Key::Enter,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::ExpandMessage]
+        );
+
+        let mut folder_commands = Commands::new();
+        folder_commands.set_region(Region::LabelSwitcher);
+        register_folders(&mut folder_commands);
+        assert_eq!(
+            dispatch_key(
+                &ctx,
+                &mut folder_commands,
+                egui::Key::ArrowUp,
+                egui::Modifiers::NONE
+            ),
+            vec![Action::Folders(crate::folders::Key::Up)]
+        );
+
+        let thread = sample_thread();
+        let threads = [&thread];
+        let mut palette_commands = Commands::new();
+        palette_commands.set_region(Region::ThreadList);
+        palette_commands.open_palette(Some("Snooze"));
+        register(
+            &mut palette_commands,
+            &Context {
+                list: &ListId::Important,
+                threads: &threads,
+                labels: &[],
+                copy: CopyRows::default(),
+                home: ListId::Important,
+                other: ListId::Other,
+                unified: false,
+                sender: None,
+                own_domains: &[],
+                exact: true,
+            },
+        );
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut chosen = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            chosen = palette_commands.show(ui.ctx(), page);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            chosen,
+            vec![Action::Remind(crate::remind::Action::Open {
+                button: false
+            })]
+        );
+    }
 }

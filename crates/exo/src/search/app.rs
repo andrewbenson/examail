@@ -216,6 +216,10 @@ impl crate::Mail {
     /// Takes the account's answers into search: people for the suggestions, and the results
     /// into the list. Call after the list's own snapshot is taken.
     pub(crate) fn search_sync(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        let shared_book = self.shared_book();
         let snapshot = self.snapshot.clone();
         let history = self.search_history();
         let now = self.ctx.input(|input| input.time);
@@ -223,16 +227,10 @@ impl crate::Mail {
             return;
         };
         search.set_labels(&snapshot.labels);
-        match &snapshot.address_book {
-            Some(book) => {
-                let effects = search.set_book(book, &self.account.settings().excluded_contacts);
-                self.search_effects(effects, now);
-            }
-            None if !search.book_asked => {
-                search.book_asked = true;
-                self.account.load_address_book();
-            }
-            None => {}
+        if let (Some(book), Some(kept)) = (&snapshot.address_book, shared_book) {
+            let effects =
+                search.set_shared_book(book, &self.account.settings().excluded_contacts, kept);
+            self.search_effects(effects, now);
         }
         let query = self
             .search

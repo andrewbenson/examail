@@ -1,8 +1,8 @@
 //! The dialog's date fields: the shared [`exo_ui::DateInput`] and its popup, the input drawn as the
 //! dialog styles it.
 
-use egui::{Color32, Id, Pos2, Rect, Sense, Ui, pos2, vec2};
-use exo_ui::{DateInput, DatePick, DatePicker, Family, Font, TextStyle};
+use egui::{Color32, Id, Pos2, Ui};
+use exo_ui::{DateField, DateFieldStyle, DateInput, DatePick, Family, Font, TextStyle};
 use jiff::civil::{Date, Weekday};
 
 /// The input's text: the UI face at 600 12px/16px, `top: 1px` (the dialog's light look doesn't
@@ -53,8 +53,6 @@ pub struct Field<'a> {
     pub min: Date,
     /// Today, which the popup marks.
     pub today: Date,
-    /// Its spelling (the input is spellchecked).
-    pub spelling: &'a mut exo_editor::FieldSpelling,
 }
 
 impl Field<'_> {
@@ -71,86 +69,53 @@ impl Field<'_> {
 
     /// Draws the input with its line box's top left at `at`, and returns what happened.
     pub fn show(&mut self, ui: &mut Ui, at: Pos2) -> Option<DateEvent> {
-        let width = self.width(ui.ctx());
-        let line = Rect::from_min_size(at, vec2(width, TEXT.line_height));
-        let mut event = None;
-        let ink = if self.disabled { INK_DISABLED } else { INK };
-        if self.input.text.is_empty() {
-            let placeholder = if self.disabled {
+        let style = DateFieldStyle {
+            text: TEXT.without_ligatures(),
+            placeholder: PLACEHOLDER,
+            min_width: MIN_WIDTH,
+            max_width: f32::INFINITY,
+            ink: if self.disabled { INK_DISABLED } else { INK },
+            placeholder_ink: if self.disabled {
                 PLACEHOLDER_DISABLED
             } else {
                 PLACEHOLDER_INK
-            };
-            PLACEHOLDER.paint_line(ui.painter(), line.min, self.placeholder, placeholder, None);
+            },
+            selection: ui.visuals().selection.bg_fill,
+            unfocused_rule: Some((RULE_GAP, 1.0, RULE)),
+            focused_rule: (RULE_GAP - 1.0, 2.0, RULE_FOCUSED),
+            error_color: RULE_ERROR,
+            popup_anchor_below: RULE_GAP + 1.0,
+        };
+        let out = DateField {
+            id: self.id,
+            input: self.input,
+            style,
+            placeholder: self.placeholder,
+            rule_focused: self.focused,
+            show_popup: self.focused,
+            disabled: self.disabled,
+            extend_hit_to_rule: true,
+            today: self.today,
+            min: Some(self.min),
+            week_start: Weekday::Sunday,
         }
-        let hit = Rect::from_min_max(line.min, pos2(line.right(), line.bottom() + RULE_GAP + 1.0));
-        if self.disabled {
-            TEXT.paint_line(ui.painter(), line.min, &self.input.text, ink, None);
-        } else {
-            let before = self.input.text.clone();
-            let selection = ui.visuals().selection.bg_fill;
-            let response = self.spelling.show(
-                ui,
-                self.id,
-                &mut self.input.text,
-                line,
-                &TEXT.without_ligatures(),
-                ink,
-                selection,
-            );
-            if response.clicked() || (response.gained_focus() && !self.focused) {
+        .show_with(ui, at, crate::spelling::text_field);
+
+        let mut event = None;
+        if !self.disabled {
+            if out.clicked || (out.gained_focus && !self.focused) {
                 event = Some(DateEvent::Focused);
             } else {
                 super::dialog::hold_focus(ui, self.focused, self.id);
             }
-            if self.input.text != before {
+            if out.text_changed {
                 event = Some(DateEvent::Cleared);
             }
-            let pointer = ui
-                .interact(hit, self.id.with("hit"), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::Text);
-            if pointer.clicked() {
-                event = Some(DateEvent::Focused);
-            }
         }
-        // The rule is 1px, 3px under the text, or 2px, 2px under it while focused.
-        let (gap, thickness) = if self.focused {
-            (RULE_GAP - 1.0, 2.0)
-        } else {
-            (RULE_GAP, 1.0)
-        };
-        let color = if self.input.error {
-            RULE_ERROR
-        } else if self.focused {
-            RULE_FOCUSED
-        } else {
-            RULE
-        };
-        let rule = Rect::from_min_size(
-            pos2(line.left(), line.bottom() + gap),
-            vec2(width, thickness),
-        );
-        ui.painter()
-            .rect_filled(exo_ui::pixel_snap(rule), 0.0, color);
-        if let Some(mut month) = self.input.month.filter(|_| self.focused && !self.disabled) {
-            // Tethered to the input's box: its line, padding and rule.
-            let at = pos2(line.left(), line.bottom() + RULE_GAP + 1.0) + exo_ui::DATE_PICKER_OFFSET;
-            let picker = DatePicker {
-                id: self.id.with("popup"),
-                month: &mut month,
-                selected: self.input.parsed,
-                today: self.today,
-                min: Some(self.min),
-                week_start: Weekday::Sunday,
-            };
-            match picker.show(ui.ctx(), at) {
-                Some(DatePick::Picked(day)) => event = Some(DateEvent::Picked(day)),
-                Some(DatePick::MonthChanged) => {
-                    self.input.month = Some(month);
-                    event = Some(DateEvent::MonthChanged);
-                }
-                None => {}
-            }
+        match out.pick {
+            Some(DatePick::Picked(day)) => event = Some(DateEvent::Picked(day)),
+            Some(DatePick::MonthChanged) => event = Some(DateEvent::MonthChanged),
+            None => {}
         }
         event
     }

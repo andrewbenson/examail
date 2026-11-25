@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 use egui::Color32;
+use exo_mail::escape_html as text;
 use exo_store::Attachments;
 
 use super::{
@@ -23,6 +24,10 @@ pub(super) const BASE_URL: &str = "exo-https://exo.invalid/";
 /// Only what the print view's handler answers loads: fonts from Exo, a body's remote content
 /// through the guarded fetches, its inline attachments, and `data:` images. No scripts at all.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src exo-https: exo-http: cid: data:; style-src 'unsafe-inline' exo-https: exo-http:; font-src exo-print: exo-https: exo-http: data:";
+/// Tighter CSP when every message and draft in the document has remote content blocked, omitting
+/// `exo-https:` and `exo-http:` altogether.
+const CONTENT_SECURITY_POLICY_BLOCKED: &str =
+    "default-src 'none'; img-src cid: data:; style-src 'unsafe-inline'; font-src exo-print: data:";
 
 /// The legacy icons the printed page shows, each in the color it prints in.
 const PAPERCLIP: (&str, &str) = ("legacy/DEPRECATED_paperclip", "#000");
@@ -31,8 +36,16 @@ const COLLAPSE: (&str, &str) = ("legacy/DEPRECATED_collapse", "rgba(0,0,0,0.7)")
 const PIXEL_BLOCKING: (&str, &str) = ("legacy/DEPRECATED_pixelBlocking", "rgba(0,0,0,0.45)");
 const CROSS: (&str, &str) = ("css/isInvalid-cross", "#fff");
 
-/// The page for `conversation`.
-pub(super) fn html(conversation: &Conversation) -> String {
+/// A rendered print document and whether any message or draft in it loads remote content.
+pub(super) struct Rendered {
+    pub(super) html: String,
+    pub(super) allow_remote: bool,
+}
+
+/// The page for `conversation`. When `block_draft_remote_content` is set, remote URLs in open
+/// drafts are rewritten to `exo-blocked:`; if no message body or draft loads remote content, the
+/// page's CSP omits `exo-https:` and `exo-http:` and [`Rendered::allow_remote`] is `false`.
+pub(super) fn html(conversation: &Conversation, block_draft_remote_content: bool) -> Rendered {
     let icon = |(name, color): (&str, &str)| -> String {
         exo_ui::icon_svg(name)
             .map(|svg| svg.replace("\"#fff\"", &format!("\"{color}\"")))
@@ -45,31 +58,16 @@ pub(super) fn html(conversation: &Conversation) -> String {
         pixel_blocking: icon(PIXEL_BLOCKING),
         cross: icon(CROSS),
     };
-    let page = conversation.page;
-    let narrow = if page.narrow() {
-        " class=\"isNarrow\""
-    } else {
-        ""
-    };
-    let mut html = format!(
-        "<!DOCTYPE html><html{narrow} style=\"font-size: {rem}px; width: {width}px\"><head><meta charset=\"utf-8\">\
-         <meta http-equiv=\"Content-Security-Policy\" content=\"{CONTENT_SECURITY_POLICY}\">\
-         <meta http-equiv=\"x-dns-prefetch-control\" content=\"off\">\
-         <title>{title}</title><style>{fonts}{PRINT_CSS}</style></head><body>",
-        rem = page.rem(),
-        // Rounded to the hundredth, since a float's last digits mean nothing to a layout.
-        width = (page.width() * 100.0).round() / 100.0,
-        title = text(&conversation.title),
-        fonts = font_faces(),
-    );
-    header(&mut html, conversation);
+    let mut body_html = String::new();
+    let mut allow_remote = false;
+    header(&mut body_html, conversation);
     let scrolled = if conversation.scrolled {
         " isScrolled"
     } else {
         ""
     };
     let _ = write!(
-        html,
+        body_html,
         "<div class=\"ThreadPane-messages{scrolled}\"><div class=\"ThreadPane-table\">"
     );
     for message in &conversation.messages {
@@ -92,7 +90,7 @@ pub(super) fn html(conversation: &Conversation) -> String {
                     Attachments::None => String::new(),
                 };
                 let _ = write!(
-                    html,
+                    body_html,
                     "<div class=\"MessagePane-collapsed\"><div class=\"MessagePane-from\">{}</div><div class=\"MessagePane-snippet\">{}</div><div class=\"MessagePane-datetime\">{clip}{}</div></div>",
                     text(from),
                     text(snippet),
@@ -123,7 +121,7 @@ pub(super) fn html(conversation: &Conversation) -> String {
                     })
                     .unwrap_or_default();
                 let _ = write!(
-                    html,
+                    body_html,
                     "<div class=\"ThreadShareMarker\"><span class=\"ThreadShareMarker-body\">{}{link}</span>{when}</div>",
                     text(body)
                 );
@@ -135,11 +133,11 @@ pub(super) fn html(conversation: &Conversation) -> String {
                 files,
                 draft,
             } => {
-                html.push_str("<div class=\"MessagePane-expanded\">");
+                body_html.push_str("<div class=\"MessagePane-expanded\">");
                 match header {
                     Header::Compact { participants, when } => {
                         let _ = write!(
-                            html,
+                            body_html,
                             "<div class=\"MessagePane-header\"><div class=\"MessagePane-header-from\">{}</div><div class=\"MessagePane-datetime isSent\">{}</div></div>",
                             text(participants),
                             when_html(when)
@@ -150,42 +148,77 @@ pub(super) fn html(conversation: &Conversation) -> String {
                         when,
                         chevron,
                         tracking_blocked,
-                    } => full_header(&mut html, rows, when, *chevron, *tracking_blocked, &icons),
+                    } => full_header(
+                        &mut body_html,
+                        rows,
+                        when,
+                        *chevron,
+                        *tracking_blocked,
+                        &icons,
+                    ),
                 }
-                html.push_str("<div class=\"MessagePane-iframe-wrapper\">");
+                body_html.push_str("<div class=\"MessagePane-iframe-wrapper\">");
                 if let Some(invite) = invite {
-                    invite_card(&mut html, invite);
+                    invite_card(&mut body_html, invite);
                 }
                 if let Some(body) = body {
+                    if !allow_remote && html_has_remote_resources(body) {
+                        allow_remote = true;
+                    }
                     // A script the print view injects moves each template into its host's shadow
                     // root (`macos::SHADOW_ROOTS`).
                     let _ = write!(
-                        html,
+                        body_html,
                         "<div class=\"Shadowbox\"><template>{body}</template></div>"
                     );
                 }
                 if !files.is_empty() {
-                    html.push_str("<div class=\"AttachmentList\">");
+                    body_html.push_str("<div class=\"AttachmentList\">");
                     for file in files {
-                        attachment(&mut html, file);
+                        attachment(&mut body_html, file);
                     }
-                    html.push_str("</div>");
+                    body_html.push_str("</div>");
                 }
-                html.push_str("</div>");
-                if let Some(draft) = draft {
-                    draft_form(&mut html, draft, &icons);
+                body_html.push_str("</div>");
+                if let Some(draft) = draft
+                    && draft_form(&mut body_html, draft, &icons, block_draft_remote_content)
+                {
+                    allow_remote = true;
                 }
-                html.push_str("</div>");
+                body_html.push_str("</div>");
             }
         }
     }
-    html.push_str("</div></div></body></html>");
-    html
+    body_html.push_str("</div></div>");
+    let page = conversation.page;
+    let narrow = if page.narrow() {
+        " class=\"isNarrow\""
+    } else {
+        ""
+    };
+    let csp = if allow_remote {
+        CONTENT_SECURITY_POLICY
+    } else {
+        CONTENT_SECURITY_POLICY_BLOCKED
+    };
+    let html = format!(
+        "<!DOCTYPE html><html{narrow} style=\"font-size: {rem}px; width: {width}px\"><head><meta charset=\"utf-8\">\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
+         <meta http-equiv=\"x-dns-prefetch-control\" content=\"off\">\
+         <title>{title}</title><style>{fonts}{PRINT_CSS}</style></head><body>{body_html}</body></html>",
+        rem = page.rem(),
+        // Rounded to the hundredth, since a float's last digits mean nothing to a layout.
+        width = (page.width() * 100.0).round() / 100.0,
+        title = text(&conversation.title),
+        fonts = font_faces(),
+    );
+    Rendered { html, allow_remote }
 }
 
 /// A draft's form without its buttons: its header (`Draft to …`, or its recipient lists), what's
-/// written, and the `…` of its quote. The editor's HTML is Exo's own, so it goes in as it is.
-fn draft_form(html: &mut String, draft: &Draft, icons: &Icons) {
+/// written, and the `…` of its quote. Returns whether the rewritten draft body loads any remote
+/// content.
+fn draft_form(html: &mut String, draft: &Draft, icons: &Icons, block_remote_content: bool) -> bool {
     html.push_str("<div class=\"ComposeForm\"><div class=\"ComposeForm-header\">");
     match &draft.header {
         DraftHeader::Collapsed(recipients) => {
@@ -223,15 +256,80 @@ fn draft_form(html: &mut String, draft: &Draft, icons: &Icons) {
             }
         }
     }
+    let body = exo_mail::rewrite_print_html(&draft.body, block_remote_content);
+    let has_remote = !block_remote_content && html_has_remote_resources(&body);
     let _ = write!(
         html,
-        "</div><div class=\"ComposeForm-body\"><div class=\"ComposeForm-editor\">{}</div>",
-        draft.body
+        "</div><div class=\"ComposeForm-body\"><div class=\"ComposeForm-editor\">{body}</div>",
     );
     if draft.quote {
         html.push_str("<div class=\"ComposeForm-quote\"><span></span></div>");
     }
     html.push_str("</div></div>");
+    has_remote
+}
+
+fn is_remote_scheme(url: &str) -> bool {
+    let trimmed = url.trim_start();
+    let Some(rest) = exo_mail::strip_ascii_prefix(trimmed, exo_mail::REMOTE_SCHEME_PREFIX) else {
+        return false;
+    };
+    exo_mail::strip_ascii_prefix(rest, "https:").is_some()
+        || exo_mail::strip_ascii_prefix(rest, "http:").is_some()
+}
+
+fn srcset_has_remote(srcset: &str) -> bool {
+    srcset.split(',').any(is_remote_scheme)
+}
+
+fn css_has_remote(css: &str) -> bool {
+    static CSS_REMOTE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:url\(\s*['"]?\s*|@import\s*['"]\s*)exo-https?:"#)
+            .expect("valid regex")
+    });
+    CSS_REMOTE.is_match(css)
+}
+
+/// Whether `html` (already rewritten for printing) references any `exo-http:` or `exo-https:`
+/// resource in an element attribute or CSS declaration. Plain text and `<a href>` links don't
+/// count.
+fn html_has_remote_resources(html: &str) -> bool {
+    if !html
+        .as_bytes()
+        .windows(8)
+        .any(|window| window.eq_ignore_ascii_case(b"exo-http"))
+    {
+        return false;
+    }
+    let document = exo_mail::dom::parse(&format!(
+        "<!DOCTYPE html><html><body><div>{html}</div></body></html>"
+    ));
+    let found = exo_mail::dom::body(&document)
+        .and_then(|body| exo_mail::dom::element_children(&body).into_iter().next())
+        .is_some_and(|root| {
+            exo_mail::dom::select(&root, exo_mail::dom::is_element)
+                .into_iter()
+                .any(|element| {
+                    let has_href_resource = exo_mail::dom::is_svg_image(&element)
+                        || exo_mail::dom::is(&element, "link");
+                    let attrs: &[&str] = if has_href_resource {
+                        &["src", "background", "poster", "href", "xlink:href"]
+                    } else {
+                        &["src", "background", "poster"]
+                    };
+                    attrs.iter().any(|name| {
+                        exo_mail::dom::attr(&element, name)
+                            .is_some_and(|value| is_remote_scheme(&value))
+                    }) || exo_mail::dom::attr(&element, "srcset")
+                        .is_some_and(|value| srcset_has_remote(&value))
+                        || exo_mail::dom::attr(&element, "style")
+                            .is_some_and(|value| css_has_remote(&value))
+                        || (exo_mail::dom::is(&element, "style")
+                            && css_has_remote(&exo_mail::dom::text_content(&element)))
+                })
+        });
+    exo_mail::dom::drop_tree(document);
+    found
 }
 
 /// An attachment card: the file's name, and its type's badge.
@@ -492,15 +590,6 @@ fn css_color(color: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
 }
 
-/// `value` escaped for HTML text and double-quoted attributes.
-fn text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +608,8 @@ mod tests {
 
     #[test]
     fn the_page_is_laid_out_for_its_paper() {
-        let html = html(&conversation(Vec::new()));
+        let rendered = html(&conversation(Vec::new()), false);
+        let html = rendered.html;
         assert!(
             html.starts_with(
                 "<!DOCTYPE html><html class=\"isNarrow\" style=\"font-size: 10px; width: 777.6px\">"
@@ -590,7 +680,7 @@ mod tests {
                 draft: None,
             },
         ];
-        let html = html(&conversation(messages));
+        let html = html(&conversation(messages), false).html;
         let clip = exo_ui::icon_svg(PAPERCLIP.0)
             .expect("compiled in")
             .replace("\"#fff\"", "\"#000\"");
@@ -627,7 +717,7 @@ mod tests {
                 body: "<div>Thanks</div>".into(),
                 quote: true,
             };
-            draft_form(&mut html, &draft, &icons);
+            draft_form(&mut html, &draft, &icons, false);
             html
         };
         assert_eq!(
@@ -698,6 +788,180 @@ mod tests {
              <div class=\"CalendarInvite-row\"><span class=\"CalendarInvite-question\">When</span><div class=\"CalendarInvite-property CalendarInvite-property-when\"><div><span class=\"CalendarInvite-eventTime\">Wednesday<wbr>,<wbr> November 25th<wbr>,<wbr> 2026<wbr> at<wbr> 9:00 AM <wbr>– <wbr>9:45 AM EST</span></div></div></div>\
              <div class=\"CalendarInvite-row\"><span class=\"CalendarInvite-question\">Meet</span><div class=\"CalendarInvite-property CalendarInvite-property-video-link\"><div><a>meet.google.com/a</a></div></div></div>\
              </div></div>"
+        );
+    }
+
+    #[test]
+    fn open_draft_rewrites_remote_signature_images_for_print_csp() {
+        let icons = Icons {
+            paperclip: String::new(),
+            calendar: String::new(),
+            collapse: String::new(),
+            pixel_blocking: String::new(),
+            cross: String::new(),
+        };
+        let draft = Draft {
+            header: DraftHeader::Collapsed("Tom".into()),
+            body: concat!(
+                r#"<div>Best,<br><img src="https://cdn.example.com/sig.png" srcset="HTTP://cdn.example.com/sig@1x.png 1x, //cdn.example.com/sig@2x.png 2x" loading="lazy"></div>"#,
+                r#"<div style="background: url('https://cdn.example.com/bg.png')"><a href="https://example.com">https://example.com</a></div>"#,
+                r#"<img src="cid:inline-logo"><img src="data:image/png;base64,iVBORw0K">"#,
+            )
+            .into(),
+            quote: false,
+        };
+        let mut html = String::new();
+        assert!(draft_form(&mut html, &draft, &icons, false));
+        assert!(
+            html.contains(r#"src="exo-https://cdn.example.com/sig.png""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"srcset="exo-http://cdn.example.com/sig@1x.png 1x, exo-https://cdn.example.com/sig@2x.png 2x""#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("loading="), "lazy loading stripped: {html}");
+        assert!(
+            html.contains("url('exo-https://cdn.example.com/bg.png')"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a href="https://example.com">https://example.com</a>"#),
+            "links and body text keep their scheme: {html}"
+        );
+        assert!(
+            html.contains(r#"src="cid:inline-logo""#)
+                && html.contains(r#"src="data:image/png;base64,iVBORw0K""#),
+            "cid: and data: stay untouched: {html}"
+        );
+    }
+
+    #[test]
+    fn draft_with_angle_bracket_alt_and_preexisting_exo_scheme_honors_blocking() {
+        let icons = Icons {
+            paperclip: String::new(),
+            calendar: String::new(),
+            collapse: String::new(),
+            pixel_blocking: String::new(),
+            cross: String::new(),
+        };
+        let draft = Draft {
+            header: DraftHeader::Collapsed("Tom".into()),
+            body: concat!(
+                r#"<img alt="a > b" src="https://cdn.example.com/sig.png">"#,
+                r#"<img src="exo-https://cdn.example.com/pre.png">"#,
+            )
+            .into(),
+            quote: false,
+        };
+
+        let mut allowed = String::new();
+        assert!(draft_form(&mut allowed, &draft, &icons, false));
+        assert!(
+            allowed.contains(r#"src="exo-https://cdn.example.com/sig.png""#),
+            "DOM rewriter handles '>' inside alt attribute: {allowed}"
+        );
+        assert!(
+            allowed.contains(r#"src="exo-https://cdn.example.com/pre.png""#)
+                && !allowed.contains("exo-exo-"),
+            "pre-existing exo-https is preserved without double-prefixing: {allowed}"
+        );
+
+        let mut blocked = String::new();
+        assert!(!draft_form(&mut blocked, &draft, &icons, true));
+        assert!(
+            blocked.contains(r#"src="exo-blocked://cdn.example.com/sig.png""#),
+            "remote image blocked: {blocked}"
+        );
+        assert!(
+            blocked.contains(r#"src="exo-blocked://cdn.example.com/pre.png""#),
+            "pre-existing exo-https blocked: {blocked}"
+        );
+        assert!(blocked.contains("data-exo-blocked"), "{blocked}");
+        assert!(
+            !blocked.to_ascii_lowercase().contains("exo-http"),
+            "no exo-http(s) survives blocking: {blocked}"
+        );
+    }
+
+    #[test]
+    fn print_csp_omits_remote_schemes_when_all_content_is_blocked() {
+        let expanded = |body: Option<&str>, draft: Option<&str>| Message::Expanded {
+            header: Header::Compact {
+                participants: "Maya".into(),
+                when: When::Date("NOV 16".into()),
+            },
+            invite: None,
+            body: body.map(str::to_owned),
+            files: Vec::new(),
+            draft: draft.map(|body| Draft {
+                header: DraftHeader::Collapsed("Tom".into()),
+                body: body.into(),
+                quote: false,
+            }),
+        };
+
+        // Both message body (blocked + deceptive plain text) and blocked draft -> no remote schemes in CSP.
+        let blocked_doc = html(
+            &conversation(vec![expanded(
+                Some(
+                    r#"<img src="exo-blocked://x.io/a.png" data-exo-blocked=""><p>exo-https://plain.text</p><a href="exo-https://link.text">link</a>"#,
+                ),
+                Some(
+                    r#"<img alt="a > b" src="https://cdn.example.com/sig.png"><img src="exo-https://cdn.example.com/pre.png">"#,
+                ),
+            )]),
+            true,
+        );
+        assert!(!blocked_doc.allow_remote);
+        assert!(
+            blocked_doc.html.contains(CONTENT_SECURITY_POLICY_BLOCKED),
+            "{}",
+            blocked_doc.html
+        );
+        assert!(
+            !blocked_doc.html.contains("img-src exo-https: exo-http:"),
+            "{}",
+            blocked_doc.html
+        );
+
+        // Allowed draft with remote image -> CSP permits exo-https:/exo-http:.
+        let allowed_draft_doc = html(
+            &conversation(vec![expanded(
+                Some(r#"<img src="exo-blocked://x.io/a.png" data-exo-blocked="">"#),
+                Some(r#"<img alt="a > b" src="https://cdn.example.com/sig.png">"#),
+            )]),
+            false,
+        );
+        assert!(allowed_draft_doc.allow_remote);
+        assert!(
+            allowed_draft_doc.html.contains(CONTENT_SECURITY_POLICY),
+            "{}",
+            allowed_draft_doc.html
+        );
+
+        // Blocked draft, but a message body explicitly revealed its images -> CSP permits remote.
+        let revealed_message_doc = html(
+            &conversation(vec![expanded(
+                Some(r#"<img src="exo-https://x.io/revealed.png">"#),
+                Some(r#"<img src="https://cdn.example.com/sig.png">"#),
+            )]),
+            true,
+        );
+        assert!(revealed_message_doc.allow_remote);
+        assert!(
+            revealed_message_doc.html.contains(CONTENT_SECURITY_POLICY),
+            "{}",
+            revealed_message_doc.html
+        );
+        assert!(
+            revealed_message_doc
+                .html
+                .contains(r#"src="exo-blocked://cdn.example.com/sig.png""#),
+            "draft itself still blocks its own remote images: {}",
+            revealed_message_doc.html
         );
     }
 }

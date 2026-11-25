@@ -7,7 +7,7 @@
 //! checked the same way.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -40,37 +40,118 @@ pub(crate) enum Error {
     Unavailable,
 }
 
+/// Which addresses a [`Client`] may connect to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Only globally routable public internet addresses.
+    Public,
+    /// Public internet addresses, plus this machine's loopback (mock-servers).
+    PublicOrLoopback,
+    /// Only this machine's loopback (mock-servers' one-click unsubscribes).
+    LoopbackOnly,
+}
+
+impl Scope {
+    /// Whether `ip` is within this scope.
+    pub(crate) fn allows(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Public => is_public(ip),
+            Self::PublicOrLoopback => ip.to_canonical().is_loopback() || is_public(ip),
+            Self::LoopbackOnly => ip.to_canonical().is_loopback(),
+        }
+    }
+}
+
+impl Error {
+    /// Whether the request was refused before connecting because its URL or resolved addresses
+    /// weren't allowed.
+    pub(crate) fn is_refused(&self) -> bool {
+        match self {
+            Self::Url(_) | Self::Private(_) => true,
+            Self::Http(error) => {
+                let mut source = std::error::Error::source(error);
+                while let Some(cause) = source {
+                    if cause.is::<Private>() {
+                        return true;
+                    }
+                    source = cause.source();
+                }
+                false
+            }
+            Self::Unavailable => false,
+        }
+    }
+}
+
 /// The client. Every URL is checked before it's asked for, and names are checked as they resolve.
 #[derive(Clone, Debug)]
 pub(crate) struct Client {
     http: Option<reqwest::Client>,
-    loopback: bool,
+    scope: Scope,
+    https_only: bool,
 }
 
 impl Client {
     /// Gives up on a load after `timeout`. With `loopback` it may also load from this Mac, which
-    /// only a Gmail served from it (gmail-mock) asks for.
+    /// only a Gmail served from it (mock-servers) asks for.
     pub(crate) fn new(timeout: Duration, loopback: bool) -> Self {
+        let scope = if loopback {
+            Scope::PublicOrLoopback
+        } else {
+            Scope::Public
+        };
         Self {
-            http: http(timeout, loopback, false),
-            loopback,
+            http: http(timeout, scope, false, true),
+            scope,
+            https_only: false,
         }
     }
 
     /// [`new`](Self::new) on the public internet, over HTTPS only, redirects included.
     pub(crate) fn https_only(timeout: Duration) -> Self {
         Self {
-            http: http(timeout, false, true),
-            loopback: false,
+            http: http(timeout, Scope::Public, true, true),
+            scope: Scope::Public,
+            https_only: true,
         }
     }
 
-    /// Asks for `url`, refusing without connecting when it names a local address.
+    /// A client that never follows redirects, restricted to `scope` and optionally HTTPS only.
+    pub(crate) fn no_redirects(timeout: Duration, scope: Scope, https_only: bool) -> Self {
+        Self {
+            http: http(timeout, scope, https_only, false),
+            scope,
+            https_only,
+        }
+    }
+
+    /// Asks for `url`, refusing without connecting when it names a local address or carries
+    /// credentials.
     pub(crate) async fn get(&self, url: &str) -> Result<reqwest::Response, Error> {
         let url = url::Url::parse(url)?;
-        check(&url, self.loopback)?;
+        check(&url, self.scope, self.https_only)?;
         let http = self.http.as_ref().ok_or(Error::Unavailable)?;
         Ok(http.get(url).send().await?)
+    }
+
+    /// POSTs `body` (`application/x-www-form-urlencoded`) to `url`, refusing without connecting
+    /// when `url` isn't allowed by this client's scope.
+    pub(crate) async fn post_form(
+        &self,
+        url: &url::Url,
+        body: &'static str,
+    ) -> Result<reqwest::Response, Error> {
+        check(url, self.scope, self.https_only)?;
+        let http = self.http.as_ref().ok_or(Error::Unavailable)?;
+        Ok(http
+            .post(url.clone())
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .await?)
     }
 
     /// The body at `url` ([`get`](Self::get)), or `None` when it's over `limit` bytes.
@@ -87,32 +168,47 @@ impl Client {
     }
 }
 
-/// Whether Gmail is served from this Mac (gmail-mock), the only case in which remote content may
+/// Whether Gmail is served from this Mac (mock-servers), the only case in which remote content may
 /// come from it too.
 pub(crate) fn serves_gmail_locally(endpoints: &gmail::Endpoints) -> bool {
     endpoints.gmail.host().is_some_and(|host| match host {
-        url::Host::Domain(name) => name == "localhost",
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
     })
 }
 
-/// The HTTP client, whose resolver and redirects only reach the public internet, and with
+/// Whether `url` is allowed before resolving its host: allowed scheme, no userinfo credentials,
+/// and an IP literal (if any) permitted by `scope`.
+pub(crate) fn permits(url: &url::Url, scope: Scope, https_only: bool) -> bool {
+    check(url, scope, https_only).is_ok()
+}
+
+/// The HTTP client, whose resolver and redirects only reach addresses in `scope`, and with
 /// `https_only`, only over HTTPS.
-fn http(timeout: Duration, loopback: bool, https_only: bool) -> Option<reqwest::Client> {
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            attempt.error("too many redirects")
-        } else if let Err(refused) = check(attempt.url(), loopback) {
-            attempt.error(refused)
-        } else {
-            attempt.follow()
-        }
-    });
+fn http(
+    timeout: Duration,
+    scope: Scope,
+    https_only: bool,
+    follow_redirects: bool,
+) -> Option<reqwest::Client> {
+    let policy = if follow_redirects {
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if let Err(refused) = check(attempt.url(), scope, https_only) {
+                attempt.error(refused)
+            } else {
+                attempt.follow()
+            }
+        })
+    } else {
+        reqwest::redirect::Policy::none()
+    };
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(policy)
-        .dns_resolver(Arc::new(PublicResolver { loopback }))
+        .dns_resolver(Arc::new(PublicResolver { scope }))
         .https_only(https_only)
         // A proxy would resolve the name itself, past the resolver's check.
         .no_proxy()
@@ -121,36 +217,53 @@ fn http(timeout: Duration, loopback: bool, https_only: bool) -> Option<reqwest::
         .ok()
 }
 
-/// Refuses `url` when its host is an address that isn't public, before anything connects.
-/// Names are left to [`PublicResolver`].
-fn check(url: &url::Url, loopback: bool) -> Result<(), Private> {
-    let ip = match url.host() {
-        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
-        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
-        Some(url::Host::Domain(_)) => return Ok(()),
-        None => return Err(Private(url.to_string())),
+/// Refuses `url` before anything connects when its scheme isn't HTTP(S), it carries credentials,
+/// or its host is an IP literal outside `scope`. Names are left to [`PublicResolver`].
+fn check(url: &url::Url, scope: Scope, https_only: bool) -> Result<(), Private> {
+    let scheme_ok = if https_only {
+        url.scheme() == "https"
+    } else {
+        matches!(url.scheme(), "http" | "https")
     };
-    if allowed(ip, loopback) {
+    if !scheme_ok || !url.username().is_empty() || url.password().is_some() {
+        return Err(Private(url.to_string()));
+    }
+    let Some(host) = url.host() else {
+        return Err(Private(url.to_string()));
+    };
+    if scope == Scope::Public {
+        return if exo_mail::is_public_host(host.clone()) {
+            Ok(())
+        } else {
+            Err(Private(host.to_string()))
+        };
+    }
+    let ip = match host {
+        url::Host::Ipv4(ip) => IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => IpAddr::V6(ip),
+        url::Host::Domain(_) => return Ok(()),
+    };
+    if scope.allows(ip) {
         Ok(())
     } else {
         Err(Private(ip.to_string()))
     }
 }
 
-/// Resolves names with the system's resolver, keeping only the addresses [`allowed`] lets
+/// Resolves names with the system's resolver, keeping only the addresses [`Scope::allows`] lets
 /// through. A name with none left fails to resolve.
 struct PublicResolver {
-    loopback: bool,
+    scope: Scope,
 }
 
 impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let loopback = self.loopback;
+        let scope = self.scope;
         Box::pin(async move {
             let host = name.as_str().to_owned();
             let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await?
-                .filter(|address| allowed(address.ip(), loopback))
+                .filter(|address| scope.allows(address.ip()))
                 .collect();
             if addresses.is_empty() {
                 return Err(Box::new(Private(host)) as _);
@@ -160,60 +273,7 @@ impl Resolve for PublicResolver {
     }
 }
 
-/// Whether remote content may come from `ip`, which it may from a public address, or with
-/// `loopback` from this Mac's.
-fn allowed(ip: IpAddr, loopback: bool) -> bool {
-    (loopback && ip.is_loopback()) || is_public(ip)
-}
-
-/// Whether `ip` is on the public internet: not this machine (loopback, `0.0.0.0`), a private or
-/// carrier-grade NAT network, link-local, multicast, broadcast or reserved. An IPv6 address that
-/// carries an IPv4 one (mapped, or NAT64's `64:ff9b::/96`) is judged by it.
-fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_public_v4(ip),
-        IpAddr::V6(ip) => match embedded_v4(ip) {
-            Some(v4) => is_public_v4(v4),
-            None => {
-                let [first, second, ..] = ip.segments();
-                !(ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_multicast()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    // Site-local (`fec0::/10`), deprecated but still routed by some networks.
-                    || first & 0xffc0 == 0xfec0
-                    // Discard-only (`100::/64`).
-                    || (first == 0x100 && second == 0))
-            }
-        },
-    }
-}
-
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [first, second, ..] = ip.octets();
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        // "This network" (`0.0.0.0/8`), carrier-grade NAT (`100.64.0.0/10`) and reserved
-        // (`240.0.0.0/4`).
-        || first == 0
-        || (first == 100 && second & 0xc0 == 64)
-        || first >= 240)
-}
-
-/// The IPv4 address an IPv6 one stands for: IPv4-mapped (`::ffff:a.b.c.d`), or NAT64's
-/// well-known prefix (`64:ff9b::a.b.c.d`), which a NAT64 network routes to that address.
-fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    ip.to_ipv4_mapped().or_else(|| {
-        let segments = ip.segments();
-        (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0])
-            .then(|| Ipv4Addr::from((u32::from(segments[6]) << 16) | u32::from(segments[7])))
-    })
-}
+pub(crate) use exo_mail::is_public_ip as is_public;
 
 #[cfg(test)]
 mod tests {
@@ -233,6 +293,7 @@ mod tests {
             "2606:4700::1111",
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
+            "2002:808:808::1",
         ];
         for ip in public {
             assert!(is_public(ip.parse().expect("an address")), "{ip} is public");
@@ -249,45 +310,82 @@ mod tests {
             "0.1.2.3",
             "100.64.0.1",
             "100.127.255.254",
+            "192.0.0.8",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "198.51.100.1",
+            "203.0.113.1",
             "224.0.0.1",
             "255.255.255.255",
             "240.0.0.1",
             "::1",
             "::",
+            "::7f00:1",
+            "::a00:1",
             "fe80::1",
             "fc00::1",
             "fd12:3456::1",
             "fec0::1",
             "ff02::1",
             "100::1",
+            "2001:db8::1",
+            "2001::1",
             "::ffff:192.168.1.1",
             "::ffff:127.0.0.1",
+            "::ffff:192.0.0.1",
+            "::ffff:198.18.0.1",
             "64:ff9b::a00:1",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:ffff::1",
+            "2002:c0a8:101::1",
+            "2002:7f00:1::1",
         ];
         for ip in private {
             assert!(!is_public(ip.parse().expect("an address")), "{ip} is local");
         }
         assert!(
-            allowed("127.0.0.1".parse().expect("an address"), true),
-            "gmail-mock's own machine"
+            Scope::PublicOrLoopback.allows("127.0.0.1".parse().expect("an address")),
+            "mock-servers' own machine"
         );
         assert!(
-            !allowed("192.168.1.1".parse().expect("an address"), true),
+            Scope::PublicOrLoopback.allows("::ffff:127.0.0.1".parse().expect("an address")),
+            "canonicalized IPv4-mapped loopback"
+        );
+        assert!(
+            !Scope::PublicOrLoopback.allows("192.168.1.1".parse().expect("an address")),
             "but never the network"
         );
+        assert!(Scope::LoopbackOnly.allows("127.0.0.1".parse().expect("an address")));
+        assert!(!Scope::LoopbackOnly.allows("8.8.8.8".parse().expect("an address")));
     }
 
     #[test]
-    fn urls_naming_local_addresses_are_refused_before_connecting() {
-        let check = |url: &str, loopback| check(&url.parse().expect("a URL"), loopback).is_ok();
+    fn urls_naming_local_addresses_or_credentials_are_refused_before_connecting() {
+        let check = |url: &str, loopback| {
+            let scope = if loopback {
+                Scope::PublicOrLoopback
+            } else {
+                Scope::Public
+            };
+            check(&url.parse().expect("a URL"), scope, false).is_ok()
+        };
         assert!(
             check("https://example.com/a.png", false),
             "names are the resolver's"
         );
         assert!(!check("http://192.168.0.1/admin", false));
         assert!(!check("http://[::ffff:10.0.0.1]/", false));
+        assert!(!check("http://[::7f00:1]/", false));
+        assert!(!check("http://[64:ff9b:1::808:808]/", false));
         assert!(!check("http://127.0.0.1:8080/", false));
+        assert!(!check("http://localhost:8080/", false));
+        assert!(!check("http://sub.localhost/a.png", false));
+        assert!(!check("https://user:pass@example.com/a.png", false));
+        assert!(!check("https://user@example.com/a.png", false));
+        assert!(!check("file:///etc/passwd", false));
         assert!(check("http://127.0.0.1:8080/", true));
+        assert!(!check("http://user@127.0.0.1:8080/", true));
     }
 
     /// A server on this Mac that counts the connections it takes and answers each request with
@@ -341,7 +439,7 @@ mod tests {
         let mock = client_for_mock()
             .get(&format!("http://127.0.0.1:{port}/a.png"))
             .await
-            .expect("gmail-mock's machine is allowed");
+            .expect("mock-servers' machine is allowed");
         assert_eq!(mock.text().await.expect("a body"), "ok");
     }
 

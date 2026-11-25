@@ -1,4 +1,4 @@
-//! Compose's extras end to end on gmail-mock: Instant Intro, Auto Bcc, recipient chips edited in
+//! Compose's extras end to end on mock-servers: Instant Intro, Auto Bcc, recipient chips edited in
 //! place and moved, the `:` emoji and `+` mention dropdowns, and their settings dialogs.
 
 mod support;

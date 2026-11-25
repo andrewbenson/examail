@@ -1,5 +1,5 @@
 //! Discarding drafts from the list (⌘⇧,) and unblocking senders (Blocked Senders), end to end
-//! on gmail-mock.
+//! on mock-servers.
 
 mod support;
 

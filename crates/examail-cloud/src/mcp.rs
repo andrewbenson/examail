@@ -303,7 +303,10 @@ async fn read(gmail: &gmail::Client, arguments: &Value) -> anyhow::Result<Value>
         .map(|message| {
             let mut text = message.payload.as_ref().map(text_of).unwrap_or_default();
             if text.len() > MOST_TEXT {
-                let cut = (0..=MOST_TEXT).rev().find(|at| text.is_char_boundary(*at)).unwrap_or(0);
+                let cut = (0..=MOST_TEXT)
+                    .rev()
+                    .find(|at| text.is_char_boundary(*at))
+                    .unwrap_or(0);
                 text.truncate(cut);
                 text.push_str("\n[…]");
             }
@@ -368,7 +371,11 @@ pub fn strip_tags(html: &str) -> String {
         }
         let tag_end = rest.find('>').map_or(rest.len(), |at| at + 1);
         let tag = rest[..tag_end].to_ascii_lowercase();
-        if tag.starts_with("<br") || tag.starts_with("</p") || tag.starts_with("</div") || tag.starts_with("</tr") {
+        if tag.starts_with("<br")
+            || tag.starts_with("</p")
+            || tag.starts_with("</div")
+            || tag.starts_with("</tr")
+        {
             out.push('\n');
         }
         rest = &rest[tag_end..];
@@ -421,7 +428,11 @@ async fn draft(gmail: &gmail::Client, arguments: &Value) -> anyhow::Result<Value
     if let Some(id) = &thread_id {
         let thread = gmail
             .gmail()
-            .thread(id, gmail::Format::Metadata, &["Message-ID", "References", "Subject"])
+            .thread(
+                id,
+                gmail::Format::Metadata,
+                &["Message-ID", "References", "Subject"],
+            )
             .await?;
         if let Some(last) = thread
             .messages
@@ -490,7 +501,9 @@ pub fn rfc822(
         && !in_reply_to.contains(['\r', '\n'])
         && !chain.contains(['\r', '\n'])
     {
-        out.push_str(&format!("In-Reply-To: {in_reply_to}\r\nReferences: {chain}\r\n"));
+        out.push_str(&format!(
+            "In-Reply-To: {in_reply_to}\r\nReferences: {chain}\r\n"
+        ));
     }
     out.push_str("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n");
     out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");

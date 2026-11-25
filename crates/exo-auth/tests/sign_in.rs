@@ -1,4 +1,4 @@
-//! The loopback flow end to end against gmail-mock's OAuth endpoints.
+//! The loopback flow end to end against mock-servers' OAuth endpoints.
 
 mod support;
 

@@ -42,20 +42,31 @@ pub fn is_popular_domain(domain: &str) -> bool {
     POPULAR_DOMAINS.binary_search(&domain).is_ok()
 }
 
+/// Strips a leading `to:` prefix (case-insensitive) and following whitespace.
+pub(crate) fn strip_to_prefix(name: &str) -> &str {
+    static TO_PREFIX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^to:\s*").expect("valid regex"));
+    match TO_PREFIX.find(name) {
+        Some(found) => &name[found.end()..],
+        None => name,
+    }
+}
+
 /// `Doe, Jane` → `Jane Doe`, unless the part after the comma is a suffix.
 pub fn reverse_by_comma(name: &str) -> String {
     static LAST_FIRST: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^[^,\s]+,\s[^,]+$").expect("valid regex"));
     static SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i),\s?(Jr|Junior|Sr|Senior|CEO|CPA|CSPO|DACVS|DDS|DVM|Esq|Inc|Director|Founder|Co-?founder|J\.?D|LLC|MBA|M\.?D|M\.?Ed|MBA|PCC|Ph\.?D|Psy\.?D|R\.?N)[\s.]*")
+        Regex::new(r"(?i),\s?(Jr|Junior|Sr|Senior|CEO|CPA|CSPO|DACVS|DDS|DVM|Esq|Inc|Director|Founder|Co-?founder|J\.?D|LLC|MBA|M\.?D|M\.?Ed|PCC|Ph\.?D|Psy\.?D|R\.?N)[\s.]*")
             .expect("valid regex")
     });
     const PARTICLES: [&str; 11] = [
         "van", "de", "da", "di", "le", "la", "du", "des", "del", "della", "vander",
     ];
-    let starts_with_particle = PARTICLES
-        .iter()
-        .any(|particle| name.starts_with(&format!("{particle} ")));
+    let starts_with_particle = PARTICLES.iter().any(|particle| {
+        name.strip_prefix(particle)
+            .is_some_and(|rest| rest.starts_with(' '))
+    });
     if (LAST_FIRST.is_match(name) || starts_with_particle) && !SUFFIX.is_match(name) {
         let mut parts: Vec<&str> = name.split(", ").collect();
         parts.reverse();
@@ -69,7 +80,6 @@ pub fn reverse_by_comma(name: &str) -> String {
 pub fn first_name(name: &str, email: &str) -> String {
     static HONORIFIC: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(Mr|Mrs|Miss|Ms)(\.|\s)").expect("valid regex"));
-    static TO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^to:\s*").expect("valid regex"));
     static TITLE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(Dr|Rev|The Rev|Prof|Capt|Rabbi)(\s|\.|\.\s)([^\s]+)").expect("valid regex")
     });
@@ -91,9 +101,9 @@ pub fn first_name(name: &str, email: &str) -> String {
         return name.to_owned();
     }
     let name = HONORIFIC.replace_all(name, "");
-    let name = TO.replace(name.trim(), "").into_owned();
-    let title = TITLE.find(&name).map(|title| title.as_str().to_owned());
-    let name = reverse_by_comma(&name);
+    let name = strip_to_prefix(name.trim());
+    let title = TITLE.find(name).map(|title| title.as_str().to_owned());
+    let name = reverse_by_comma(name);
     let first = if let Some(quoted) = DOUBLE_QUOTED
         .captures(&name)
         .or_else(|| SINGLE_QUOTED.captures(&name))
@@ -145,7 +155,6 @@ pub fn display_name(
         person.email.to_lowercase()
     };
     let full = reverse_by_comma(full.trim());
-    let first = first_name(&full, &person.email);
     let shorten = |name: String| {
         if shorten_email && !has_name {
             name.split('@').next().unwrap_or_default().to_owned()
@@ -154,7 +163,7 @@ pub fn display_name(
         }
     };
     match format {
-        NameFormat::First => shorten(first),
+        NameFormat::First => shorten(first_name(&full, &person.email)),
         NameFormat::Full => shorten(full),
     }
 }
@@ -199,6 +208,18 @@ mod tests {
         assert_eq!(
             display_name(&anonymous, false, NameFormat::Full, false),
             "someone@example.com"
+        );
+    }
+
+    #[test]
+    fn reverse_by_comma_handles_particles_and_suffixes() {
+        assert_eq!(reverse_by_comma("van der Berg, Jan"), "Jan van der Berg");
+        assert_eq!(reverse_by_comma("de Vries, Anna"), "Anna de Vries");
+        assert_eq!(reverse_by_comma("Doe, Jane"), "Jane Doe");
+        assert_eq!(reverse_by_comma("Doe, Jr."), "Doe, Jr.");
+        assert_eq!(
+            reverse_by_comma("vanguard, Co., Inc."),
+            "vanguard, Co., Inc."
         );
     }
 }

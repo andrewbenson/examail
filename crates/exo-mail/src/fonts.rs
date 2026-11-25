@@ -1,7 +1,7 @@
 //! The fonts message bodies are laid out with: Exo's fonts under the family names the body
 //! stylesheets use, and the generic families resolved the way Chromium on macOS resolves them.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use blitz_dom::FontContext;
 use exo_fonts::{
@@ -60,9 +60,21 @@ pub struct Fonts {
     context: FontContext,
 }
 
+static SHARED: LazyLock<Fonts> = LazyLock::new(Fonts::build);
+
 impl Fonts {
-    /// Registers the email faces alongside the system fonts.
+    /// Process-wide shared font collection, scanning macOS system fonts and `SFNS.ttf` once.
+    pub fn shared() -> &'static Self {
+        &SHARED
+    }
+
+    /// Clones a handle onto [`Self::shared`].
     pub fn load() -> Self {
+        Self::shared().clone()
+    }
+
+    /// Registers the email faces alongside the system fonts.
+    fn build() -> Self {
         let mut collection = Collection::new(CollectionOptions {
             shared: true,
             system_fonts: true,

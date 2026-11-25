@@ -1,4 +1,4 @@
-//! Remind me end to end on gmail-mock: `H` snoozes the cursor's conversation into Reminders, `Z`
+//! Remind me end to end on mock-servers: `H` snoozes the cursor's conversation into Reminders, `Z`
 //! takes it back, the footer removes it, and the conversation comes back to the inbox once its
 //! reminder is due, by the app's clock. In compose, ⌘⇧H gives a reply a reminder, which its
 //! thread has from Send on, and the follow-up hint does the same for a message just sent. Move

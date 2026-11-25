@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use blitz_dom::{BaseDocument, Node, NodeId, local_name};
 
-use crate::dom::escape_attribute;
+use crate::dom::{push_inner_html_attr, push_inner_html_text};
 
 /// A piece of the cloned range.
 #[derive(Debug)]
@@ -343,17 +343,7 @@ fn is(document: &BaseDocument, id: NodeId, name: &blitz_dom::LocalName) -> bool 
 /// Writes `piece` as `innerHTML` does.
 fn write(document: &BaseDocument, piece: &Piece, out: &mut String) {
     match piece {
-        Piece::Text(text) => {
-            for ch in text.chars() {
-                match ch {
-                    '&' => out.push_str("&amp;"),
-                    '<' => out.push_str("&lt;"),
-                    '>' => out.push_str("&gt;"),
-                    '\u{a0}' => out.push_str("&nbsp;"),
-                    ch => out.push(ch),
-                }
-            }
-        }
+        Piece::Text(text) => push_inner_html_text(out, text),
         Piece::Break => out.push_str("<br>"),
         Piece::Wrapper(tag, children) => {
             out.push_str(&format!("<{tag}>"));
@@ -370,11 +360,11 @@ fn write(document: &BaseDocument, piece: &Piece, out: &mut String) {
             out.push('<');
             out.push_str(tag);
             for attribute in data.attrs() {
-                out.push_str(&format!(
-                    " {}=\"{}\"",
-                    attribute.name.local,
-                    escape_attribute(&attribute.value).replace('\u{a0}', "&nbsp;")
-                ));
+                out.push(' ');
+                out.push_str(&attribute.name.local);
+                out.push_str("=\"");
+                push_inner_html_attr(out, &attribute.value);
+                out.push('"');
             }
             out.push('>');
             children

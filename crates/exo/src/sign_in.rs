@@ -44,7 +44,7 @@ pub struct SignIn {
     /// Where accounts' mail stores live.
     stores: PathBuf,
     browser: Browser,
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     attempt: Option<Attempt>,
     /// The power source the accounts it opens sync by off screen.
     power: PowerSource,
@@ -77,14 +77,15 @@ impl SignIn {
             auth: None,
             stores: stores.to_owned(),
             browser,
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("exo-sign-in")
-                .enable_all()
-                .build()?,
+            runtime: crate::account::new_runtime()?,
             attempt: None,
             power: PowerSource::default(),
         })
+    }
+
+    /// The Tokio runtime shared across sign-in and all accounts opened in this app session.
+    pub(crate) fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
     }
 
     /// Has the accounts it opens from now on sync off screen by `power`, the Mac's
@@ -152,7 +153,7 @@ impl SignIn {
         let endpoints = self.auth()?.endpoints().clone();
         let stores = self.stores.clone();
         // Counting makes no Gmail call, so the store's client is never used.
-        let counted = self.runtime.block_on(async move {
+        let counted = crate::account::block_on_runtime(&self.runtime, async move {
             exo_store::Store::open(&stores, email, endpoints, gmail::StaticToken(String::new()))
                 .await?
                 .unsent()
@@ -181,8 +182,10 @@ impl SignIn {
     /// # Errors
     /// When the old store can't be moved aside or the new one made.
     pub(crate) fn clear_cache(&self, email: &str) -> exo_store::Result<()> {
-        self.runtime
-            .block_on(exo_store::Store::clear_cache(&self.stores, email))
+        crate::account::block_on_runtime(
+            &self.runtime,
+            exo_store::Store::clear_cache(&self.stores, email),
+        )
     }
 
     /// Opens `email`'s mail, repainting `ctx` as it changes. Also returns its tokens, which say
@@ -195,8 +198,19 @@ impl SignIn {
         email: &str,
         ctx: &egui::Context,
     ) -> Result<(Account, Tokens), MailError> {
+        let tokens = self.auth()?.tokens(email)?;
+        let account = self.open_mail_with_tokens(email, tokens.clone(), ctx)?;
+        Ok((account, tokens))
+    }
+
+    /// [`SignIn::open_mail`] when `tokens` were already read from the Keychain (as launch does).
+    pub(crate) fn open_mail_with_tokens(
+        &mut self,
+        email: &str,
+        tokens: Tokens,
+        ctx: &egui::Context,
+    ) -> Result<Account, MailError> {
         let auth = self.auth()?;
-        let tokens = auth.tokens(email)?;
         let credentials = Credentials {
             email: email.to_owned(),
             endpoints: auth.endpoints().clone(),
@@ -206,7 +220,8 @@ impl SignIn {
             auth: auth.clone(),
             browser: self.browser.clone(),
         };
-        let mut account = Account::open(&self.stores, credentials, ctx.clone())?;
+        let mut account =
+            Account::open_on(&self.stores, credentials, ctx.clone(), self.runtime.clone())?;
         account.follow_power(&self.power);
         account.sign_in_calendars_with(calendars);
         account.start_mcp();
@@ -219,7 +234,7 @@ impl SignIn {
                 merge_settings: Box::new(|_, _| tokio::sync::oneshot::channel().1),
             });
         }
-        Ok((account, tokens))
+        Ok(account)
     }
 }
 

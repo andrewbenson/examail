@@ -27,7 +27,7 @@ pub(crate) fn of(from: Option<&Address>, aliases: &[Alias]) -> Option<String> {
 /// Whether `open` carries its signature's content. New mail always does, and a reply or forward
 /// does while the setting is on.
 pub(crate) fn includes_content(open: &Open) -> bool {
-    open.is_new_email() || open.signature_on_replies
+    open.is_new_email() || open.body.signature_on_replies
 }
 
 /// The block that `…` reveals into the body under what's written. It holds the alias's
@@ -139,19 +139,17 @@ mod tests {
     fn replies_carry_the_content_only_with_the_setting() {
         let mut reply = open(DraftAction::Reply, "maya@brightmoor.co");
         assert!(includes_content(&reply), "on by default");
-        reply.signature_on_replies = false;
+        reply.body.signature_on_replies = false;
         assert!(!includes_content(&reply));
         assert_eq!(
             revealed(&reply, &aliases()),
             "<div class=\"gmail_signature\" data-signature-draft-id=\"draft00aaaaaaaaaaaaaa\"><br/></div>"
         );
         let mut new = open(DraftAction::Compose, "maya@brightmoor.co");
-        new.signature_on_replies = false;
+        new.body.signature_on_replies = false;
         assert!(includes_content(&new), "new mail always does");
-        let forward = Open {
-            signature_on_replies: false,
-            ..open(DraftAction::Forward, "maya@brightmoor.co")
-        };
+        let mut forward = open(DraftAction::Forward, "maya@brightmoor.co");
+        forward.body.signature_on_replies = false;
         assert!(!includes_content(&forward));
     }
 

@@ -4,12 +4,12 @@
 
 use jiff::Timestamp;
 
-use crate::db::{AttachmentRow, LabelRow, ListEntry};
+use crate::db::{LabelRow, ListEntry};
 use crate::error::Result;
 use crate::ids::ThreadId;
 use crate::ids::labels::{INBOX, SH_IMPORTANT, SH_OTHER};
 use crate::split::{SplitInbox, Splits};
-use crate::store::{Store, load_views};
+use crate::store::{Store, load_attachments_by_thread, load_views};
 use crate::view::{Router, ThreadView};
 
 /// A conversation as the preview lists it.
@@ -68,17 +68,7 @@ impl Store {
             .map(|entry| entry.thread_id.clone())
             .collect();
         let views = load_views(&mut db, &ids).await?;
-        let messages: Vec<String> = views
-            .values()
-            .flat_map(|view| view.messages.iter().map(|message| message.row.id.clone()))
-            .collect();
-        let attachments = AttachmentRow::filter(
-            AttachmentRow::fields()
-                .message_id()
-                .in_list(messages.as_slice()),
-        )
-        .exec(&mut db)
-        .await?;
+        let attachments_by_thread = load_attachments_by_thread(&mut db, &views).await?;
         let labels = LabelRow::all().exec(&mut db).await?;
         let current = self.inner.router();
         let mut splits: Vec<SplitInbox> = current.splits.defined.clone();
@@ -101,7 +91,8 @@ impl Store {
         };
         for id in &ids {
             let Some(view) = views.get(id) else { continue };
-            let lists = router.list_ids(view, &attachments);
+            let attachments = attachments_by_thread.get(id).map_or(&[][..], Vec::as_slice);
+            let lists = router.list_ids(view, attachments);
             let add = |list: &mut PreviewList| {
                 list.count += 1;
                 if list.threads.len() < limit

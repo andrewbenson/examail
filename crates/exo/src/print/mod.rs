@@ -268,6 +268,9 @@ pub struct Printout {
     /// The print job's title ([`title`]).
     pub title: String,
     lay_out: Box<dyn Fn(Page) -> Conversation>,
+    /// Optional explicit override for whether open drafts block remote content (when `None`, the
+    /// print job reads the account's `RemoteContentBlocking` setting before rendering).
+    block_draft_remote_content: Option<bool>,
 }
 
 impl Printout {
@@ -275,7 +278,21 @@ impl Printout {
         Self {
             title,
             lay_out: Box::new(lay_out),
+            block_draft_remote_content: None,
         }
+    }
+
+    /// Sets whether open drafts in this printout block remote content (for example, `true` when
+    /// `RemoteContentBlocking::All` is set and the user hasn't revealed draft images).
+    #[must_use]
+    pub fn block_draft_remote_content(mut self, block: bool) -> Self {
+        self.block_draft_remote_content = Some(block);
+        self
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn blocks_draft_remote_content(&self) -> Option<bool> {
+        self.block_draft_remote_content
     }
 
     /// The conversation laid out for `page`.
@@ -337,8 +354,13 @@ enum Resource<'a> {
 }
 
 /// What `url` loads, from `inline` (the thread's inline attachments by `Content-ID`). `None` for
-/// anything else, which fails, as does a relative URL that a body's CSS names.
-fn resource<'a>(url: &str, inline: &'a HashMap<String, Attachment>) -> Option<Resource<'a>> {
+/// anything else, which fails, as does a relative URL that a body's CSS names or any remote URL
+/// when `allow_remote` is `false`.
+fn resource<'a>(
+    url: &str,
+    inline: &'a HashMap<String, Attachment>,
+    allow_remote: bool,
+) -> Option<Resource<'a>> {
     if let Some(name) = url.strip_prefix(&format!("{}://font/", document::SCHEME)) {
         let name = name.strip_suffix(".ttf")?;
         return exo_mail::EMAIL_FACES
@@ -348,6 +370,9 @@ fn resource<'a>(url: &str, inline: &'a HashMap<String, Attachment>) -> Option<Re
     }
     if let Some(cid) = url.strip_prefix("cid:") {
         return crate::body::fetch::named(inline, cid).map(Resource::Inline);
+    }
+    if !allow_remote {
+        return None;
     }
     let remote = url.strip_prefix(exo_mail::REMOTE_SCHEME_PREFIX)?;
     let parsed = url::Url::parse(remote).ok()?;
@@ -496,35 +521,50 @@ mod tests {
             .map(|(_, _, _, font)| font.data)
             .expect("a bold face");
         assert_eq!(
-            resource("exo-print://font/ExoSans-Bold.ttf", &inline),
+            resource("exo-print://font/ExoSans-Bold.ttf", &inline, true),
             Some(Resource::Font(bold))
         );
-        assert_eq!(resource("exo-print://font/Missing.ttf", &inline), None);
         assert_eq!(
-            resource("cid:image001.png%4001d9", &inline),
+            resource("exo-print://font/Missing.ttf", &inline, true),
+            None
+        );
+        assert_eq!(
+            resource("cid:image001.png%4001d9", &inline, true),
             Some(Resource::Inline(&attachment))
         );
-        assert_eq!(resource("cid:other", &inline), None);
+        assert_eq!(resource("cid:other", &inline, true), None);
         assert_eq!(
-            resource("exo-https://x.io/a.png?b=1", &inline),
+            resource("exo-https://x.io/a.png?b=1", &inline, true),
             Some(Resource::Remote("https://x.io/a.png?b=1".into()))
         );
         assert_eq!(
-            resource("exo-http://x.io/a.css", &inline),
+            resource("exo-http://x.io/a.css", &inline, true),
             Some(Resource::Remote("http://x.io/a.css".into()))
         );
         assert_eq!(
-            resource("exo-https://exo.invalid/a.png", &inline),
+            resource("exo-https://exo.invalid/a.png", &inline, true),
             None,
             "a relative URL"
         );
-        assert_eq!(resource("exo-blocked://x.io/a.png", &inline), None);
-        assert_eq!(resource("exo-file:///etc/passwd", &inline), None);
+        assert_eq!(resource("exo-blocked://x.io/a.png", &inline, true), None);
+        assert_eq!(resource("exo-file:///etc/passwd", &inline, true), None);
         assert_eq!(
-            resource("https://x.io/a.png", &inline),
+            resource("https://x.io/a.png", &inline, true),
             None,
             "never straight to the network"
         );
+        // When the active print job blocks all remote content, fonts and cid: still load, while
+        // exo-http(s) remote resources are refused at the handler as defense-in-depth.
+        assert_eq!(
+            resource("exo-print://font/ExoSans-Bold.ttf", &inline, false),
+            Some(Resource::Font(bold))
+        );
+        assert_eq!(
+            resource("cid:image001.png%4001d9", &inline, false),
+            Some(Resource::Inline(&attachment))
+        );
+        assert_eq!(resource("exo-https://x.io/a.png?b=1", &inline, false), None);
+        assert_eq!(resource("exo-http://x.io/a.css", &inline, false), None);
     }
 
     #[test]

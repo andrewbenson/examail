@@ -1,4 +1,4 @@
-//! The shell's right-click menu, end to end on gmail-mock, in a message body and on the rest of
+//! The shell's right-click menu, end to end on mock-servers, in a message body and on the rest of
 //! the page. A right-clicked word is selected and offers Look Up, Search with Google and Copy. A
 //! link offers Copy Link and Open Link, and an address link offers Copy Email Address. Elsewhere,
 //! the menu has `Copy`, off with nothing selected.

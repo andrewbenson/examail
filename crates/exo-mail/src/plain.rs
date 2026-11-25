@@ -25,7 +25,7 @@ pub(crate) fn to_html(text: &str) -> String {
             blank_before = true;
             continue;
         }
-        let escaped = escape(line);
+        let escaped = crate::dom::escape_html(line);
         if level > depth {
             lines.push(format!("</p>{}<p>", "<blockquote>".repeat(level - depth)));
             depth = level;
@@ -52,15 +52,6 @@ fn continues(line: &str) -> bool {
         chars.next();
         !matches!(chars.next(), Some('.' | ')'))
     }
-}
-
-/// Escapes `&`, `<`, `>`, `"` and `'` as HTML entities.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]

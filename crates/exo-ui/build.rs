@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Compiles Exo's icons (`assets/icons`) into the crate. It writes `$OUT_DIR/icons.rs`, a table
 //! of every SVG under its key (its path without `.svg`).
 

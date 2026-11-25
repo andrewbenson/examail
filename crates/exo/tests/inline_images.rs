@@ -1,4 +1,4 @@
-//! Inline images in compose end to end, on gmail-mock: a pasted screenshot and a dropped image go
+//! Inline images in compose end to end, on mock-servers: a pasted screenshot and a dropped image go
 //! in the body and into the Gmail draft as inline parts, sending carries them by Content-ID, a
 //! draft written in Gmail shows its images and keeps them, and remote images follow the Images
 //! setting and Show Images.

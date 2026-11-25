@@ -282,25 +282,81 @@ fn root_size(svg: &[u8]) -> (Option<Vec2>, Option<Vec2>) {
     (size, view_box)
 }
 
+/// Paints a clockwise rotating spinner arc centered at `center` with `radius`, `sweep` radians, and
+/// `stroke`, turning once a second at `now` (`1000ms infinite linear`) and requesting the next
+/// frame.
+pub(crate) fn paint_spinner_arc(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    sweep: f32,
+    stroke: egui::Stroke,
+    now: f64,
+) {
+    const STEPS: usize = 48;
+    let turn = (now % 1.0) as f32 * std::f32::consts::TAU;
+    let points: Vec<egui::Pos2> = (0..=STEPS)
+        .map(|step| center + radius * Vec2::angled(turn + sweep * step as f32 / STEPS as f32))
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+    painter.ctx().request_repaint();
+}
+
 /// Classic's spinner in `rect`, in `color`, at `now`. It's a 7.5-unit circle of a 17-unit box,
 /// stroked 1.25 wide with a 40-unit dash so a sixth of it is open, turning clockwise once a second
 /// (`1000ms infinite linear`). It asks for the next frame.
 pub fn paint_spinner(painter: &egui::Painter, rect: Rect, now: f64, color: Color32) {
-    const STEPS: usize = 48;
     let scale = rect.width() / 17.0;
-    let radius = 7.5 * scale;
-    let sweep = 40.0 / 7.5;
-    let turn = (now % 1.0) as f32 * std::f32::consts::TAU;
-    let points: Vec<egui::Pos2> = (0..=STEPS)
-        .map(|step| {
-            rect.center() + radius * Vec2::angled(turn + sweep * step as f32 / STEPS as f32)
-        })
-        .collect();
-    painter.add(egui::Shape::line(
-        points,
+    paint_spinner_arc(
+        painter,
+        rect.center(),
+        7.5 * scale,
+        40.0 / 7.5,
         egui::Stroke::new(1.25 * scale, color),
-    ));
-    painter.ctx().request_repaint();
+        now,
+    );
+}
+
+/// Paints a page's centered loading disc: a 48px white circle with its top-left at the window's
+/// center (`top: 50%; left: 50%`), three soft shadows, and a 16px (7px-radius, 2px-stroked,
+/// three-quarter-turn) spinner in its middle.
+pub fn paint_loading_spinner(ui: &Ui) {
+    const SHADOWS: [crate::BoxShadow; 3] = [
+        crate::BoxShadow::new(
+            [0.0, -1.0],
+            8.0,
+            0.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 10),
+        ),
+        crate::BoxShadow::new(
+            [0.0, 2.0],
+            8.0,
+            0.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 13),
+        ),
+        crate::BoxShadow::new(
+            [0.0, 4.0],
+            12.0,
+            0.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 20),
+        ),
+    ];
+    let palette = crate::palette(ui.ctx());
+    let disc = Rect::from_min_size(ui.ctx().content_rect().center(), Vec2::splat(48.0));
+    for shadow in SHADOWS {
+        shadow.paint(ui.painter(), disc, egui::CornerRadius::same(24));
+    }
+    ui.painter()
+        .circle_filled(disc.center(), 24.0, Color32::WHITE);
+    let now = ui.input(|input| input.time);
+    paint_spinner_arc(
+        ui.painter(),
+        disc.center(),
+        7.0,
+        1.5 * std::f32::consts::PI,
+        egui::Stroke::new(2.0, palette.icon_base_default),
+        now,
+    );
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 mod listed;
 mod turndown;
 
+use exo_mail::escape_html as escape;
 use exo_store::{Contact, MessageDetail};
 use jiff::Zoned;
 use regex::Regex;
@@ -218,14 +219,6 @@ fn html_header(message: &MessageDetail, now: &Zoned) -> String {
     );
     html += &line("Subject:", &message.subject);
     html + "<br></div>"
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
 }
 
 #[cfg(test)]

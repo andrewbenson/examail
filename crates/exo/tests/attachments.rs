@@ -1,4 +1,4 @@
-//! A conversation's files end to end on gmail-mock: the file notifications while a file
+//! A conversation's files end to end on mock-servers: the file notifications while a file
 //! downloads and once it has, the alert offline, `Download all`'s zip, and Copy
 //! Attachments pasted into a draft.
 
@@ -434,16 +434,16 @@ fn output(
     found
 }
 
-/// ⌘C, and what it put on the clipboard.
+/// ⌘C as egui-winit reports it, and what it put on the clipboard.
 fn copy(app: &mut Fixture) -> Option<String> {
-    let key = |pressed| Event::Key {
+    let release = Event::Key {
         key: Key::C,
         physical_key: None,
-        pressed,
+        pressed: false,
         repeat: false,
         modifiers: CMD,
     };
-    output(app, vec![key(true), key(false)], |command| match command {
+    output(app, vec![Event::Copy, release], |command| match command {
         egui::OutputCommand::CopyText(text) => Some(text.clone()),
         _ => None,
     })

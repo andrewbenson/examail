@@ -60,7 +60,9 @@ impl Firestore {
 
     /// The document `collection/id`, or `None` when there's none.
     pub async fn get<T: DeserializeOwned>(&self, collection: &str, id: &str) -> Result<Option<T>> {
-        let response = self.request(Method::GET, &format!("{collection}/{id}"), None).await?;
+        let response = self
+            .request(Method::GET, &format!("{collection}/{id}"), None)
+            .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -70,7 +72,9 @@ impl Firestore {
 
     /// The document `collection/id` with its update time, for [`Firestore::set_if_unchanged`].
     pub async fn get_document(&self, collection: &str, id: &str) -> Result<Option<Document>> {
-        let response = self.request(Method::GET, &format!("{collection}/{id}"), None).await?;
+        let response = self
+            .request(Method::GET, &format!("{collection}/{id}"), None)
+            .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -78,7 +82,10 @@ impl Firestore {
         Ok(Some(Document {
             id: id.to_owned(),
             fields: decode_document(&document),
-            update_time: document["updateTime"].as_str().unwrap_or_default().to_owned(),
+            update_time: document["updateTime"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
         }))
     }
 
@@ -100,7 +107,10 @@ impl Firestore {
             .request(Method::PATCH, &path, Some(json!({ "fields": fields })))
             .await?;
         if precondition == Precondition::Missing
-            && matches!(response.status(), StatusCode::CONFLICT | StatusCode::BAD_REQUEST)
+            && matches!(
+                response.status(),
+                StatusCode::CONFLICT | StatusCode::BAD_REQUEST
+            )
         {
             let text = response.text().await.unwrap_or_default();
             if text.contains("ALREADY_EXISTS") || text.contains("FAILED_PRECONDITION") {
@@ -127,7 +137,12 @@ impl Firestore {
     }
 
     /// The ids of the documents in `collection` whose `field` equals `value`.
-    pub async fn ids_where(&self, collection: &str, field: &str, value: &Value) -> Result<Vec<String>> {
+    pub async fn ids_where(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &Value,
+    ) -> Result<Vec<String>> {
         let filter = json!({ "fieldFilter": {
             "field": { "fieldPath": field },
             "op": "EQUAL",
@@ -174,7 +189,8 @@ impl Firestore {
             "op": "LESS_THAN_OR_EQUAL",
             "value": encode(value)?,
         } });
-        self.query(collection, filter, Some(field), Some(limit)).await
+        self.query(collection, filter, Some(field), Some(limit))
+            .await
     }
 
     /// Writes `value` as `collection/id` only if the document hasn't changed since it was read at
@@ -195,7 +211,10 @@ impl Firestore {
                 Some(json!({ "fields": fields })),
             )
             .await?;
-        if matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND) {
+        if matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND
+        ) {
             let text = response.text().await.unwrap_or_default();
             if text.contains("FAILED_PRECONDITION") || text.contains("NOT_FOUND") {
                 return Ok(false);
@@ -218,7 +237,8 @@ impl Firestore {
             "where": filter,
         });
         if let Some(field) = order_by {
-            query["orderBy"] = json!([{ "field": { "fieldPath": field }, "direction": "ASCENDING" }]);
+            query["orderBy"] =
+                json!([{ "field": { "fieldPath": field }, "direction": "ASCENDING" }]);
         }
         if let Some(limit) = limit {
             query["limit"] = json!(limit);
@@ -248,7 +268,12 @@ impl Firestore {
             .collect())
     }
 
-    async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<reqwest::Response> {
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Response> {
         let url = format!("https://firestore.googleapis.com/v1/{}/{path}", self.root);
         let mut request = self
             .http

@@ -1,4 +1,4 @@
-//! The list's smaller pieces, end to end on gmail-mock: Trash on UK keyboards, the Snippets
+//! The list's smaller pieces, end to end on mock-servers: Trash on UK keyboards, the Snippets
 //! folder in the folder drawer, the contact pane's Mail header, the rows' right-click menu, and
 //! the list header's keyboard.
 

@@ -22,6 +22,7 @@ use exo_ui::{
 use jiff::Zoned;
 
 use crate::{
+    ViewContext,
     format::dates::{self, Segment},
     mailbox::ThreadSummary,
 };
@@ -243,7 +244,7 @@ pub struct Inbox {
     threads: Vec<ThreadSummary>,
     items: Vec<Item>,
     view: View,
-    now: Zoned,
+    context: ViewContext,
     cursor: Option<String>,
     cursor_source: CursorSource,
     /// Put the cursor here once the thread is listed (an undone thread coming back).
@@ -254,17 +255,6 @@ pub struct Inbox {
     anchor: Option<String>,
     /// A hint the selection asks for, until the app takes it.
     hint: Option<SelectionHint>,
-    /// What the rows that a bulk action waits or runs for show instead of their date (`Pending:
-    /// Mark Done`).
-    pending: HashMap<String, String>,
-    /// Whether Gmail can be reached. Offline, rows with a send waiting say so.
-    online: bool,
-    /// Whether a draft is popped out, which puts the status line over the rows.
-    popped_out: bool,
-    /// Whether the popped-out draft has the keyboard, which hides the highlight.
-    popout_focused: bool,
-    /// The popped-out draft's card, over the rows. The pointer on the card isn't on the rows.
-    covered: Option<Rect>,
     /// Dismissed threads and when they started leaving (egui time).
     leaving: Vec<(ThreadSummary, f64)>,
     /// The frame's time, from [`Self::settle`], which sizes the slots of leaving rows.
@@ -278,8 +268,6 @@ pub struct Inbox {
     hover: RowHover,
     /// The search result's file card the pointer is settling on: its row and index.
     file_intent: exo_ui::HoverIntent<(String, usize)>,
-    /// Whether the list has the keyboard, which it doesn't while the folder drawer is open.
-    focused: bool,
     /// Whether the focus bar shows on the cursor's row, which it doesn't while the search bar has
     /// the keyboard.
     bar: bool,
@@ -440,7 +428,7 @@ impl Inbox {
             threads: Vec::new(),
             items: Vec::new(),
             view: View::default(),
-            now,
+            context: ViewContext::new(now),
             cursor: None,
             cursor_source: CursorSource::Command,
             pending_cursor: None,
@@ -448,11 +436,6 @@ impl Inbox {
             selected: selection::Selection::default(),
             anchor: None,
             hint: None,
-            pending: HashMap::new(),
-            online: true,
-            popped_out: false,
-            popout_focused: false,
-            covered: None,
             leaving: Vec::new(),
             clock: 0.0,
             returning: Vec::new(),
@@ -460,7 +443,6 @@ impl Inbox {
             viewport: 0.0,
             hover: RowHover::default(),
             file_intent: exo_ui::HoverIntent::default(),
-            focused: true,
             bar: true,
             reading: false,
             advance_anchor: None,
@@ -517,7 +499,7 @@ impl Inbox {
             .enumerate()
             .map(|(at, thread)| (thread.received, at))
             .collect();
-        self.items = dates::segment(items, &self.now)
+        self.items = dates::segment(items, &self.context.now)
             .into_iter()
             .map(|segment| match segment {
                 Segment::Separator(label) => Item::Separator(label),
@@ -526,19 +508,15 @@ impl Inbox {
             .collect();
     }
 
-    /// Dates the rows relative to `now`. The date separators move when the day does.
-    pub fn set_now(&mut self, now: Zoned) {
-        let moved = now.date() != self.now.date() || now.time_zone() != self.now.time_zone();
-        self.now = now;
+    /// Updates the shared per-frame environment (`now`, connection, pop-out, folder focus, and
+    /// pending bulk actions). Date separators regroup when the day or timezone changes.
+    pub(crate) fn sync_context(&mut self, context: &ViewContext) {
+        let moved = context.now.date() != self.context.now.date()
+            || context.now.time_zone() != self.context.now.time_zone();
+        self.context.clone_from(context);
         if moved {
             self.segment();
         }
-    }
-
-    /// Says whether the list has the keyboard. Without it (the folder drawer has it) the
-    /// cursor's row looks like any other.
-    pub fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
     }
 
     /// Gives the header the keyboard (↑ on the first row), on its first tab: Important or Inbox, or
@@ -1070,31 +1048,6 @@ impl Inbox {
         self.selected.cutoff().is_some() && self.selection_count().0 > 1
     }
 
-    /// Sets what the rows that a bulk action waits or runs for show instead of their date.
-    pub fn set_pending(&mut self, pending: HashMap<String, String>) {
-        self.pending = pending;
-    }
-
-    /// Whether Gmail can be reached, as the offline bar says.
-    pub fn set_online(&mut self, online: bool) {
-        self.online = online;
-    }
-
-    /// Whether a draft is popped out.
-    pub fn set_popped_out(&mut self, popped_out: bool) {
-        self.popped_out = popped_out;
-    }
-
-    /// Whether the popped-out draft has the keyboard.
-    pub fn set_popout_focused(&mut self, focused: bool) {
-        self.popout_focused = focused;
-    }
-
-    /// Where the popped-out draft's card covers the list, if it does.
-    pub fn set_covered(&mut self, card: Option<Rect>) {
-        self.covered = card;
-    }
-
     /// The status line over the rows: a search's, or any list's while a draft is popped out. A
     /// list's line then says `No conversations found.` once everything is here and the list is
     /// empty. Offline, with more than is stored, it says `Search results may be partial when
@@ -1102,8 +1055,8 @@ impl Inbox {
     fn top_status(&self) -> Option<&'static str> {
         match &self.view.search {
             Some(search) => search.status,
-            None if !self.popped_out || self.at_inbox_zero() => None,
-            None if !self.online && !self.view.complete => Some(PARTIAL_OFFLINE),
+            None if !self.context.popped_out || self.at_inbox_zero() => None,
+            None if !self.context.online && !self.view.complete => Some(PARTIAL_OFFLINE),
             None => (self.view.complete && !self.view.loading && self.threads.is_empty())
                 .then_some(NOTHING_FOUND),
         }
@@ -1319,12 +1272,12 @@ impl Inbox {
     /// What goes under the rows: the spinner until the list has loaded all it can (offline, that's
     /// what's stored), then the status line (search results have theirs at the top).
     fn bottom(&self) -> Bottom {
-        let offline_end = !self.online && !self.view.complete;
+        let offline_end = !self.context.online && !self.view.complete;
         if self.view.loading || (self.view.more && !offline_end) {
             return Bottom::Spinner;
         }
         // The status line is over the rows instead.
-        if self.view.search.is_some() || self.popped_out {
+        if self.view.search.is_some() || self.context.popped_out {
             return Bottom::None;
         }
         match (self.threads.is_empty(), offline_end) {
@@ -1425,7 +1378,7 @@ impl Inbox {
                         [thread] => thread
                             .reminder
                             .as_ref()
-                            .map(|reminder| crate::remind::status(reminder, &self.now)),
+                            .map(|reminder| crate::remind::status(reminder, &self.context.now)),
                         _ => None,
                     },
                 });
@@ -1636,11 +1589,11 @@ impl Inbox {
         // With the folder drawer open, the highlight fades out over 100ms and the cursor's row
         // shows its date. The same happens while the header has the keyboard. While the pop-out has
         // it, only the highlight goes.
-        let keyboard = self.focused && self.header_focus.is_none();
+        let keyboard = !self.context.folders_open && self.header_focus.is_none();
         let away = motion::transition_in(
             ui.ctx(),
             ui.id().with("thread-list-away"),
-            !keyboard || self.popout_focused,
+            !keyboard || self.context.popout_focused,
             0.1,
             CubicBezier::EASE,
         );
@@ -1663,7 +1616,7 @@ impl Inbox {
         let mut events = Vec::new();
         let mut hovered_row = None;
         // On the pop-out's card the pointer is the card's, not a row's.
-        let covered = |at: Pos2| self.covered.is_some_and(|card| card.contains(at));
+        let covered = |at: Pos2| self.context.covered.is_some_and(|card| card.contains(at));
         let on_rows = !ui
             .input(|input| input.pointer.hover_pos())
             .is_some_and(covered);
@@ -1718,8 +1671,8 @@ impl Inbox {
                         joined_above: self.neighbour_joins(i, -1),
                         joined_below: self.neighbour_joins(i, 1),
                         archivable: self.view.archivable,
-                        pending: self.pending.get(&thread.id).map(String::as_str),
-                        offline: !self.online,
+                        pending: self.context.pending.get(&thread.id).map(String::as_str),
+                        offline: !self.context.online,
                         strip: (self.row_height(thread) == ROW_WITH_FILES).then(|| {
                             self.file_pages
                                 .get(&thread.id)
@@ -1744,7 +1697,7 @@ impl Inbox {
                         geometry,
                         thread,
                         &state,
-                        &self.now,
+                        &self.context.now,
                     );
                     if elapsed.is_none() {
                         // Anywhere on the row, as CSS `:hover` reaches it through its children,
@@ -2003,11 +1956,11 @@ mod tests {
                 .collect(),
         );
         assert_eq!(separators(&inbox), ["Yesterday"]);
-        inbox.set_now(
+        inbox.sync_context(&ViewContext::new(
             now()
                 .checked_add(jiff::SignedDuration::from_hours(24))
                 .expect("in range"),
-        );
+        ));
         assert_eq!(
             separators(&inbox),
             ["November 16th"],
@@ -2023,10 +1976,12 @@ mod tests {
             complete,
             ..View::default()
         };
+        let mut ctx = ViewContext::new(now());
         let mut list = inbox(3);
         list.set_view(view(true, false));
         assert_eq!(list.bottom(), Bottom::Spinner, "more to load");
-        list.set_online(false);
+        ctx.online = false;
+        list.sync_context(&ctx);
         assert_eq!(
             list.bottom(),
             Bottom::Status(EARLIER_OFFLINE),
@@ -2036,9 +1991,10 @@ mod tests {
         assert_eq!(list.bottom(), Bottom::None, "everything is here");
         let mut empty = Inbox::new(now());
         empty.set_view(view(true, false));
-        empty.set_online(false);
+        empty.sync_context(&ctx);
         assert_eq!(empty.bottom(), Bottom::Status(EMPTY_OFFLINE));
-        empty.set_online(true);
+        ctx.online = true;
+        empty.sync_context(&ctx);
         empty.set_view(view(false, true));
         assert_eq!(empty.bottom(), Bottom::Status(EMPTY));
         empty.set_view(View {
@@ -2061,8 +2017,10 @@ mod tests {
             complete,
             ..View::default()
         };
+        let mut ctx = ViewContext::new(now());
+        ctx.popped_out = true;
         let mut empty = Inbox::new(now());
-        empty.set_popped_out(true);
+        empty.sync_context(&ctx);
         empty.set_view(view(false, true));
         assert_eq!(
             (empty.top_status(), empty.bottom()),
@@ -2070,16 +2028,18 @@ mod tests {
             "all here and empty"
         );
         let mut list = inbox(3);
-        list.set_popped_out(true);
+        list.sync_context(&ctx);
         list.set_view(view(true, false));
         assert_eq!(list.top_status(), None, "online, more to load");
-        list.set_online(false);
+        ctx.online = false;
+        list.sync_context(&ctx);
         assert_eq!(
             (list.top_status(), list.bottom()),
             (Some(PARTIAL_OFFLINE), Bottom::None),
             "offline, Gmail has the rest"
         );
-        list.set_popped_out(false);
+        ctx.popped_out = false;
+        list.sync_context(&ctx);
         assert_eq!(
             (list.top_status(), list.bottom()),
             (None, Bottom::Status(EARLIER_OFFLINE)),

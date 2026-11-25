@@ -1,6 +1,6 @@
 //! The Images setting (`remoteContentBlocking`) end to end: what a message's body asks the
 //! network for under each choice, counted by a server on this Mac (which Exo loads from only
-//! because gmail-mock is here too), ⌘K Show Images, and the header's eye.
+//! because mock-servers is here too), ⌘K Show Images, and the header's eye.
 
 mod support;
 

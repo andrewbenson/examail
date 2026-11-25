@@ -7,13 +7,17 @@ use std::collections::BTreeMap;
 
 use egui::{Color32, CornerRadius, Id, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use exo_store::Address;
-use exo_ui::{ActionKind, CalendarColor, DialogAction, Family, Font, TextStyle, Theme};
+use exo_ui::{
+    ActionKind, AnchoredCard, AnchoredHover, AnchoredList, CalendarColor, ContactAcceptKeys,
+    ContactListColors, ContactRow, ContactSearchInput, ContactSearchOutcome, DialogAction, Family,
+    Font, StackedContactStyle, TextStyle, Theme, show_stacked_contact_popup,
+};
 use jiff::{SignedDuration, Timestamp, Zoned, tz::TimeZone};
 
 use super::{
     availability::{self, Person},
     event::Event,
-    timezones::{self, Found},
+    timezones::{ZoneField, ZoneInput, ZoneRows},
 };
 use crate::compose::{contacts::Index, recipients};
 
@@ -103,12 +107,8 @@ pub struct Share {
     who_error: bool,
     /// The durations' list while it's open, with this row highlighted.
     durations: Option<usize>,
-    /// The Timezone input's text, whether it's been typed in since a zone was picked, its list
-    /// and the highlighted row.
-    zone_text: String,
-    zone_typed: bool,
-    zones: Vec<Found>,
-    zone_pick: usize,
+    /// The Timezone input's state and suggestion list.
+    zone: ZoneInput,
     /// The field taking the keyboard next frame, or giving it up.
     focus: Option<Input>,
     blur: bool,
@@ -135,10 +135,7 @@ impl Share {
             who_pick: 0,
             who_error: false,
             durations: None,
-            zone_text: String::new(),
-            zone_typed: false,
-            zones: Vec::new(),
-            zone_pick: 0,
+            zone: ZoneInput::default(),
             focus: Some(Input::Who),
             blur: false,
             typing: Some(Input::Who),
@@ -165,12 +162,7 @@ impl Share {
                 self.who_error = false;
                 false
             }
-            Some(Input::Zone) if self.zone_typed => {
-                self.zone_typed = false;
-                self.zones.clear();
-                self.zone_text.clear();
-                false
-            }
+            Some(Input::Zone) if self.zone.clear_typed() => false,
             _ => {
                 self.blur = true;
                 true
@@ -370,7 +362,7 @@ impl Share {
             .collect();
         let has_focus = |id: Id| ctx.memory(|memory| memory.has_focus(id));
         if !(has_focus(who_id) && !self.who.is_empty())
-            && !(has_focus(zone_id) && !self.zones.is_empty())
+            && !(has_focus(zone_id) && self.zone.has_suggestions())
         {
             let order: Vec<Id> = [duration_id, who_id]
                 .into_iter()
@@ -485,31 +477,41 @@ impl Share {
             pos2(left, top + LABEL_HEIGHT + 1.0),
             vec2(width, FIELD_HEIGHT),
         );
-        let had_focus = ui.memory(|memory| memory.has_focus(who_id));
-        let keys = ui.input(|input| {
-            (
-                input.key_pressed(egui::Key::ArrowUp),
-                input.key_pressed(egui::Key::ArrowDown),
-                input.key_pressed(egui::Key::Enter),
-                input.key_pressed(egui::Key::Tab),
-            )
-        });
-        if self.who.is_empty() {
-            FIELD.paint_line(
-                &painter,
-                who_box.min + vec2(0.0, 1.0),
-                "Enter name or email",
-                palette.ink(0.35, 0.35),
-                None,
-            );
+        let who_line = Rect::from_min_size(
+            who_box.min + vec2(0.0, 1.0),
+            vec2(who_box.width(), FIELD.line_height),
+        );
+        let want_who_focus = self.focus == Some(Input::Who);
+        if want_who_focus {
+            self.focus = None;
         }
-        let response = self.field(ui, who_id, Input::Who, who_box);
-        rule(who_box.top(), response.has_focus(), self.who_error);
-        if response.changed() {
-            self.who_pick = 0;
-            if recipients::is_valid(self.who.trim()) {
-                self.who_error = false;
-            }
+        let surrender_who = self.blur && self.typing == Some(Input::Who);
+        if self.typing == Some(Input::Who) || self.typing.is_none() {
+            self.blur = false;
+        }
+        let who_color = if self.who_error {
+            Color32::from_rgb(0xf6, 0x7b, 0x7b)
+        } else {
+            palette.ink(0.9, 0.9)
+        };
+        let input_out = ContactSearchInput::new(
+            who_id,
+            who_line,
+            &FIELD,
+            who_color,
+            palette.text_selection_default,
+        )
+        .placeholder("Enter name or email", palette.ink(0.35, 0.35))
+        .request_focus(want_who_focus)
+        .surrender_focus(surrender_who)
+        .show_input(ui, &mut self.who, &mut self.who_pick);
+        rule(
+            who_box.top(),
+            input_out.response.has_focus(),
+            self.who_error,
+        );
+        if input_out.changed && recipients::is_valid(self.who.trim()) {
+            self.who_error = false;
         }
         let suggestions: Vec<Address> = match contacts {
             Some(book) if !self.who.trim().is_empty() => {
@@ -517,32 +519,66 @@ impl Share {
             }
             _ => Vec::new(),
         };
+        let contact_rows: Vec<ContactRow<'_>> = suggestions
+            .iter()
+            .map(|contact| ContactRow {
+                name: contact.name.as_deref().unwrap_or(&contact.email),
+                email: &contact.email,
+                disabled: false,
+                avatar: None,
+            })
+            .collect();
+        let colors = ContactListColors::new(palette, false);
+        let stacked_style = StackedContactStyle {
+            card: AnchoredCard::menu(colors.background, colors.selected),
+            row: 50.0,
+            pad_top: 11.0,
+            pad_bottom: 11.0,
+            pad_x: 16.0,
+            inset_x: 0.0,
+            name_style: TextStyle::new(Font::new(Family::Sans, 400), 13.0, 16.0),
+            name_top: 9.0,
+            name_inks: colors.name,
+            email_style: FIELD,
+            email_top: 29.0,
+            email_inks: colors.email,
+            match_query: true,
+            hover_mode: AnchoredHover::OnMove,
+        };
+        let popup_width = who_box.width() + 24.0;
+        let popup_at = pos2(
+            who_box.center().x - popup_width / 2.0,
+            who_box.bottom() + 8.0,
+        );
         let mut add = None;
-        if had_focus && !self.who.is_empty() {
-            let (up, down, enter, tab) = keys;
-            if up {
-                self.who_pick = self.who_pick.saturating_sub(1);
-            } else if down {
-                self.who_pick = (self.who_pick + 1).min(suggestions.len().saturating_sub(1));
-            }
-            if enter || tab {
-                if let Some(pick) = suggestions.get(self.who_pick).or(suggestions.first()) {
-                    add = Some(pick.clone());
-                } else if recipients::is_valid(self.who.trim()) {
-                    add = Some(recipients::parse(self.who.trim()));
-                } else {
-                    self.who_error = true;
+        if let Some(outcome) = show_stacked_contact_popup(
+            &ctx,
+            exo_ui::id(&ctx, "share-who-suggestions"),
+            input_out.response.has_focus(),
+            input_out.keys,
+            &self.who,
+            &contact_rows,
+            &mut self.who_pick,
+            ContactAcceptKeys::EnterAndTab,
+            false,
+            popup_at,
+            popup_width,
+            stacked_style,
+        ) {
+            match outcome {
+                ContactSearchOutcome::Picked(index) => {
+                    add = Some(suggestions[index].clone());
+                    self.focus = Some(Input::Who);
                 }
-                // Enter and Tab stay in the field.
-                self.focus = Some(Input::Who);
-            }
-        }
-        if response.has_focus() && !suggestions.is_empty() {
-            let (hovered, picked) =
-                suggestion_list(ui, who_box, &suggestions, &self.who, self.who_pick);
-            self.who_pick = hovered.unwrap_or(self.who_pick);
-            if let Some(index) = picked {
-                add = Some(suggestions[index].clone());
+                ContactSearchOutcome::SubmittedTyped { .. } => {
+                    if recipients::is_valid(self.who.trim()) {
+                        add = Some(recipients::parse(self.who.trim()));
+                    } else {
+                        self.who_error = true;
+                    }
+                    self.focus = Some(Input::Who);
+                }
+                ContactSearchOutcome::SubmittedEmpty { .. } => {}
             }
         }
         if let Some(address) = add {
@@ -707,72 +743,39 @@ impl Share {
             pos2(left, top + LABEL_HEIGHT + 1.0),
             vec2(width, FIELD_HEIGHT),
         );
-        let relevant = self.relevant(now);
-        let current = timezones::current(self.tz.iana_name().unwrap_or("UTC"), relevant);
-        if !self.zone_typed {
-            self.zone_text = current.as_ref().map(Found::text).unwrap_or_default();
+        if self.focus == Some(Input::Zone) {
+            self.focus = None;
+            ui.memory_mut(|memory| memory.request_focus(zone_id));
         }
-        let had_zone_focus = ui.memory(|memory| memory.has_focus(zone_id));
-        let response = self.field(ui, zone_id, Input::Zone, zone_box);
-        rule(zone_box.top(), response.has_focus(), false);
-        if response.gained_focus() {
-            // Taking the keyboard lists the zones for what was typed, or else this zone over the
-            // common ones.
-            self.zones = if self.zone_typed {
-                timezones::search(&self.zone_text, relevant, ZONES)
-            } else {
-                timezones::suggested(current.as_ref(), relevant, ZONES)
-            };
-            self.zone_pick = 0;
+        let iana = self.tz.iana_name().map(str::to_owned);
+        let zone_field = ZoneField {
+            id: zone_id,
+            line: Rect::from_min_size(
+                zone_box.min + vec2(0.0, 1.0),
+                vec2(zone_box.width(), FIELD.line_height),
+            ),
+            zone: iana.as_deref(),
+            now: self.relevant(now),
+            limit: ZONES,
+            ink: palette.ink(0.9, 0.9),
+            placeholder: palette.ink(0.35, 0.35),
+            show_rule: false,
+            always_ruled: false,
+            blur_on_pick: true,
+            list_width: 276.0,
+            list_offset: vec2(-7.0, 11.0),
+            rows: ZoneRows::SIDEBAR,
+        };
+        let zone_res = self.zone.show(ui, &zone_field);
+        if self.blur && self.typing == Some(Input::Zone) {
+            ui.memory_mut(|memory| memory.surrender_focus(zone_id));
+            self.blur = false;
         }
-        if response.changed() {
-            self.zone_typed = true;
-            self.zones = timezones::search(&self.zone_text, relevant, ZONES);
-            self.zone_pick = 0;
-        }
-        let mut picked_zone = None;
-        if had_zone_focus && !self.zones.is_empty() {
-            let (up, down, enter, tab) = keys;
-            if up {
-                self.zone_pick = self.zone_pick.saturating_sub(1);
-            } else if down {
-                self.zone_pick = (self.zone_pick + 1).min(self.zones.len() - 1);
-            } else if enter || tab {
-                picked_zone = self.zones.get(self.zone_pick).cloned();
-            }
-        }
-        if response.has_focus() && !self.zones.is_empty() {
-            let list = Rect::from_min_size(
-                pos2(zone_box.left() - 7.0, zone_box.bottom() + 12.0),
-                vec2(276.0, self.zones.len() as f32 * 32.0 + 9.0),
-            );
-            let (hovered, picked) = zone_list(
-                ui,
-                exo_ui::id(ui.ctx(), "share-zone-list"),
-                list,
-                &self.zones,
-                self.zone_pick,
-                &ZoneRows::SIDEBAR,
-            );
-            self.zone_pick = hovered.unwrap_or(self.zone_pick);
-            if let Some(index) = picked {
-                picked_zone = self.zones.get(index).cloned();
-            }
-        }
-        if response.lost_focus() && picked_zone.is_none() {
-            self.zones.clear();
-            // On leaving, an emptied field takes the zone back.
-            if self.zone_text.trim().is_empty() {
-                self.zone_typed = false;
-            }
-        }
-        if let Some(found) = picked_zone {
-            if let Ok(tz) = TimeZone::get(&found.iana) {
-                self.tz = tz;
-            }
-            self.zone_typed = false;
-            self.zones.clear();
-            self.blur = true;
+        rule(zone_box.top(), zone_res.focused, false);
+        if let Some(picked_iana) = zone_res.picked
+            && let Ok(tz) = TimeZone::get(&picked_iana)
+        {
+            self.tz = tz;
         }
         top = zone_box.bottom() - 1.0 + ROW_GAP;
 
@@ -826,13 +829,33 @@ impl Share {
 
         // The durations' list, centered under its button, over the rest.
         if let Some(highlighted) = self.durations {
-            let (hovered, picked, rect) = duration_list(ui, button, highlighted);
-            self.durations = Some(hovered.unwrap_or(highlighted));
-            if let Some(picked) = picked {
+            const ITEM: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 28.0);
+            let rect = Rect::from_min_size(
+                pos2(button.center().x - 136.0, button.bottom() + 8.0),
+                vec2(272.0, DURATIONS.len() as f32 * 28.0 + 8.0),
+            );
+            let out = AnchoredList::new(
+                exo_ui::id(&ctx, "share-durations"),
+                rect,
+                AnchoredCard::menu(colors.background, colors.selected),
+            )
+            .uniform_padding(4.0)
+            .highlighted(Some(highlighted))
+            .show_uniform(&ctx, DURATIONS.len(), 28.0, |painter, row, index| {
+                ITEM.paint_line(
+                    painter,
+                    pos2(row.left() + 16.0, row.top()),
+                    &format!("{} mins", DURATIONS[index]),
+                    palette.ink(0.7, 0.7),
+                    None,
+                );
+            });
+            self.durations = Some(out.hovered.unwrap_or(highlighted));
+            if let Some(picked) = out.pressed {
                 self.minutes = DURATIONS[picked];
                 self.durations = None;
             } else if ui.input(|input| input.pointer.any_pressed())
-                && !ui.rect_contains_pointer(rect)
+                && !out.contains_pointer
                 && !opened.hovered()
             {
                 self.durations = None;
@@ -847,57 +870,6 @@ impl Share {
             .chain(attendee_ids)
             .any(has_focus);
         actions
-    }
-
-    /// One of the text fields, on the line box at `rect`'s top. It takes or lets go of the
-    /// keyboard as asked.
-    fn field(&mut self, ui: &mut Ui, id: Id, input: Input, rect: Rect) -> egui::Response {
-        let palette = exo_ui::palette(ui.ctx());
-        if self.focus == Some(input) {
-            self.focus = None;
-            ui.memory_mut(|memory| memory.request_focus(id));
-        }
-        let line = Rect::from_min_size(
-            rect.min + vec2(0.0, 1.0),
-            vec2(rect.width(), FIELD.line_height),
-        );
-        let text = match input {
-            Input::Who => &mut self.who,
-            Input::Zone => &mut self.zone_text,
-        };
-        let color = if input == Input::Who && self.who_error {
-            Color32::from_rgb(0xf6, 0x7b, 0x7b)
-        } else {
-            palette.ink(0.9, 0.9)
-        };
-        let length = text.chars().count();
-        let response = exo_ui::text_field(
-            ui,
-            id,
-            text,
-            line,
-            &FIELD,
-            color,
-            palette.text_selection_default,
-        );
-        // The Timezone input selects its text when it takes the keyboard.
-        if input == Input::Zone && response.gained_focus() {
-            exo_ui::focus_field(
-                ui.ctx(),
-                id,
-                egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(length),
-                ),
-            );
-        }
-        if self.blur && self.typing == Some(input) {
-            response.surrender_focus();
-        }
-        if self.typing == Some(input) || self.typing.is_none() {
-            self.blur = false;
-        }
-        response
     }
 
     /// Adds `address` under Who, listing them again if they were listed or else adding them, with
@@ -955,7 +927,7 @@ fn slot_id(key: &str) -> Option<u64> {
     clippy::too_many_arguments,
     reason = "a list's box, its rows and how to paint them"
 )]
-fn dropdown(
+pub(super) fn dropdown(
     ui: &Ui,
     id: Id,
     rect: Rect,
@@ -964,246 +936,31 @@ fn dropdown(
     row: f32,
     pad: f32,
     highlighted: usize,
-    mut paint: impl FnMut(&egui::Painter, Rect, usize),
+    paint: impl FnMut(&egui::Painter, Rect, usize),
 ) -> (Option<usize>, Option<usize>) {
-    let ctx = ui.ctx().clone();
-    let palette = exo_ui::palette(&ctx);
-    let colors = exo_ui::ContactListColors::new(palette, false);
-    let (pointer, pressed, moving) = ctx.input(|input| {
-        (
-            input.pointer.hover_pos(),
-            input.pointer.primary_pressed(),
-            input.pointer.is_moving(),
-        )
-    });
-    let (mut hovered, mut picked) = (None, None);
-    egui::Area::new(id)
-        .order(egui::Order::Tooltip)
-        .fixed_pos(rect.min)
-        .constrain(false)
-        .show(&ctx, |area| {
-            let painter = area.painter().clone();
-            if let Some(carbon) = timezone {
-                // The Timezone list: `0 2px 8px rgba(0,0,0,.1)`, 4px corners.
-                let snapped = exo_ui::pixel_snap(rect);
-                exo_ui::BoxShadow::new([0.0, 2.0], 8.0, 0.0, Color32::from_black_alpha(26)).paint(
-                    &painter,
-                    snapped,
-                    CornerRadius::same(4),
-                );
-                painter.rect_filled(
-                    snapped,
-                    CornerRadius::same(4),
-                    if palette.theme == Theme::Carbon {
-                        carbon
-                    } else {
-                        Color32::WHITE
-                    },
-                );
+    let ctx = ui.ctx();
+    let palette = exo_ui::palette(ctx);
+    let colors = ContactListColors::new(palette, false);
+    let card = match timezone {
+        Some(carbon) => AnchoredCard::elevated(
+            if palette.theme == Theme::Carbon {
+                carbon
             } else {
-                exo_ui::paint_contact_list_box(&painter, rect, colors.background);
-            }
-            let _ = area.allocate_rect(rect, Sense::click());
-            for index in 0..rows {
-                let line = Rect::from_min_size(
-                    pos2(rect.left(), rect.top() + pad + index as f32 * row),
-                    vec2(rect.width(), row),
-                );
-                if index == highlighted {
-                    // The Timezone list's `#f2f4fa`, else `hsl(220, 45%, 97%)`; Carbon `#464b53`.
-                    let fill = if timezone.is_some() && palette.theme == Theme::Snow {
-                        Color32::from_rgb(0xf2, 0xf4, 0xfa)
-                    } else {
-                        colors.selected
-                    };
-                    painter.rect_filled(exo_ui::pixel_snap(line), 0.0, fill);
-                }
-                paint(&painter, line, index);
-                if pointer.is_some_and(|at| line.contains(at)) {
-                    if moving {
-                        hovered = Some(index);
-                    }
-                    if pressed {
-                        picked = Some(index);
-                    }
-                }
-            }
-        });
-    (hovered, picked)
-}
-
-/// Who's suggestions: 24px wider than the field and centered under it, 8px down, padded 11px.
-/// Each row is 50px, with a 13px name over a 12px address 16px in, and the typed text darker.
-/// Returns the row under a moving pointer and the row pressed.
-fn suggestion_list(
-    ui: &Ui,
-    field: Rect,
-    suggestions: &[Address],
-    query: &str,
-    highlighted: usize,
-) -> (Option<usize>, Option<usize>) {
-    const NAME: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 13.0, 16.0);
-    let colors = exo_ui::ContactListColors::new(exo_ui::palette(ui.ctx()), false);
-    let rect = Rect::from_min_size(
-        pos2(
-            field.center().x - (field.width() + 24.0) / 2.0,
-            field.bottom() + 8.0,
+                Color32::WHITE
+            },
+            if palette.theme == Theme::Snow {
+                Color32::from_rgb(0xf2, 0xf4, 0xfa)
+            } else {
+                colors.selected
+            },
         ),
-        vec2(field.width() + 24.0, suggestions.len() as f32 * 50.0 + 22.0),
-    );
-    dropdown(
-        ui,
-        exo_ui::id(ui.ctx(), "share-who-suggestions"),
-        rect,
-        None,
-        suggestions.len(),
-        50.0,
-        11.0,
-        highlighted,
-        |painter, row, index| {
-            let contact = &suggestions[index];
-            let name = contact.name.as_deref().unwrap_or(&contact.email);
-            exo_ui::paint_matched(
-                painter,
-                pos2(row.left() + 16.0, row.top() + 9.0),
-                name,
-                query,
-                &NAME,
-                colors.name.0,
-                colors.name.1,
-                row.width() - 32.0,
-            );
-            exo_ui::paint_matched(
-                painter,
-                pos2(row.left() + 16.0, row.top() + 29.0),
-                &contact.email,
-                query,
-                &FIELD,
-                colors.email.0,
-                colors.email.1,
-                row.width() - 32.0,
-            );
-        },
-    )
-}
-
-/// How a Timezone input's list lays out its rows: their height, the padding over the first and
-/// under the last, where each row's 12px/16px text sits, and the list's Carbon fill.
-pub(super) struct ZoneRows {
-    pub row: f32,
-    pub pad: f32,
-    pub bottom: f32,
-    pub text_top: f32,
-    pub carbon: Color32,
-}
-
-impl ZoneRows {
-    /// Share Availability's and Calendar Settings': 32px rows from 4px down, on `#27292d`.
-    pub const SIDEBAR: Self = Self {
-        row: 32.0,
-        pad: 4.0,
-        bottom: 5.0,
-        text_top: 8.0,
-        carbon: Color32::from_rgb(0x27, 0x29, 0x2d),
+        None => AnchoredCard::menu(colors.background, colors.selected),
     };
-    /// The event form's When (12px lines nudged `top: 3px`): 28px rows from 6px down, on the
-    /// form's `#27292d`.
-    pub const EDIT_EVENT: Self = Self {
-        row: 28.0,
-        pad: 6.0,
-        bottom: 3.0,
-        text_top: 6.0,
-        carbon: Color32::from_rgb(0x27, 0x29, 0x2d),
-    };
-}
-
-/// A Timezone input's list at `rect`: `rows` of a zone's offset (80px wide), name and, on the
-/// right, abbreviation (left out when it's an offset). Share Availability's list is 276px from
-/// 7px left of the field and 12px under it, Calendar Settings' is 286px from 16px left and 4px
-/// under, and the form's is 296px. Returns the row under a moving pointer and the row pressed.
-pub(super) fn zone_list(
-    ui: &Ui,
-    id: Id,
-    rect: Rect,
-    zones: &[Found],
-    highlighted: usize,
-    rows: &ZoneRows,
-) -> (Option<usize>, Option<usize>) {
-    let ctx = ui.ctx().clone();
-    let palette = exo_ui::palette(&ctx);
-    dropdown(
-        ui,
-        id,
-        rect,
-        Some(rows.carbon),
-        zones.len(),
-        rows.row,
-        rows.pad,
-        highlighted,
-        |painter, row, index| {
-            let zone = &zones[index];
-            let line = row.top() + rows.text_top;
-            FIELD.paint_line(
-                painter,
-                pos2(row.left() + 15.0, line),
-                &zone.offset,
-                palette.ink(0.4, 0.4),
-                None,
-            );
-            FIELD.paint_line(
-                painter,
-                pos2(row.left() + 95.0, line),
-                &zone.name,
-                palette.ink(0.9, 0.9),
-                Some(row.width() - 95.0 - 60.0),
-            );
-            if !zone.abbreviation.chars().any(|ch| ch.is_ascii_digit()) {
-                let width = FIELD.width(&ctx, &zone.abbreviation);
-                FIELD.paint_line(
-                    painter,
-                    pos2(row.right() - 15.0 - width, line),
-                    &zone.abbreviation,
-                    palette.ink(0.9, 0.9),
-                    None,
-                );
-            }
-        },
-    )
-}
-
-/// The durations' list: 272px, centered 8px under the button, 28px rows from 4px down, 12px at
-/// `.7`. Returns the row under a moving pointer and the row pressed.
-fn duration_list(
-    ui: &Ui,
-    button: Rect,
-    highlighted: usize,
-) -> (Option<usize>, Option<usize>, Rect) {
-    const ITEM: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 28.0);
-    let palette = exo_ui::palette(ui.ctx());
-    let rect = Rect::from_min_size(
-        pos2(button.center().x - 136.0, button.bottom() + 8.0),
-        vec2(272.0, DURATIONS.len() as f32 * 28.0 + 8.0),
-    );
-    let (hovered, picked) = dropdown(
-        ui,
-        exo_ui::id(ui.ctx(), "share-durations"),
-        rect,
-        None,
-        DURATIONS.len(),
-        28.0,
-        4.0,
-        highlighted,
-        |painter, row, index| {
-            ITEM.paint_line(
-                painter,
-                pos2(row.left() + 16.0, row.top()),
-                &format!("{} mins", DURATIONS[index]),
-                palette.ink(0.7, 0.7),
-                None,
-            );
-        },
-    );
-    (hovered, picked, rect)
+    let out = AnchoredList::new(id, rect, card)
+        .uniform_padding(pad)
+        .highlighted(Some(highlighted))
+        .show_uniform(ctx, rows, row, paint);
+    (out.hovered, out.pressed)
 }
 
 impl crate::Mail {

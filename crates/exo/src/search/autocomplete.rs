@@ -300,7 +300,9 @@ fn label_suggestions(field: &str, value: &str, labels: &[LabelChoice]) -> Vec<Su
         }
     }
     for extra in ["all", "read"] {
-        if wanted.is_empty() || extra.starts_with(&wanted) {
+        if (wanted.is_empty() || extra.starts_with(&wanted))
+            && !items.iter().any(|(_, slug)| slug == extra)
+        {
             items.push((label_item(field, value, extra, &original), extra.to_owned()));
         }
     }
@@ -588,6 +590,27 @@ mod tests {
             ["in:scheduled", "in:snippets", "in:reminders"],
             "by `commandScore`"
         );
+        assert_eq!(
+            suggested("in:all"),
+            ["in:all"],
+            "`in:all` is never duplicated"
+        );
+        assert_eq!(suggested("in:al"), ["in:all"]);
+        let read_label = Label {
+            id: "L_read".into(),
+            name: "Read".into(),
+            kind: LabelKind::User,
+            text_color: None,
+            background_color: None,
+            hidden: false,
+        };
+        let with_read = label_choices(&[read_label]);
+        let read_suggestions = suggest("in:rea", &with_read, &[]);
+        let read_hits: Vec<_> = replacements(&read_suggestions)
+            .into_iter()
+            .filter(|s| *s == "in:read")
+            .collect();
+        assert_eq!(read_hits, ["in:read"], "`in:read` is never duplicated");
     }
 
     #[test]

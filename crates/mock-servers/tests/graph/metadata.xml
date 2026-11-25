@@ -1,0 +1,877 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Microsoft Graph v1.0 metadata (CSDL), trimmed to the types the mock's Graph front end
+serves and the types they reach. Annotations are dropped.
+
+Source: https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/6515412a38ee4efb99669442b697df15b7f55c36/clean_v10_metadata/cleanMetadata.xml
+sha256 of the source: 2c5db54eae286ce51560730d3e27db7c5f2bdfed23fcfdaf334d8f296ff1993c
+
+MIT License
+
+Copyright (c) 2018 Microsoft Graph
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="microsoft.graph" Alias="graph" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <ComplexType Name="attendee" BaseType="graph.attendeeBase">
+        <Property Name="proposedNewTime" Type="graph.timeSlot" />
+        <Property Name="status" Type="graph.responseStatus" />
+      </ComplexType>
+      <ComplexType Name="attendeeAvailability">
+        <Property Name="attendee" Type="graph.attendeeBase" />
+        <Property Name="availability" Type="graph.freeBusyStatus" />
+      </ComplexType>
+      <ComplexType Name="attendeeBase" BaseType="graph.recipient">
+        <Property Name="type" Type="graph.attendeeType" />
+      </ComplexType>
+      <ComplexType Name="automaticRepliesSetting">
+        <Property Name="externalAudience" Type="graph.externalAudienceScope" />
+        <Property Name="externalReplyMessage" Type="Edm.String" />
+        <Property Name="internalReplyMessage" Type="Edm.String" />
+        <Property Name="scheduledEndDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="scheduledStartDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="status" Type="graph.automaticRepliesStatus" />
+      </ComplexType>
+      <ComplexType Name="convertIdResult">
+        <Property Name="errorDetails" Type="graph.genericError" />
+        <Property Name="sourceId" Type="Edm.String" />
+        <Property Name="targetId" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="dateTimeTimeZone">
+        <Property Name="dateTime" Type="Edm.String" Nullable="false" />
+        <Property Name="timeZone" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="Dictionary" OpenType="true" />
+      <ComplexType Name="emailAddress">
+        <Property Name="address" Type="Edm.String" />
+        <Property Name="name" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="followupFlag">
+        <Property Name="completedDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="dueDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="flagStatus" Type="graph.followupFlagStatus" />
+        <Property Name="startDateTime" Type="graph.dateTimeTimeZone" />
+      </ComplexType>
+      <ComplexType Name="freeBusyError">
+        <Property Name="message" Type="Edm.String" />
+        <Property Name="responseCode" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="genericError">
+        <Property Name="code" Type="Edm.String" />
+        <Property Name="message" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="internetMessageHeader">
+        <Property Name="name" Type="Edm.String" />
+        <Property Name="value" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="itemBody">
+        <Property Name="content" Type="Edm.String" />
+        <Property Name="contentType" Type="graph.bodyType" />
+      </ComplexType>
+      <ComplexType Name="localeInfo">
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="locale" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="location">
+        <Property Name="address" Type="graph.physicalAddress" />
+        <Property Name="coordinates" Type="graph.outlookGeoCoordinates" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="locationEmailAddress" Type="Edm.String" />
+        <Property Name="locationType" Type="graph.locationType" />
+        <Property Name="locationUri" Type="Edm.String" />
+        <Property Name="uniqueId" Type="Edm.String" />
+        <Property Name="uniqueIdType" Type="graph.locationUniqueIdType" />
+      </ComplexType>
+      <ComplexType Name="mailboxSettings">
+        <Property Name="archiveFolder" Type="Edm.String" />
+        <Property Name="automaticRepliesSetting" Type="graph.automaticRepliesSetting" />
+        <Property Name="dateFormat" Type="Edm.String" />
+        <Property Name="delegateMeetingMessageDeliveryOptions" Type="graph.delegateMeetingMessageDeliveryOptions" />
+        <Property Name="language" Type="graph.localeInfo" />
+        <Property Name="timeFormat" Type="Edm.String" />
+        <Property Name="timeZone" Type="Edm.String" />
+        <Property Name="userPurpose" Type="graph.userPurpose" />
+        <Property Name="workingHours" Type="graph.workingHours" />
+      </ComplexType>
+      <ComplexType Name="meetingTimeSuggestion">
+        <Property Name="attendeeAvailability" Type="Collection(graph.attendeeAvailability)" />
+        <Property Name="confidence" Type="Edm.Double" />
+        <Property Name="locations" Type="Collection(graph.location)" />
+        <Property Name="meetingTimeSlot" Type="graph.timeSlot" />
+        <Property Name="order" Type="Edm.Int32" />
+        <Property Name="organizerAvailability" Type="graph.freeBusyStatus" />
+        <Property Name="suggestionReason" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="meetingTimeSuggestionsResult">
+        <Property Name="emptySuggestionsReason" Type="Edm.String" />
+        <Property Name="meetingTimeSuggestions" Type="Collection(graph.meetingTimeSuggestion)" />
+      </ComplexType>
+      <ComplexType Name="messageRuleActions">
+        <Property Name="assignCategories" Type="Collection(Edm.String)" />
+        <Property Name="copyToFolder" Type="Edm.String" />
+        <Property Name="delete" Type="Edm.Boolean" />
+        <Property Name="forwardAsAttachmentTo" Type="Collection(graph.recipient)" />
+        <Property Name="forwardTo" Type="Collection(graph.recipient)" />
+        <Property Name="markAsRead" Type="Edm.Boolean" />
+        <Property Name="markImportance" Type="graph.importance" />
+        <Property Name="moveToFolder" Type="Edm.String" />
+        <Property Name="permanentDelete" Type="Edm.Boolean" />
+        <Property Name="redirectTo" Type="Collection(graph.recipient)" />
+        <Property Name="stopProcessingRules" Type="Edm.Boolean" />
+      </ComplexType>
+      <ComplexType Name="messageRulePredicates">
+        <Property Name="bodyContains" Type="Collection(Edm.String)" />
+        <Property Name="bodyOrSubjectContains" Type="Collection(Edm.String)" />
+        <Property Name="categories" Type="Collection(Edm.String)" />
+        <Property Name="fromAddresses" Type="Collection(graph.recipient)" />
+        <Property Name="hasAttachments" Type="Edm.Boolean" />
+        <Property Name="headerContains" Type="Collection(Edm.String)" />
+        <Property Name="importance" Type="graph.importance" />
+        <Property Name="isApprovalRequest" Type="Edm.Boolean" />
+        <Property Name="isAutomaticForward" Type="Edm.Boolean" />
+        <Property Name="isAutomaticReply" Type="Edm.Boolean" />
+        <Property Name="isEncrypted" Type="Edm.Boolean" />
+        <Property Name="isMeetingRequest" Type="Edm.Boolean" />
+        <Property Name="isMeetingResponse" Type="Edm.Boolean" />
+        <Property Name="isNonDeliveryReport" Type="Edm.Boolean" />
+        <Property Name="isPermissionControlled" Type="Edm.Boolean" />
+        <Property Name="isReadReceipt" Type="Edm.Boolean" />
+        <Property Name="isSigned" Type="Edm.Boolean" />
+        <Property Name="isVoicemail" Type="Edm.Boolean" />
+        <Property Name="messageActionFlag" Type="graph.messageActionFlag" />
+        <Property Name="notSentToMe" Type="Edm.Boolean" />
+        <Property Name="recipientContains" Type="Collection(Edm.String)" />
+        <Property Name="senderContains" Type="Collection(Edm.String)" />
+        <Property Name="sensitivity" Type="graph.sensitivity" />
+        <Property Name="sentCcMe" Type="Edm.Boolean" />
+        <Property Name="sentOnlyToMe" Type="Edm.Boolean" />
+        <Property Name="sentToAddresses" Type="Collection(graph.recipient)" />
+        <Property Name="sentToMe" Type="Edm.Boolean" />
+        <Property Name="sentToOrCcMe" Type="Edm.Boolean" />
+        <Property Name="subjectContains" Type="Collection(Edm.String)" />
+        <Property Name="withinSizeRange" Type="graph.sizeRange" />
+      </ComplexType>
+      <ComplexType Name="onlineMeetingInfo">
+        <Property Name="conferenceId" Type="Edm.String" />
+        <Property Name="joinUrl" Type="Edm.String" />
+        <Property Name="phones" Type="Collection(graph.phone)" />
+        <Property Name="quickDial" Type="Edm.String" />
+        <Property Name="tollFreeNumbers" Type="Collection(Edm.String)" />
+        <Property Name="tollNumber" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="outlookGeoCoordinates">
+        <Property Name="accuracy" Type="Edm.Double" />
+        <Property Name="altitude" Type="Edm.Double" />
+        <Property Name="altitudeAccuracy" Type="Edm.Double" />
+        <Property Name="latitude" Type="Edm.Double" />
+        <Property Name="longitude" Type="Edm.Double" />
+      </ComplexType>
+      <ComplexType Name="patternedRecurrence">
+        <Property Name="pattern" Type="graph.recurrencePattern" />
+        <Property Name="range" Type="graph.recurrenceRange" />
+      </ComplexType>
+      <ComplexType Name="personType">
+        <Property Name="class" Type="Edm.String" />
+        <Property Name="subclass" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="phone">
+        <Property Name="language" Type="Edm.String" />
+        <Property Name="number" Type="Edm.String" />
+        <Property Name="region" Type="Edm.String" />
+        <Property Name="type" Type="graph.phoneType" />
+      </ComplexType>
+      <ComplexType Name="physicalAddress">
+        <Property Name="city" Type="Edm.String" />
+        <Property Name="countryOrRegion" Type="Edm.String" />
+        <Property Name="postalCode" Type="Edm.String" />
+        <Property Name="state" Type="Edm.String" />
+        <Property Name="street" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="recipient">
+        <Property Name="emailAddress" Type="graph.emailAddress" />
+      </ComplexType>
+      <ComplexType Name="recurrencePattern">
+        <Property Name="dayOfMonth" Type="Edm.Int32" Nullable="false" />
+        <Property Name="daysOfWeek" Type="Collection(graph.dayOfWeek)" />
+        <Property Name="firstDayOfWeek" Type="graph.dayOfWeek" />
+        <Property Name="index" Type="graph.weekIndex" />
+        <Property Name="interval" Type="Edm.Int32" Nullable="false" />
+        <Property Name="month" Type="Edm.Int32" Nullable="false" />
+        <Property Name="type" Type="graph.recurrencePatternType" />
+      </ComplexType>
+      <ComplexType Name="recurrenceRange">
+        <Property Name="endDate" Type="Edm.Date" />
+        <Property Name="numberOfOccurrences" Type="Edm.Int32" Nullable="false" />
+        <Property Name="recurrenceTimeZone" Type="Edm.String" />
+        <Property Name="startDate" Type="Edm.Date" />
+        <Property Name="type" Type="graph.recurrenceRangeType" />
+      </ComplexType>
+      <ComplexType Name="responseStatus">
+        <Property Name="response" Type="graph.responseType" />
+        <Property Name="time" Type="Edm.DateTimeOffset" />
+      </ComplexType>
+      <ComplexType Name="scheduleInformation">
+        <Property Name="availabilityView" Type="Edm.String" />
+        <Property Name="error" Type="graph.freeBusyError" />
+        <Property Name="scheduleId" Type="Edm.String" />
+        <Property Name="scheduleItems" Type="Collection(graph.scheduleItem)" />
+        <Property Name="workingHours" Type="graph.workingHours" />
+      </ComplexType>
+      <ComplexType Name="scheduleItem">
+        <Property Name="end" Type="graph.dateTimeTimeZone" />
+        <Property Name="isPrivate" Type="Edm.Boolean" />
+        <Property Name="location" Type="Edm.String" />
+        <Property Name="start" Type="graph.dateTimeTimeZone" />
+        <Property Name="status" Type="graph.freeBusyStatus" />
+        <Property Name="subject" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="scoredEmailAddress">
+        <Property Name="address" Type="Edm.String" />
+        <Property Name="itemId" Type="Edm.String" />
+        <Property Name="relevanceScore" Type="Edm.Double" />
+        <Property Name="selectionLikelihood" Type="graph.selectionLikelihoodInfo" />
+      </ComplexType>
+      <ComplexType Name="sizeRange">
+        <Property Name="maximumSize" Type="Edm.Int32" />
+        <Property Name="minimumSize" Type="Edm.Int32" />
+      </ComplexType>
+      <ComplexType Name="stringDictionary" BaseType="graph.Dictionary" OpenType="true" />
+      <ComplexType Name="timeSlot">
+        <Property Name="end" Type="graph.dateTimeTimeZone" Nullable="false" />
+        <Property Name="start" Type="graph.dateTimeTimeZone" Nullable="false" />
+      </ComplexType>
+      <ComplexType Name="timeZoneBase">
+        <Property Name="name" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="uploadSession">
+        <Property Name="expirationDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="nextExpectedRanges" Type="Collection(Edm.String)" />
+        <Property Name="uploadUrl" Type="Edm.String" />
+      </ComplexType>
+      <ComplexType Name="website">
+        <Property Name="address" Type="Edm.String" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="type" Type="graph.websiteType" />
+      </ComplexType>
+      <ComplexType Name="workingHours">
+        <Property Name="daysOfWeek" Type="Collection(graph.dayOfWeek)" />
+        <Property Name="endTime" Type="Edm.TimeOfDay" />
+        <Property Name="startTime" Type="Edm.TimeOfDay" />
+        <Property Name="timeZone" Type="graph.timeZoneBase" />
+      </ComplexType>
+      <EntityType Name="attachment" BaseType="graph.entity" Abstract="true">
+        <Property Name="contentType" Type="Edm.String" />
+        <Property Name="isInline" Type="Edm.Boolean" Nullable="false" />
+        <Property Name="lastModifiedDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="name" Type="Edm.String" />
+        <Property Name="size" Type="Edm.Int32" Nullable="false" />
+      </EntityType>
+      <EntityType Name="calendar" BaseType="graph.entity">
+        <Property Name="allowedOnlineMeetingProviders" Type="Collection(graph.onlineMeetingProviderType)" />
+        <Property Name="canEdit" Type="Edm.Boolean" />
+        <Property Name="canShare" Type="Edm.Boolean" />
+        <Property Name="canViewPrivateItems" Type="Edm.Boolean" />
+        <Property Name="changeKey" Type="Edm.String" />
+        <Property Name="color" Type="graph.calendarColor" />
+        <Property Name="defaultOnlineMeetingProvider" Type="graph.onlineMeetingProviderType" />
+        <Property Name="hexColor" Type="Edm.String" />
+        <Property Name="isDefaultCalendar" Type="Edm.Boolean" />
+        <Property Name="isRemovable" Type="Edm.Boolean" />
+        <Property Name="isSharedWithMe" Type="Edm.Boolean" />
+        <Property Name="isTallyingResponses" Type="Edm.Boolean" />
+        <Property Name="name" Type="Edm.String" />
+        <Property Name="owner" Type="graph.emailAddress" />
+        <NavigationProperty Name="calendarView" Type="Collection(graph.event)" ContainsTarget="true" />
+        <NavigationProperty Name="events" Type="Collection(graph.event)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="calendarGroup" BaseType="graph.entity">
+        <Property Name="changeKey" Type="Edm.String" />
+        <Property Name="classId" Type="Edm.Guid" />
+        <Property Name="name" Type="Edm.String" />
+        <NavigationProperty Name="calendars" Type="Collection(graph.calendar)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="contact" BaseType="graph.outlookItem" OpenType="true">
+        <Property Name="assistantName" Type="Edm.String" />
+        <Property Name="birthday" Type="Edm.DateTimeOffset" />
+        <Property Name="businessAddress" Type="graph.physicalAddress" />
+        <Property Name="businessHomePage" Type="Edm.String" />
+        <Property Name="businessPhones" Type="Collection(Edm.String)" />
+        <Property Name="children" Type="Collection(Edm.String)" />
+        <Property Name="companyName" Type="Edm.String" />
+        <Property Name="department" Type="Edm.String" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="emailAddresses" Type="Collection(graph.emailAddress)" />
+        <Property Name="fileAs" Type="Edm.String" />
+        <Property Name="generation" Type="Edm.String" />
+        <Property Name="givenName" Type="Edm.String" />
+        <Property Name="homeAddress" Type="graph.physicalAddress" />
+        <Property Name="homePhones" Type="Collection(Edm.String)" />
+        <Property Name="imAddresses" Type="Collection(Edm.String)" />
+        <Property Name="initials" Type="Edm.String" />
+        <Property Name="jobTitle" Type="Edm.String" />
+        <Property Name="manager" Type="Edm.String" />
+        <Property Name="middleName" Type="Edm.String" />
+        <Property Name="mobilePhone" Type="Edm.String" />
+        <Property Name="nickName" Type="Edm.String" />
+        <Property Name="officeLocation" Type="Edm.String" />
+        <Property Name="otherAddress" Type="graph.physicalAddress" />
+        <Property Name="parentFolderId" Type="Edm.String" />
+        <Property Name="personalNotes" Type="Edm.String" />
+        <Property Name="primaryEmailAddress" Type="graph.emailAddress" />
+        <Property Name="profession" Type="Edm.String" />
+        <Property Name="secondaryEmailAddress" Type="graph.emailAddress" />
+        <Property Name="spouseName" Type="Edm.String" />
+        <Property Name="surname" Type="Edm.String" />
+        <Property Name="tertiaryEmailAddress" Type="graph.emailAddress" />
+        <Property Name="title" Type="Edm.String" />
+        <Property Name="yomiCompanyName" Type="Edm.String" />
+        <Property Name="yomiGivenName" Type="Edm.String" />
+        <Property Name="yomiSurname" Type="Edm.String" />
+        <NavigationProperty Name="extensions" Type="Collection(graph.extension)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="photo" Type="graph.profilePhoto" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="contactFolder" BaseType="graph.entity">
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="parentFolderId" Type="Edm.String" />
+        <NavigationProperty Name="childFolders" Type="Collection(graph.contactFolder)" ContainsTarget="true" />
+        <NavigationProperty Name="contacts" Type="Collection(graph.contact)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="directoryObject" BaseType="graph.entity" OpenType="true">
+        <Property Name="deletedDateTime" Type="Edm.DateTimeOffset" />
+      </EntityType>
+      <EntityType Name="entity" Abstract="true">
+        <Key>
+          <PropertyRef Name="id" />
+        </Key>
+        <Property Name="id" Type="Edm.String" Nullable="false" />
+      </EntityType>
+      <EntityType Name="event" BaseType="graph.outlookItem" OpenType="true">
+        <Property Name="allowNewTimeProposals" Type="Edm.Boolean" />
+        <Property Name="attendees" Type="Collection(graph.attendee)" />
+        <Property Name="body" Type="graph.itemBody" />
+        <Property Name="bodyPreview" Type="Edm.String" />
+        <Property Name="cancelledOccurrences" Type="Collection(Edm.String)" Nullable="false" />
+        <Property Name="end" Type="graph.dateTimeTimeZone" />
+        <Property Name="hasAttachments" Type="Edm.Boolean" />
+        <Property Name="hideAttendees" Type="Edm.Boolean" />
+        <Property Name="iCalUId" Type="Edm.String" />
+        <Property Name="importance" Type="graph.importance" />
+        <Property Name="isAllDay" Type="Edm.Boolean" />
+        <Property Name="isCancelled" Type="Edm.Boolean" />
+        <Property Name="isDraft" Type="Edm.Boolean" />
+        <Property Name="isOnlineMeeting" Type="Edm.Boolean" />
+        <Property Name="isOrganizer" Type="Edm.Boolean" />
+        <Property Name="isReminderOn" Type="Edm.Boolean" />
+        <Property Name="location" Type="graph.location" />
+        <Property Name="locations" Type="Collection(graph.location)" />
+        <Property Name="onlineMeeting" Type="graph.onlineMeetingInfo" />
+        <Property Name="onlineMeetingProvider" Type="graph.onlineMeetingProviderType" />
+        <Property Name="onlineMeetingUrl" Type="Edm.String" />
+        <Property Name="organizer" Type="graph.recipient" />
+        <Property Name="originalEndTimeZone" Type="Edm.String" />
+        <Property Name="originalStart" Type="Edm.DateTimeOffset" />
+        <Property Name="originalStartTimeZone" Type="Edm.String" />
+        <Property Name="recurrence" Type="graph.patternedRecurrence" />
+        <Property Name="reminderMinutesBeforeStart" Type="Edm.Int32" />
+        <Property Name="responseRequested" Type="Edm.Boolean" />
+        <Property Name="responseStatus" Type="graph.responseStatus" />
+        <Property Name="sensitivity" Type="graph.sensitivity" />
+        <Property Name="seriesMasterId" Type="Edm.String" />
+        <Property Name="showAs" Type="graph.freeBusyStatus" />
+        <Property Name="start" Type="graph.dateTimeTimeZone" />
+        <Property Name="subject" Type="Edm.String" />
+        <Property Name="transactionId" Type="Edm.String" />
+        <Property Name="type" Type="graph.eventType" />
+        <Property Name="webLink" Type="Edm.String" />
+        <NavigationProperty Name="attachments" Type="Collection(graph.attachment)" ContainsTarget="true" />
+        <NavigationProperty Name="calendar" Type="graph.calendar" />
+        <NavigationProperty Name="exceptionOccurrences" Type="Collection(graph.event)" ContainsTarget="true" />
+        <NavigationProperty Name="extensions" Type="Collection(graph.extension)" ContainsTarget="true" />
+        <NavigationProperty Name="instances" Type="Collection(graph.event)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="eventMessage" BaseType="graph.message">
+        <Property Name="endDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="isAllDay" Type="Edm.Boolean" />
+        <Property Name="isDelegated" Type="Edm.Boolean" />
+        <Property Name="isOutOfDate" Type="Edm.Boolean" />
+        <Property Name="location" Type="graph.location" />
+        <Property Name="meetingMessageType" Type="graph.meetingMessageType" />
+        <Property Name="recurrence" Type="graph.patternedRecurrence" />
+        <Property Name="startDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="type" Type="graph.eventType" />
+        <NavigationProperty Name="event" Type="graph.event" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="eventMessageRequest" BaseType="graph.eventMessage">
+        <Property Name="allowNewTimeProposals" Type="Edm.Boolean" />
+        <Property Name="meetingRequestType" Type="graph.meetingRequestType" />
+        <Property Name="previousEndDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="previousLocation" Type="graph.location" />
+        <Property Name="previousStartDateTime" Type="graph.dateTimeTimeZone" />
+        <Property Name="responseRequested" Type="Edm.Boolean" />
+      </EntityType>
+      <EntityType Name="eventMessageResponse" BaseType="graph.eventMessage">
+        <Property Name="proposedNewTime" Type="graph.timeSlot" />
+        <Property Name="responseType" Type="graph.responseType" />
+      </EntityType>
+      <EntityType Name="extension" BaseType="graph.entity" Abstract="true" OpenType="true" />
+      <EntityType Name="fileAttachment" BaseType="graph.attachment" HasStream="true">
+        <Property Name="contentBytes" Type="Edm.Binary" />
+        <Property Name="contentId" Type="Edm.String" />
+        <Property Name="contentLocation" Type="Edm.String" />
+      </EntityType>
+      <EntityType Name="inferenceClassificationOverride" BaseType="graph.entity">
+        <Property Name="classifyAs" Type="graph.inferenceClassificationType" />
+        <Property Name="senderEmailAddress" Type="graph.emailAddress" />
+      </EntityType>
+      <EntityType Name="mailFolder" BaseType="graph.entity">
+        <Property Name="childFolderCount" Type="Edm.Int32" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="isHidden" Type="Edm.Boolean" />
+        <Property Name="parentFolderId" Type="Edm.String" />
+        <Property Name="totalItemCount" Type="Edm.Int32" />
+        <Property Name="unreadItemCount" Type="Edm.Int32" />
+        <NavigationProperty Name="childFolders" Type="Collection(graph.mailFolder)" ContainsTarget="true" />
+        <NavigationProperty Name="messageRules" Type="Collection(graph.messageRule)" ContainsTarget="true" />
+        <NavigationProperty Name="messages" Type="Collection(graph.message)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType HasStream="true" Name="message" BaseType="graph.outlookItem" OpenType="true">
+        <Property Name="bccRecipients" Type="Collection(graph.recipient)" />
+        <Property Name="body" Type="graph.itemBody" />
+        <Property Name="bodyPreview" Type="Edm.String" />
+        <Property Name="ccRecipients" Type="Collection(graph.recipient)" />
+        <Property Name="conversationId" Type="Edm.String" />
+        <Property Name="conversationIndex" Type="Edm.Binary" />
+        <Property Name="flag" Type="graph.followupFlag" />
+        <Property Name="from" Type="graph.recipient" />
+        <Property Name="hasAttachments" Type="Edm.Boolean" />
+        <Property Name="importance" Type="graph.importance" />
+        <Property Name="inferenceClassification" Type="graph.inferenceClassificationType" />
+        <Property Name="internetMessageHeaders" Type="Collection(graph.internetMessageHeader)" />
+        <Property Name="internetMessageId" Type="Edm.String" />
+        <Property Name="isDeliveryReceiptRequested" Type="Edm.Boolean" />
+        <Property Name="isDraft" Type="Edm.Boolean" />
+        <Property Name="isRead" Type="Edm.Boolean" />
+        <Property Name="isReadReceiptRequested" Type="Edm.Boolean" />
+        <Property Name="parentFolderId" Type="Edm.String" />
+        <Property Name="receivedDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="replyTo" Type="Collection(graph.recipient)" />
+        <Property Name="sender" Type="graph.recipient" />
+        <Property Name="sentDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="subject" Type="Edm.String" />
+        <Property Name="toRecipients" Type="Collection(graph.recipient)" />
+        <Property Name="uniqueBody" Type="graph.itemBody" />
+        <Property Name="webLink" Type="Edm.String" />
+        <NavigationProperty Name="attachments" Type="Collection(graph.attachment)" ContainsTarget="true" />
+        <NavigationProperty Name="extensions" Type="Collection(graph.extension)" ContainsTarget="true" />
+        <NavigationProperty Name="multiValueExtendedProperties" Type="Collection(graph.multiValueLegacyExtendedProperty)" ContainsTarget="true" />
+        <NavigationProperty Name="singleValueExtendedProperties" Type="Collection(graph.singleValueLegacyExtendedProperty)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="messageRule" BaseType="graph.entity">
+        <Property Name="actions" Type="graph.messageRuleActions" />
+        <Property Name="conditions" Type="graph.messageRulePredicates" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="exceptions" Type="graph.messageRulePredicates" />
+        <Property Name="hasError" Type="Edm.Boolean" />
+        <Property Name="isEnabled" Type="Edm.Boolean" />
+        <Property Name="isReadOnly" Type="Edm.Boolean" />
+        <Property Name="sequence" Type="Edm.Int32" />
+      </EntityType>
+      <EntityType Name="multiValueLegacyExtendedProperty" BaseType="graph.entity">
+        <Property Name="value" Type="Collection(Edm.String)" />
+      </EntityType>
+      <EntityType Name="outlookCategory" BaseType="graph.entity">
+        <Property Name="color" Type="graph.categoryColor" />
+        <Property Name="displayName" Type="Edm.String" />
+      </EntityType>
+      <EntityType Name="outlookItem" BaseType="graph.entity" Abstract="true">
+        <Property Name="categories" Type="Collection(Edm.String)" />
+        <Property Name="changeKey" Type="Edm.String" />
+        <Property Name="createdDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="lastModifiedDateTime" Type="Edm.DateTimeOffset" />
+      </EntityType>
+      <EntityType Name="person" BaseType="graph.entity">
+        <Property Name="birthday" Type="Edm.String" />
+        <Property Name="companyName" Type="Edm.String" />
+        <Property Name="department" Type="Edm.String" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="givenName" Type="Edm.String" />
+        <Property Name="imAddress" Type="Edm.String" />
+        <Property Name="isFavorite" Type="Edm.Boolean" />
+        <Property Name="jobTitle" Type="Edm.String" />
+        <Property Name="officeLocation" Type="Edm.String" />
+        <Property Name="personNotes" Type="Edm.String" />
+        <Property Name="personType" Type="graph.personType" />
+        <Property Name="phones" Type="Collection(graph.phone)" />
+        <Property Name="postalAddresses" Type="Collection(graph.location)" />
+        <Property Name="profession" Type="Edm.String" />
+        <Property Name="scoredEmailAddresses" Type="Collection(graph.scoredEmailAddress)" />
+        <Property Name="surname" Type="Edm.String" />
+        <Property Name="userPrincipalName" Type="Edm.String" />
+        <Property Name="websites" Type="Collection(graph.website)" />
+        <Property Name="yomiCompany" Type="Edm.String" />
+      </EntityType>
+      <EntityType Name="place" BaseType="graph.entity" Abstract="true">
+        <Property Name="address" Type="graph.physicalAddress" />
+        <Property Name="customProperties" Type="graph.stringDictionary" />
+        <Property Name="displayName" Type="Edm.String" Nullable="false" />
+        <Property Name="geoCoordinates" Type="graph.outlookGeoCoordinates" />
+        <Property Name="isWheelChairAccessible" Type="Edm.Boolean" />
+        <Property Name="label" Type="Edm.String" />
+        <Property Name="lastUpdatedTime" Type="Edm.DateTimeOffset" />
+        <Property Name="parentId" Type="Edm.String" />
+        <Property Name="phone" Type="Edm.String" />
+        <Property Name="placeId" Type="Edm.String" />
+        <Property Name="tags" Type="Collection(Edm.String)" Nullable="false" />
+      </EntityType>
+      <EntityType Name="profilePhoto" BaseType="graph.entity" HasStream="true">
+        <Property Name="height" Type="Edm.Int32" />
+        <Property Name="width" Type="Edm.Int32" />
+      </EntityType>
+      <EntityType Name="room" BaseType="graph.place">
+        <Property Name="audioDeviceName" Type="Edm.String" />
+        <Property Name="bookingType" Type="graph.bookingType" />
+        <Property Name="building" Type="Edm.String" />
+        <Property Name="capacity" Type="Edm.Int32" />
+        <Property Name="displayDeviceName" Type="Edm.String" />
+        <Property Name="emailAddress" Type="Edm.String" />
+        <Property Name="floorLabel" Type="Edm.String" />
+        <Property Name="floorNumber" Type="Edm.Int32" />
+        <Property Name="nickname" Type="Edm.String" Nullable="false" />
+        <Property Name="teamsEnabledState" Type="graph.placeFeatureEnablement" Nullable="false" />
+        <Property Name="videoDeviceName" Type="Edm.String" />
+      </EntityType>
+      <EntityType Name="singleValueLegacyExtendedProperty" BaseType="graph.entity">
+        <Property Name="value" Type="Edm.String" />
+      </EntityType>
+      <EntityType Name="user" BaseType="graph.directoryObject" OpenType="true">
+        <Property Name="aboutMe" Type="Edm.String" />
+        <Property Name="accountEnabled" Type="Edm.Boolean" />
+        <Property Name="ageGroup" Type="Edm.String" />
+        <Property Name="birthday" Type="Edm.DateTimeOffset" Nullable="false" />
+        <Property Name="businessPhones" Type="Collection(Edm.String)" Nullable="false" />
+        <Property Name="city" Type="Edm.String" />
+        <Property Name="companyName" Type="Edm.String" />
+        <Property Name="consentProvidedForMinor" Type="Edm.String" />
+        <Property Name="country" Type="Edm.String" />
+        <Property Name="createdDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="creationType" Type="Edm.String" />
+        <Property Name="department" Type="Edm.String" />
+        <Property Name="deviceEnrollmentLimit" Type="Edm.Int32" Nullable="false" />
+        <Property Name="displayName" Type="Edm.String" />
+        <Property Name="employeeHireDate" Type="Edm.DateTimeOffset" />
+        <Property Name="employeeId" Type="Edm.String" />
+        <Property Name="employeeLeaveDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="employeeType" Type="Edm.String" />
+        <Property Name="externalUserState" Type="Edm.String" />
+        <Property Name="externalUserStateChangeDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="faxNumber" Type="Edm.String" />
+        <Property Name="givenName" Type="Edm.String" />
+        <Property Name="hireDate" Type="Edm.DateTimeOffset" Nullable="false" />
+        <Property Name="identityParentId" Type="Edm.String" />
+        <Property Name="imAddresses" Type="Collection(Edm.String)" />
+        <Property Name="interests" Type="Collection(Edm.String)" />
+        <Property Name="isManagementRestricted" Type="Edm.Boolean" />
+        <Property Name="isResourceAccount" Type="Edm.Boolean" />
+        <Property Name="jobTitle" Type="Edm.String" />
+        <Property Name="lastPasswordChangeDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="legalAgeGroupClassification" Type="Edm.String" />
+        <Property Name="mail" Type="Edm.String" />
+        <Property Name="mailNickname" Type="Edm.String" />
+        <Property Name="mobilePhone" Type="Edm.String" />
+        <Property Name="mySite" Type="Edm.String" />
+        <Property Name="officeLocation" Type="Edm.String" />
+        <Property Name="onPremisesDistinguishedName" Type="Edm.String" />
+        <Property Name="onPremisesDomainName" Type="Edm.String" />
+        <Property Name="onPremisesImmutableId" Type="Edm.String" />
+        <Property Name="onPremisesLastSyncDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="onPremisesSamAccountName" Type="Edm.String" />
+        <Property Name="onPremisesSecurityIdentifier" Type="Edm.String" />
+        <Property Name="onPremisesSyncEnabled" Type="Edm.Boolean" />
+        <Property Name="onPremisesUserPrincipalName" Type="Edm.String" />
+        <Property Name="otherMails" Type="Collection(Edm.String)" Nullable="false" />
+        <Property Name="passwordPolicies" Type="Edm.String" />
+        <Property Name="pastProjects" Type="Collection(Edm.String)" />
+        <Property Name="postalCode" Type="Edm.String" />
+        <Property Name="preferredDataLocation" Type="Edm.String" />
+        <Property Name="preferredLanguage" Type="Edm.String" />
+        <Property Name="preferredName" Type="Edm.String" />
+        <Property Name="proxyAddresses" Type="Collection(Edm.String)" Nullable="false" />
+        <Property Name="responsibilities" Type="Collection(Edm.String)" />
+        <Property Name="schools" Type="Collection(Edm.String)" />
+        <Property Name="securityIdentifier" Type="Edm.String" />
+        <Property Name="showInAddressList" Type="Edm.Boolean" />
+        <Property Name="signInSessionsValidFromDateTime" Type="Edm.DateTimeOffset" />
+        <Property Name="skills" Type="Collection(Edm.String)" />
+        <Property Name="state" Type="Edm.String" />
+        <Property Name="streetAddress" Type="Edm.String" />
+        <Property Name="surname" Type="Edm.String" />
+        <Property Name="usageLocation" Type="Edm.String" />
+        <Property Name="userPrincipalName" Type="Edm.String" />
+        <Property Name="userType" Type="Edm.String" />
+        <NavigationProperty Name="photo" Type="graph.profilePhoto" ContainsTarget="true" />
+      </EntityType>
+      <EnumType Name="attendeeType">
+        <Member Name="required" Value="0" />
+        <Member Name="optional" Value="1" />
+        <Member Name="resource" Value="2" />
+      </EnumType>
+      <EnumType Name="automaticRepliesStatus">
+        <Member Name="disabled" Value="0" />
+        <Member Name="alwaysEnabled" Value="1" />
+        <Member Name="scheduled" Value="2" />
+      </EnumType>
+      <EnumType Name="bodyType">
+        <Member Name="text" Value="0" />
+        <Member Name="html" Value="1" />
+      </EnumType>
+      <EnumType Name="bookingType">
+        <Member Name="unknown" Value="0" />
+        <Member Name="standard" Value="1" />
+        <Member Name="reserved" Value="2" />
+      </EnumType>
+      <EnumType Name="calendarColor">
+        <Member Name="auto" Value="-1" />
+        <Member Name="lightBlue" Value="0" />
+        <Member Name="lightGreen" Value="1" />
+        <Member Name="lightOrange" Value="2" />
+        <Member Name="lightGray" Value="3" />
+        <Member Name="lightYellow" Value="4" />
+        <Member Name="lightTeal" Value="5" />
+        <Member Name="lightPink" Value="6" />
+        <Member Name="lightBrown" Value="7" />
+        <Member Name="lightRed" Value="8" />
+        <Member Name="maxColor" Value="9" />
+      </EnumType>
+      <EnumType Name="categoryColor">
+        <Member Name="none" Value="-1" />
+        <Member Name="preset0" Value="0" />
+        <Member Name="preset1" Value="1" />
+        <Member Name="preset2" Value="2" />
+        <Member Name="preset3" Value="3" />
+        <Member Name="preset4" Value="4" />
+        <Member Name="preset5" Value="5" />
+        <Member Name="preset6" Value="6" />
+        <Member Name="preset7" Value="7" />
+        <Member Name="preset8" Value="8" />
+        <Member Name="preset9" Value="9" />
+        <Member Name="preset10" Value="10" />
+        <Member Name="preset11" Value="11" />
+        <Member Name="preset12" Value="12" />
+        <Member Name="preset13" Value="13" />
+        <Member Name="preset14" Value="14" />
+        <Member Name="preset15" Value="15" />
+        <Member Name="preset16" Value="16" />
+        <Member Name="preset17" Value="17" />
+        <Member Name="preset18" Value="18" />
+        <Member Name="preset19" Value="19" />
+        <Member Name="preset20" Value="20" />
+        <Member Name="preset21" Value="21" />
+        <Member Name="preset22" Value="22" />
+        <Member Name="preset23" Value="23" />
+        <Member Name="preset24" Value="24" />
+      </EnumType>
+      <EnumType Name="dayOfWeek">
+        <Member Name="sunday" Value="0" />
+        <Member Name="monday" Value="1" />
+        <Member Name="tuesday" Value="2" />
+        <Member Name="wednesday" Value="3" />
+        <Member Name="thursday" Value="4" />
+        <Member Name="friday" Value="5" />
+        <Member Name="saturday" Value="6" />
+      </EnumType>
+      <EnumType Name="delegateMeetingMessageDeliveryOptions">
+        <Member Name="sendToDelegateAndInformationToPrincipal" Value="0" />
+        <Member Name="sendToDelegateAndPrincipal" Value="1" />
+        <Member Name="sendToDelegateOnly" Value="2" />
+      </EnumType>
+      <EnumType Name="eventType">
+        <Member Name="singleInstance" Value="0" />
+        <Member Name="occurrence" Value="1" />
+        <Member Name="exception" Value="2" />
+        <Member Name="seriesMaster" Value="3" />
+      </EnumType>
+      <EnumType Name="externalAudienceScope">
+        <Member Name="none" Value="0" />
+        <Member Name="contactsOnly" Value="1" />
+        <Member Name="all" Value="2" />
+      </EnumType>
+      <EnumType Name="followupFlagStatus">
+        <Member Name="notFlagged" Value="0" />
+        <Member Name="complete" Value="1" />
+        <Member Name="flagged" Value="2" />
+      </EnumType>
+      <EnumType Name="freeBusyStatus">
+        <Member Name="unknown" Value="-1" />
+        <Member Name="free" Value="0" />
+        <Member Name="tentative" Value="1" />
+        <Member Name="busy" Value="2" />
+        <Member Name="oof" Value="3" />
+        <Member Name="workingElsewhere" Value="4" />
+      </EnumType>
+      <EnumType Name="importance">
+        <Member Name="low" Value="0" />
+        <Member Name="normal" Value="1" />
+        <Member Name="high" Value="2" />
+      </EnumType>
+      <EnumType Name="inferenceClassificationType">
+        <Member Name="focused" Value="0" />
+        <Member Name="other" Value="1" />
+      </EnumType>
+      <EnumType Name="locationType">
+        <Member Name="default" Value="0" />
+        <Member Name="conferenceRoom" Value="1" />
+        <Member Name="homeAddress" Value="2" />
+        <Member Name="businessAddress" Value="3" />
+        <Member Name="geoCoordinates" Value="4" />
+        <Member Name="streetAddress" Value="5" />
+        <Member Name="hotel" Value="6" />
+        <Member Name="restaurant" Value="7" />
+        <Member Name="localBusiness" Value="8" />
+        <Member Name="postalAddress" Value="9" />
+      </EnumType>
+      <EnumType Name="locationUniqueIdType">
+        <Member Name="unknown" Value="0" />
+        <Member Name="locationStore" Value="1" />
+        <Member Name="directory" Value="2" />
+        <Member Name="private" Value="3" />
+        <Member Name="bing" Value="4" />
+      </EnumType>
+      <EnumType Name="meetingMessageType">
+        <Member Name="none" Value="0" />
+        <Member Name="meetingRequest" Value="1" />
+        <Member Name="meetingCancelled" Value="2" />
+        <Member Name="meetingAccepted" Value="3" />
+        <Member Name="meetingTenativelyAccepted" Value="4" />
+        <Member Name="meetingDeclined" Value="5" />
+      </EnumType>
+      <EnumType Name="meetingRequestType">
+        <Member Name="none" Value="0" />
+        <Member Name="newMeetingRequest" Value="1" />
+        <Member Name="fullUpdate" Value="65536" />
+        <Member Name="informationalUpdate" Value="131072" />
+        <Member Name="silentUpdate" Value="262144" />
+        <Member Name="outdated" Value="524288" />
+        <Member Name="principalWantsCopy" Value="1048576" />
+      </EnumType>
+      <EnumType Name="messageActionFlag">
+        <Member Name="any" Value="0" />
+        <Member Name="call" Value="1" />
+        <Member Name="doNotForward" Value="2" />
+        <Member Name="followUp" Value="3" />
+        <Member Name="fyi" Value="4" />
+        <Member Name="forward" Value="5" />
+        <Member Name="noResponseNecessary" Value="6" />
+        <Member Name="read" Value="7" />
+        <Member Name="reply" Value="8" />
+        <Member Name="replyToAll" Value="9" />
+        <Member Name="review" Value="10" />
+      </EnumType>
+      <EnumType Name="onlineMeetingProviderType">
+        <Member Name="unknown" Value="0" />
+        <Member Name="skypeForBusiness" Value="1" />
+        <Member Name="skypeForConsumer" Value="2" />
+        <Member Name="teamsForBusiness" Value="3" />
+      </EnumType>
+      <EnumType Name="phoneType">
+        <Member Name="home" Value="0" />
+        <Member Name="business" Value="1" />
+        <Member Name="mobile" Value="2" />
+        <Member Name="other" Value="3" />
+        <Member Name="assistant" Value="4" />
+        <Member Name="homeFax" Value="5" />
+        <Member Name="businessFax" Value="6" />
+        <Member Name="otherFax" Value="7" />
+        <Member Name="pager" Value="8" />
+        <Member Name="radio" Value="9" />
+      </EnumType>
+      <EnumType Name="placeFeatureEnablement">
+        <Member Name="unknown" Value="0" />
+        <Member Name="enabled" Value="1" />
+        <Member Name="disabled" Value="2" />
+        <Member Name="unknownFutureValue" Value="3" />
+      </EnumType>
+      <EnumType Name="recurrencePatternType">
+        <Member Name="daily" Value="0" />
+        <Member Name="weekly" Value="1" />
+        <Member Name="absoluteMonthly" Value="2" />
+        <Member Name="relativeMonthly" Value="3" />
+        <Member Name="absoluteYearly" Value="4" />
+        <Member Name="relativeYearly" Value="5" />
+      </EnumType>
+      <EnumType Name="recurrenceRangeType">
+        <Member Name="endDate" Value="0" />
+        <Member Name="noEnd" Value="1" />
+        <Member Name="numbered" Value="2" />
+      </EnumType>
+      <EnumType Name="responseType">
+        <Member Name="none" Value="0" />
+        <Member Name="organizer" Value="1" />
+        <Member Name="tentativelyAccepted" Value="2" />
+        <Member Name="accepted" Value="3" />
+        <Member Name="declined" Value="4" />
+        <Member Name="notResponded" Value="5" />
+      </EnumType>
+      <EnumType Name="selectionLikelihoodInfo">
+        <Member Name="notSpecified" Value="0" />
+        <Member Name="high" Value="1" />
+      </EnumType>
+      <EnumType Name="sensitivity">
+        <Member Name="normal" Value="0" />
+        <Member Name="personal" Value="1" />
+        <Member Name="private" Value="2" />
+        <Member Name="confidential" Value="3" />
+      </EnumType>
+      <EnumType Name="userPurpose">
+        <Member Name="user" Value="1" />
+        <Member Name="linked" Value="2" />
+        <Member Name="shared" Value="3" />
+        <Member Name="room" Value="4" />
+        <Member Name="equipment" Value="5" />
+        <Member Name="others" Value="6" />
+        <Member Name="unknownFutureValue" Value="7" />
+      </EnumType>
+      <EnumType Name="websiteType">
+        <Member Name="other" Value="0" />
+        <Member Name="home" Value="1" />
+        <Member Name="work" Value="2" />
+        <Member Name="blog" Value="3" />
+        <Member Name="profile" Value="4" />
+      </EnumType>
+      <EnumType Name="weekIndex">
+        <Member Name="first" Value="0" />
+        <Member Name="second" Value="1" />
+        <Member Name="third" Value="2" />
+        <Member Name="fourth" Value="3" />
+        <Member Name="last" Value="4" />
+      </EnumType>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

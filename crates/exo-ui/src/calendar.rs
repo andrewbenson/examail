@@ -116,7 +116,7 @@ impl CalendarColor {
 
     /// The colour's swatch (checkboxes, the details popover's square): its accepted fill.
     pub fn swatch(self, _theme: Theme) -> Color32 {
-        COLOURS[self.0][0][1]
+        self.base()
     }
 }
 
@@ -156,69 +156,41 @@ const PICKER: [&str; 25] = [
     "magenta", "steel", "slate", "pewter", "charcoal",
 ];
 
-/// A colour's tokens: for accepted then unaccepted, plain then as a preview, each current then
-/// past, the text, fill and border.
+/// A colour's name and base RGB.
 struct Row {
     name: &'static str,
     base: [u8; 3],
-    classic: [&'static str; 24],
 }
 
 #[rustfmt::skip]
 const ROWS: [Row; 25] = [
-    Row { name: "blue", base: [115, 182, 219],
-          classic: ["white", "rgb(115, 182, 219)", "white", "white", "rgb(171, 211.2, 233.4)", "white", "rgb(87, 167, 212)", "#eaf4fa", "rgba(255, 255, 255, 0.9)", "rgba(87, 167, 212, 0.75)", "rgb(240.3, 247.3, 251.5)", "rgba(255, 255, 255, 0.9)", "rgb(86.6022727273, 167.1926136364, 211.6977272727)", "white", "rgb(115, 182, 219)", "rgb(142.6022727273, 196.3926136364, 226.0977272727)", "white", "rgb(171, 211.2, 233.4)", "rgb(87, 167, 212)", "white", "rgba(115, 182, 219, 0.45)", "rgba(87, 167, 212, 0.75)", "white", "rgba(198.4615384615, 225.5192307692, 240.4615384615, 0.615)"] },
-    Row { name: "green", base: [138, 214, 172],
-          classic: ["white", "rgb(138, 214, 172)", "white", "white", "rgb(184.8, 230.4, 205.2)", "white", "rgb(106, 198, 146)", "#e8f7ee", "rgba(255, 255, 255, 0.9)", "rgba(106, 198, 146, 0.75)", "rgb(238.9, 249.4, 243.1)", "rgba(255, 255, 255, 0.9)", "rgb(111.5639240506, 204.7360759494, 153.2462025316)", "white", "rgb(138, 214, 172)", "rgb(158.3639240506, 221.1360759494, 186.4462025316)", "white", "rgb(184.8, 230.4, 205.2)", "rgb(106, 198, 146)", "white", "rgba(138, 214, 172, 0.45)", "rgba(106, 198, 146, 0.75)", "white", "rgba(207.75, 238.4423076923, 221.4807692308, 0.615)"] },
-    Row { name: "orange", base: [224, 159, 129],
-          classic: ["white", "rgb(224, 159, 129)", "white", "white", "rgb(236.4, 197.4, 179.4)", "white", "rgb(217, 137, 100)", "#f9ece6", "rgba(255, 255, 255, 0.9)", "rgba(217, 137, 100, 0.75)", "rgb(250.8, 241.7, 237.5)", "rgba(255, 255, 255, 0.9)", "rgb(216.950955414, 137.1707006369, 100.349044586)", "white", "rgb(224, 159, 129)", "rgb(229.350955414, 175.5707006369, 150.749044586)", "white", "rgb(236.4, 197.4, 179.4)", "rgb(217, 137, 100)", "white", "rgba(224, 159, 129, 0.45)", "rgba(217, 137, 100, 0.75)", "white", "rgba(242.4807692308, 216.2307692308, 204.1153846154, 0.615)"] },
-    Row { name: "pink", base: [236, 155, 184],
-          classic: ["white", "rgb(236, 155, 184)", "white", "white", "rgb(243.6, 195, 212.4)", "white", "rgb(223, 138, 168)", "#fbebf1", "rgba(255, 255, 255, 0.9)", "rgba(223, 138, 168, 0.75)", "rgb(252.2, 241, 245.2)", "rgba(255, 255, 255, 0.9)", "rgb(230.3, 125, 162.7)", "white", "rgb(236, 155, 184)", "rgb(237.9, 165, 191.1)", "white", "rgb(243.6, 195, 212.4)", "rgb(223, 138, 168)", "white", "rgba(236, 155, 184, 0.45)", "rgba(223, 138, 168, 0.75)", "white", "rgba(247.3269230769, 214.6153846154, 226.3269230769, 0.615)"] },
-    Row { name: "red", base: [227, 148, 148],
-          classic: ["white", "rgb(227, 148, 148)", "white", "white", "rgb(238.2, 190.8, 190.8)", "white", "rgb(198, 114, 114)", "#f9eaea", "rgba(255, 255, 255, 0.9)", "rgba(198, 114, 114, 0.75)", "rgb(250.8, 240.3, 240.3)", "rgba(255, 255, 255, 0.9)", "rgb(219.5955555556, 119.7044444444, 119.7044444444)", "white", "rgb(227, 148, 148)", "rgb(230.7955555556, 162.5044444444, 162.5044444444)", "white", "rgb(238.2, 190.8, 190.8)", "rgb(198, 114, 114)", "white", "rgba(227, 148, 148, 0.45)", "rgba(198, 114, 114, 0.75)", "white", "rgba(243.6923076923, 211.7884615385, 211.7884615385, 0.615)"] },
-    Row { name: "ochre", base: [208, 162, 71],
-          classic: ["white", "rgb(208, 162, 71)", "white", "white", "rgb(226.8, 199.2, 144.6)", "white", "rgb(181, 137, 51)", "#f6ecda", "rgba(255, 255, 255, 0.9)", "rgba(181, 137, 51, 0.75)", "rgb(248.7, 241.7, 229.1)", "rgba(255, 255, 255, 0.9)", "rgb(193.7974025974, 145.3480519481, 49.5025974026)", "white", "rgb(208, 162, 71)", "rgb(219.5363636364, 184.8272727273, 116.1636363636)", "white", "rgb(226.8, 199.2, 144.6)", "rgb(181, 137, 51)", "white", "rgba(208, 162, 71, 0.45)", "rgba(181, 137, 51, 0.75)", "white", "rgba(236.0192307692, 217.4423076923, 180.6923076923, 0.615)"] },
-    Row { name: "yellow", base: [228, 196, 80],
-          classic: ["white", "rgb(228, 196, 80)", "white", "white", "rgb(238.8, 219.6, 150)", "white", "rgb(202, 168, 50)", "#faf3dc", "rgba(255, 255, 255, 0.9)", "rgba(202, 168, 50, 0.75)", "rgb(251.5, 246.6, 230.5)", "rgba(255, 255, 255, 0.9)", "rgb(223.2282178218, 185.5727722772, 49.0717821782)", "white", "rgb(228, 196, 80)", "rgb(234.0282178218, 209.1727722772, 119.0717821782)", "white", "rgb(238.8, 219.6, 150)", "rgb(202, 168, 50)", "white", "rgba(228, 196, 80, 0.45)", "rgba(202, 168, 50, 0.75)", "white", "rgba(244.0961538462, 231.1730769231, 184.3269230769, 0.615)"] },
-    Row { name: "lime", base: [186, 210, 115],
-          classic: ["white", "rgb(186, 210, 115)", "white", "white", "rgb(213.6, 228, 171)", "white", "rgb(163, 182, 33)", "#f1f6e3", "rgba(255, 255, 255, 0.9)", "rgba(163, 182, 33, 0.75)", "rgb(245.2, 248.7, 235.4)", "rgba(255, 255, 255, 0.9)", "rgb(172.6848648649, 201.3162162162, 87.9837837838)", "white", "rgb(186, 210, 115)", "rgb(200.2848648649, 219.3162162162, 143.9837837838)", "white", "rgb(213.6, 228, 171)", "rgb(163, 182, 33)", "white", "rgba(186, 210, 115, 0.45)", "rgba(163, 182, 33, 0.75)", "white", "rgba(227.1346153846, 236.8269230769, 198.4615384615, 0.615)"] },
-    Row { name: "cobalt", base: [141, 162, 216],
-          classic: ["white", "rgb(141, 162, 216)", "white", "white", "rgb(186.6, 199.2, 231.6)", "white", "rgb(97, 121, 183)", "#e8ecf7", "rgba(255, 255, 255, 0.9)", "rgba(97, 121, 183, 0.75)", "rgb(238.9, 241.7, 249.4)", "rgba(255, 255, 255, 0.9)", "rgb(114.4, 140.3, 206.9)", "white", "rgb(141, 162, 216)", "rgb(160, 177.5, 222.5)", "white", "rgb(186.6, 199.2, 231.6)", "rgb(97, 121, 183)", "white", "rgba(141, 162, 216, 0.45)", "rgba(97, 121, 183, 0.75)", "white", "rgba(208.9615384615, 217.4423076923, 239.25, 0.615)"] },
-    Row { name: "magenta", base: [213, 161, 215],
-          classic: ["white", "rgb(213, 161, 215)", "white", "white", "rgb(229.8, 198.6, 231)", "white", "rgb(205, 122, 207)", "#f7ecf7", "rgba(255, 255, 255, 0.9)", "rgba(205, 122, 207, 0.75)", "rgb(249.4, 241.7, 249.4)", "rgba(255, 255, 255, 0.9)", "rgb(201.8104477612, 135.9567164179, 204.3432835821)", "white", "rgb(213, 161, 215)", "rgb(218.6104477612, 173.5567164179, 220.3432835821)", "white", "rgb(229.8, 198.6, 231)", "rgb(205, 122, 207)", "white", "rgba(213, 161, 215, 0.45)", "rgba(205, 122, 207, 0.75)", "white", "rgba(238.0384615385, 217.0384615385, 238.8461538462, 0.615)"] },
-    Row { name: "steel", base: [144, 158, 162],
-          classic: ["white", "rgb(144, 158, 162)", "white", "white", "rgb(188.4, 196.8, 199.2)", "white", "rgb(144, 158, 162)", "#e9ecec", "rgba(255, 255, 255, 0.9)", "rgba(144, 158, 162, 0.75)", "rgb(239.6, 241.7, 241.7)", "rgba(255, 255, 255, 0.9)", "rgb(124.575, 141.025, 145.725)", "white", "rgb(144, 158, 162)", "rgb(168.975, 179.825, 182.925)", "white", "rgb(188.4, 196.8, 199.2)", "rgb(144, 158, 162)", "white", "rgba(144, 158, 162, 0.45)", "rgba(144, 158, 162, 0.75)", "white", "rgba(210.1730769231, 215.8269230769, 217.4423076923, 0.615)"] },
-    Row { name: "navy", base: [111, 140, 195],
-          classic: ["white", "rgb(111, 140, 195)", "white", "white", "rgb(168.6, 186, 219)", "white", "rgb(60, 88, 144)", "#e2e8f3", "rgba(255, 255, 255, 0.9)", "rgba(60, 88, 144, 0.75)", "rgb(234.7, 238.9, 246.6)", "rgba(255, 255, 255, 0.9)", "rgb(85.8, 119.875, 184.5)", "white", "rgb(111, 140, 195)", "rgb(143.4, 165.875, 208.5)", "white", "rgb(168.6, 186, 219)", "rgb(60, 88, 144)", "white", "rgba(111, 140, 195, 0.45)", "rgba(60, 88, 144, 0.75)", "white", "rgba(196.8461538462, 208.5576923077, 230.7692307692, 0.615)"] },
-    Row { name: "slate", base: [143, 150, 163],
-          classic: ["white", "rgb(143, 150, 163)", "white", "white", "rgb(187.8, 192, 199.8)", "white", "rgb(92, 99, 112)", "#e9eaed", "rgba(255, 255, 255, 0.9)", "rgba(92, 99, 112, 0.75)", "rgb(239.6, 240.3, 242.4)", "rgba(255, 255, 255, 0.9)", "rgb(123.4, 131.625, 146.9)", "white", "rgb(143, 150, 163)", "rgb(168.2, 173.625, 183.7)", "white", "rgb(187.8, 192, 199.8)", "rgb(92, 99, 112)", "white", "rgba(143, 150, 163, 0.45)", "rgba(92, 99, 112, 0.75)", "white", "rgba(209.7692307692, 212.5961538462, 217.8461538462, 0.615)"] },
-    Row { name: "pewter", base: [155, 153, 151],
-          classic: ["white", "rgb(155, 153, 151)", "white", "white", "rgb(195, 193.8, 192.6)", "white", "rgb(104, 102, 100)", "#ebebea", "rgba(255, 255, 255, 0.9)", "rgba(104, 102, 100, 0.75)", "rgb(241, 241, 240.3)", "rgba(255, 255, 255, 0.9)", "rgb(137.5, 135.15, 132.8)", "white", "rgb(155, 153, 151)", "rgb(177.5, 175.95, 174.4)", "white", "rgb(195, 193.8, 192.6)", "rgb(104, 102, 100)", "white", "rgba(155, 153, 151, 0.45)", "rgba(104, 102, 100, 0.75)", "white", "rgba(214.6153846154, 213.8076923077, 213, 0.615)"] },
-    Row { name: "charcoal", base: [96, 104, 108],
-          classic: ["white", "rgb(96, 104, 108)", "white", "white", "rgb(159.6, 164.4, 166.8)", "white", "rgb(48, 52, 54)", "#dadcdc", "rgba(255, 255, 255, 0.9)", "rgba(48, 52, 54, 0.75)", "rgb(229.1, 230.5, 230.5)", "rgba(255, 255, 255, 0.9)", "rgb(79.2, 85.8, 89.1)", "white", "rgb(96, 104, 108)", "rgb(141.05, 146.7833333333, 149.65)", "white", "rgb(159.6, 164.4, 166.8)", "rgb(48, 52, 54)", "white", "rgba(96, 104, 108, 0.45)", "rgba(48, 52, 54, 0.75)", "white", "rgba(190.7884615385, 194.0192307692, 195.6346153846, 0.615)"] },
-    Row { name: "blush", base: [194, 112, 119],
-          classic: ["white", "rgb(194, 112, 119)", "white", "white", "rgb(218.4, 169.2, 173.4)", "white", "rgb(143, 61, 68)", "#f3e2e4", "rgba(255, 255, 255, 0.9)", "rgba(143, 61, 68, 0.75)", "rgb(246.6, 234.7, 236.1)", "rgba(255, 255, 255, 0.9)", "rgb(183.325, 86.975, 95.2)", "white", "rgb(194, 112, 119)", "rgb(207.725, 144.175, 149.6)", "white", "rgb(218.4, 169.2, 173.4)", "rgb(143, 61, 68)", "white", "rgba(194, 112, 119, 0.45)", "rgba(143, 61, 68, 0.75)", "white", "rgba(230.3653846154, 197.25, 200.0769230769, 0.615)"] },
-    Row { name: "cinnamon", base: [204, 136, 102],
-          classic: ["white", "rgb(204, 136, 102)", "white", "white", "rgb(224.4, 183.6, 163.2)", "white", "rgb(169, 79, 35)", "#f5e7e0", "rgba(255, 255, 255, 0.9)", "rgba(169, 79, 35, 0.75)", "rgb(248, 238.2, 233.3)", "rgba(255, 255, 255, 0.9)", "rgb(195.075, 115.175, 75.225)", "white", "rgb(204, 136, 102)", "rgb(215.475, 162.775, 136.425)", "white", "rgb(224.4, 183.6, 163.2)", "rgb(169, 79, 35)", "white", "rgba(204, 136, 102, 0.45)", "rgba(169, 79, 35, 0.75)", "white", "rgba(234.4038461538, 206.9423076923, 193.2115384615, 0.615)"] },
-    Row { name: "sienna", base: [216, 156, 90],
-          classic: ["white", "rgb(216, 156, 90)", "white", "white", "rgb(231.6, 195.6, 156)", "white", "rgb(165, 105, 39)", "#f7ebde", "rgba(255, 255, 255, 0.9)", "rgba(165, 105, 39, 0.75)", "rgb(249.4, 241, 231.9)", "rgba(255, 255, 255, 0.9)", "rgb(209.175, 138.675, 61.125)", "white", "rgb(216, 156, 90)", "rgb(224.775, 178.275, 127.125)", "white", "rgb(231.6, 195.6, 156)", "rgb(165, 105, 39)", "white", "rgba(216, 156, 90, 0.45)", "rgba(165, 105, 39, 0.75)", "white", "rgba(239.25, 215.0192307692, 188.3653846154, 0.615)"] },
-    Row { name: "olive", base: [204, 182, 102],
-          classic: ["white", "rgb(204, 182, 102)", "white", "white", "rgb(224.4, 211.2, 163.2)", "white", "rgb(160, 135, 44)", "#f5f0e0", "rgba(255, 255, 255, 0.9)", "rgba(160, 135, 44, 0.75)", "rgb(248, 244.5, 233.3)", "rgba(255, 255, 255, 0.9)", "rgb(195.075, 169.225, 75.225)", "white", "rgb(204, 182, 102)", "rgb(215.475, 198.425, 136.425)", "white", "rgb(224.4, 211.2, 163.2)", "rgb(160, 135, 44)", "white", "rgba(204, 182, 102, 0.45)", "rgba(160, 135, 44, 0.75)", "white", "rgba(234.4038461538, 225.5192307692, 193.2115384615, 0.615)"] },
-    Row { name: "forest", base: [122, 184, 129],
-          classic: ["white", "rgb(122, 184, 129)", "white", "white", "rgb(175.2, 212.4, 179.4)", "white", "rgb(71, 133, 78)", "#e4f1e6", "rgba(255, 255, 255, 0.9)", "rgba(71, 133, 78, 0.75)", "rgb(236.1, 245.2, 237.5)", "rgba(255, 255, 255, 0.9)", "rgb(98.725, 171.575, 106.95)", "white", "rgb(122, 184, 129)", "rgb(151.925, 199.975, 157.35)", "white", "rgb(175.2, 212.4, 179.4)", "rgb(71, 133, 78)", "white", "rgba(122, 184, 129, 0.45)", "rgba(71, 133, 78, 0.75)", "white", "rgba(201.2884615385, 226.3269230769, 204.1153846154, 0.615)"] },
-    Row { name: "storm", base: [57, 92, 96],
-          classic: ["white", "rgb(57, 92, 96)", "white", "white", "rgb(136.2, 157.2, 159.6)", "white", "rgb(27, 70, 75)", "#d7dedf", "rgba(255, 255, 255, 0.9)", "rgba(27, 70, 75, 0.75)", "rgb(227, 231.9, 232.6)", "rgba(255, 255, 255, 0.9)", "rgb(43.7, 70.5333333333, 73.6)", "white", "rgb(57, 92, 96)", "rgb(116.4, 140.9, 143.7)", "white", "rgb(136.2, 157.2, 159.6)", "rgb(27, 70, 75)", "white", "rgba(57, 92, 96, 0.45)", "rgba(27, 70, 75, 0.75)", "white", "rgba(175.0384615385, 189.1730769231, 190.7884615385, 0.615)"] },
-    Row { name: "moss", base: [133, 189, 117],
-          classic: ["white", "rgb(133, 189, 117)", "white", "white", "rgb(181.8, 215.4, 172.2)", "white", "rgb(82, 138, 66)", "#e7f2e3", "rgba(255, 255, 255, 0.9)", "rgba(82, 138, 66, 0.75)", "rgb(238.2, 245.9, 235.4)", "rgba(255, 255, 255, 0.9)", "rgb(111.65, 177.45, 92.85)", "white", "rgb(133, 189, 117)", "rgb(160.45, 203.85, 148.05)", "white", "rgb(181.8, 215.4, 172.2)", "rgb(82, 138, 66)", "white", "rgba(133, 189, 117, 0.45)", "rgba(82, 138, 66, 0.75)", "white", "rgba(205.7307692308, 228.3461538462, 199.2692307692, 0.615)"] },
-    Row { name: "field", base: [163, 200, 106],
-          classic: ["white", "rgb(163, 200, 106)", "white", "white", "rgb(199.8, 222, 165.6)", "white", "rgb(112, 149, 55)", "#edf4e1", "rgba(255, 255, 255, 0.9)", "rgba(112, 149, 55, 0.75)", "rgb(242.4, 247.3, 234)", "rgba(255, 255, 255, 0.9)", "rgb(146.9, 190.375, 79.925)", "white", "rgb(163, 200, 106)", "rgb(183.7, 212.375, 139.525)", "white", "rgb(199.8, 222, 165.6)", "rgb(112, 149, 55)", "white", "rgba(163, 200, 106, 0.45)", "rgba(112, 149, 55, 0.75)", "white", "rgba(217.8461538462, 232.7884615385, 194.8269230769, 0.615)"] },
-    Row { name: "violet", base: [143, 112, 194],
-          classic: ["white", "rgb(143, 112, 194)", "white", "white", "rgb(187.8, 169.2, 218.4)", "white", "rgb(92, 61, 143)", "#e9e2f3", "rgba(255, 255, 255, 0.9)", "rgba(92, 61, 143, 0.75)", "rgb(239.6, 234.7, 246.6)", "rgba(255, 255, 255, 0.9)", "rgb(123.4, 86.975, 183.325)", "white", "rgb(143, 112, 194)", "rgb(168.2, 144.175, 207.725)", "white", "rgb(187.8, 169.2, 218.4)", "rgb(92, 61, 143)", "white", "rgba(143, 112, 194, 0.45)", "rgba(92, 61, 143, 0.75)", "white", "rgba(209.7692307692, 197.25, 230.3653846154, 0.615)"] },
-    Row { name: "orchid", base: [184, 117, 189],
-          classic: ["white", "rgb(184, 117, 189)", "white", "white", "rgb(212.4, 172.2, 215.4)", "white", "rgb(133, 66, 138)", "#f1e3f2", "rgba(255, 255, 255, 0.9)", "rgba(133, 66, 138, 0.75)", "rgb(245.2, 235.4, 245.9)", "rgba(255, 255, 255, 0.9)", "rgb(171.575, 92.85, 177.45)", "white", "rgb(184, 117, 189)", "rgb(199.975, 148.05, 203.85)", "white", "rgb(212.4, 172.2, 215.4)", "rgb(133, 66, 138)", "white", "rgba(184, 117, 189, 0.45)", "rgba(133, 66, 138, 0.75)", "white", "rgba(226.3269230769, 199.2692307692, 228.3461538462, 0.615)"] },
+    Row { name: "blue",     base: [115, 182, 219] },
+    Row { name: "green",    base: [138, 214, 172] },
+    Row { name: "orange",   base: [224, 159, 129] },
+    Row { name: "pink",     base: [236, 155, 184] },
+    Row { name: "red",      base: [227, 148, 148] },
+    Row { name: "ochre",    base: [208, 162, 71] },
+    Row { name: "yellow",   base: [228, 196, 80] },
+    Row { name: "lime",     base: [186, 210, 115] },
+    Row { name: "cobalt",   base: [141, 162, 216] },
+    Row { name: "magenta",  base: [213, 161, 215] },
+    Row { name: "steel",    base: [144, 158, 162] },
+    Row { name: "navy",     base: [111, 140, 195] },
+    Row { name: "slate",    base: [143, 150, 163] },
+    Row { name: "pewter",   base: [155, 153, 151] },
+    Row { name: "charcoal", base: [96, 104, 108] },
+    Row { name: "blush",    base: [194, 112, 119] },
+    Row { name: "cinnamon", base: [204, 136, 102] },
+    Row { name: "sienna",   base: [216, 156, 90] },
+    Row { name: "olive",    base: [204, 182, 102] },
+    Row { name: "forest",   base: [122, 184, 129] },
+    Row { name: "storm",    base: [57, 92, 96] },
+    Row { name: "moss",     base: [133, 189, 117] },
+    Row { name: "field",    base: [163, 200, 106] },
+    Row { name: "violet",   base: [143, 112, 194] },
+    Row { name: "orchid",   base: [184, 117, 189] },
 ];
 
-static COLOURS: [[[Color32; 3]; 8]; 25] = parse();
 static CLASSIC_COLOURS: [[[[Color32; 3]; 14]; 2]; 25] = parse_classic();
 static NAMES: [&str; 25] = names();
 static BASES: [[u8; 3]; 25] = bases();
@@ -398,22 +370,6 @@ const fn parse_classic() -> [[[[Color32; 3]; 14]; 2]; 25] {
     out
 }
 
-/// Each row's colours, three to a palette.
-const fn parse() -> [[[Color32; 3]; 8]; 25] {
-    let mut out = [[[Color32::TRANSPARENT; 3]; 8]; 25];
-    let mut row = 0;
-    while row < ROWS.len() {
-        let values = &ROWS[row].classic;
-        let mut at = 0;
-        while at < values.len() {
-            out[row][at / 3][at % 3] = css_color(values[at]);
-            at += 1;
-        }
-        row += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,18 +398,65 @@ mod tests {
     }
 
     #[test]
-    fn classic_blocks_keep_the_tokens_but_where_classic_differs() {
-        // Snow's plain states are the tokens'. A preview's border is its text colour.
+    fn swatch_matches_base_for_every_color_and_theme() {
         for color in CalendarColor::all() {
-            let tokens = COLOURS[color.0];
-            for (index, classic) in CLASSIC_COLOURS[color.0][0].iter().take(8).enumerate() {
-                let expected = if index == 2 || index == 3 {
-                    [tokens[index][0], tokens[index][1], tokens[index][0]]
-                } else {
-                    tokens[index]
-                };
-                assert_eq!(*classic, expected, "{} snow state {index}", color.name());
-            }
+            assert_eq!(color.swatch(Theme::Snow), color.base(), "{}", color.name());
+            assert_eq!(
+                color.swatch(Theme::Carbon),
+                color.base(),
+                "{}",
+                color.name()
+            );
+        }
+    }
+
+    #[test]
+    fn classic_blocks_keep_the_tokens_but_where_classic_differs() {
+        // Snow's accepted fill matches the base token; preview borders match their text colour.
+        for color in CalendarColor::all() {
+            let snow = CLASSIC_COLOURS[color.0][0];
+            assert_eq!(
+                snow[0][0],
+                Color32::WHITE,
+                "{} snow filled text",
+                color.name()
+            );
+            assert_eq!(
+                snow[0][1],
+                color.base(),
+                "{} snow filled fill",
+                color.name()
+            );
+            assert_eq!(
+                snow[0][2],
+                Color32::WHITE,
+                "{} snow filled border",
+                color.name()
+            );
+            assert_eq!(
+                snow[2][2],
+                snow[2][0],
+                "{} snow preview border",
+                color.name()
+            );
+            assert_eq!(
+                snow[3][2],
+                snow[3][0],
+                "{} snow past preview border",
+                color.name()
+            );
+            assert_eq!(
+                snow[4][1],
+                Color32::WHITE,
+                "{} snow outlined fill",
+                color.name()
+            );
+            assert_eq!(
+                snow[4][2],
+                color.base(),
+                "{} snow outlined border",
+                color.name()
+            );
         }
         // Carbon's filled blue is darker than the token (`rgb(99.8, 153.8, 184.2)`).
         assert_eq!(

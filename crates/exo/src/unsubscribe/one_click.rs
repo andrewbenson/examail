@@ -8,12 +8,15 @@
 //! RFC 8058 asks of it. A failed POST shows nothing. A failure that retrying could fix is retried
 //! for a week, and any other is logged and dropped.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use exo_store::Store;
 use jiff::{SignedDuration, Timestamp};
-use url::{Host, Url};
+use url::Url;
+
+use crate::remote_content::{self, Scope};
 
 /// What RFC 8058 posts.
 const BODY: &str = "List-Unsubscribe=One-Click";
@@ -25,111 +28,50 @@ const MAX_BACKOFF: SignedDuration = SignedDuration::from_mins(5);
 /// How long an unsubscribe keeps being retried.
 const GIVE_UP: SignedDuration = SignedDuration::from_hours(7 * 24);
 
+static PUBLIC_CLIENT: LazyLock<remote_content::Client> =
+    LazyLock::new(|| remote_content::Client::no_redirects(TIMEOUT, Scope::Public, true));
+static LOOPBACK_CLIENT: LazyLock<remote_content::Client> =
+    LazyLock::new(|| remote_content::Client::no_redirects(TIMEOUT, Scope::LoopbackOnly, false));
+
 /// Which addresses an account's one-click unsubscribes may reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
     /// The public internet, over HTTPS (RFC 8058's rule). Never this machine or a private
     /// network, which a crafted link could otherwise make Exo post to.
     Public,
-    /// This machine only, over HTTP too. It's for an account on gmail-mock, whose mail points at
+    /// This machine only, over HTTP too. It's for an account on mock-servers, whose mail points at
     /// local test servers, never at the internet.
     Loopback,
 }
 
 impl Reach {
     /// The reach of an account whose Gmail is at `endpoints`: [`Reach::Loopback`] on this
-    /// machine (gmail-mock), [`Reach::Public`] anywhere else.
+    /// machine (mock-servers), [`Reach::Public`] anywhere else.
     pub fn of(endpoints: &gmail::Endpoints) -> Self {
-        let local = match endpoints.gmail.host() {
-            Some(Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(Host::Ipv6(ip)) => ip.is_loopback(),
-            Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-            None => false,
-        };
-        if local { Self::Loopback } else { Self::Public }
+        if remote_content::serves_gmail_locally(endpoints) {
+            Self::Loopback
+        } else {
+            Self::Public
+        }
+    }
+
+    fn scope(self) -> Scope {
+        match self {
+            Self::Public => Scope::Public,
+            Self::Loopback => Scope::LoopbackOnly,
+        }
     }
 
     /// Whether a POST may connect to `ip`.
     pub fn allows(self, ip: IpAddr) -> bool {
-        match self {
-            Self::Public => is_public(ip),
-            Self::Loopback => ip.to_canonical().is_loopback(),
-        }
+        self.scope().allows(ip)
     }
 
     /// Whether `url` may be posted to, as far as can be told before resolving its host: its
     /// scheme, no credentials, and an address literal this reach allows.
     pub fn permits(self, url: &Url) -> bool {
-        let scheme = match self {
-            Self::Public => url.scheme() == "https",
-            Self::Loopback => matches!(url.scheme(), "http" | "https"),
-        };
-        let host = match url.host() {
-            Some(Host::Ipv4(ip)) => self.allows(ip.into()),
-            Some(Host::Ipv6(ip)) => self.allows(ip.into()),
-            Some(Host::Domain(_)) => true,
-            None => false,
-        };
-        scheme && host && url.username().is_empty() && url.password().is_none()
+        remote_content::permits(url, self.scope(), self == Self::Public)
     }
-}
-
-/// An address on the public internet: not this machine, a private or link-local network,
-/// shared (CGNAT), multicast, reserved or documentation space, nor an IPv6 address standing
-/// for one of those.
-fn is_public(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(ip) => is_public_v4(ip),
-        IpAddr::V6(ip) => is_public_v6(ip),
-    }
-}
-
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    let special = a == 0
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        // 100.64.0.0/10, shared address space.
-        || (a == 100 && b & 0xc0 == 64)
-        // 192.0.0.0/24, protocol assignments.
-        || (a == 192 && b == 0 && c == 0)
-        // 198.18.0.0/15, benchmarking.
-        || (a == 198 && b & 0xfe == 18)
-        // 240.0.0.0/4, reserved.
-        || a >= 240;
-    !special
-}
-
-fn is_public_v6(ip: Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    let embedded = |high: u16, low: u16| {
-        Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8)
-    };
-    // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) reach the IPv4 address inside them.
-    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        return is_public_v4(embedded(segments[6], segments[7]));
-    }
-    if segments[0] == 0x2002 {
-        return is_public_v4(embedded(segments[1], segments[2]));
-    }
-    let special = ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        // ::/96, the deprecated IPv4-compatible addresses.
-        || segments[..6] == [0; 6]
-        // fc00::/7, unique local.
-        || segments[0] & 0xfe00 == 0xfc00
-        // fe80::/10 link-local, fec0::/10 the old site-local.
-        || segments[0] & 0xffc0 == 0xfe80
-        || segments[0] & 0xffc0 == 0xfec0
-        // 2001:db8::/32, documentation; 100::/64, discard.
-        || segments[..2] == [0x2001, 0x0db8]
-        || segments[..4] == [0x100, 0, 0, 0];
-    !special
 }
 
 /// How a POST went.
@@ -148,43 +90,11 @@ pub async fn post(url: &Url, reach: Reach) -> Outcome {
     if !reach.permits(url) {
         return Outcome::Refused("not a link Examail posts to".into());
     }
-    let mut client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        // A proxy would resolve the name itself, past the address check.
-        .no_proxy()
-        .timeout(TIMEOUT)
-        .https_only(reach == Reach::Public);
-    if let Some(Host::Domain(domain)) = url.host() {
-        let port = url.port_or_known_default().unwrap_or(443);
-        let resolved: Vec<SocketAddr> = match tokio::net::lookup_host((domain, port)).await {
-            Ok(resolved) => resolved.collect(),
-            Err(error) => return Outcome::Retry(format!("resolving {domain}: {error}")),
-        };
-        let allowed: Vec<SocketAddr> = resolved
-            .iter()
-            .copied()
-            .filter(|address| reach.allows(address.ip()))
-            .collect();
-        if allowed.is_empty() {
-            return Outcome::Refused(format!(
-                "{domain} resolves to {resolved:?}, which Examail doesn't post to"
-            ));
-        }
-        // Connect to the addresses checked, not to a second lookup's.
-        client = client.resolve_to_addrs(domain, &allowed);
-    }
-    let client = match client.build() {
-        Ok(client) => client,
-        Err(error) => return Outcome::Retry(format!("no HTTP client: {error}")),
+    let client = match reach {
+        Reach::Public => &*PUBLIC_CLIENT,
+        Reach::Loopback => &*LOOPBACK_CLIENT,
     };
-    let request = client
-        .post(url.clone())
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(BODY);
-    match request.send().await {
+    match client.post_form(url, BODY).await {
         Ok(response) => {
             let status = response.status();
             if status.is_success() || status.is_redirection() {
@@ -195,6 +105,7 @@ pub async fn post(url: &Url, reach: Reach) -> Outcome {
                 Outcome::Refused(format!("HTTP {status}"))
             }
         }
+        Err(error) if error.is_refused() => Outcome::Refused(error.to_string()),
         Err(error) => Outcome::Retry(error.to_string()),
     }
 }
@@ -335,7 +246,7 @@ mod tests {
     }
 
     /// What the mock's one-click endpoint took.
-    async fn taken(server: &gmail_mock::MockServer) -> Vec<serde_json::Value> {
+    async fn taken(server: &mock_servers::MockServer) -> Vec<serde_json::Value> {
         let url = server.url().join("__mock/unsubscribes").expect("a URL");
         reqwest::get(url)
             .await
@@ -347,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_answer_says_whether_it_went() {
-        let server = gmail_mock::MockServer::start(gmail_mock::Config::default())
+        let server = mock_servers::MockServer::start(mock_servers::Config::default())
             .await
             .expect("the mock starts");
         let link = |query: &str| {
@@ -389,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_queue_keeps_what_can_be_retried_until_it_goes() {
-        let server = gmail_mock::MockServer::start(gmail_mock::Config::default())
+        let server = mock_servers::MockServer::start(mock_servers::Config::default())
             .await
             .expect("the mock starts");
         let dir = std::env::temp_dir().join(format!("exo-one-click-queue-{}", std::process::id()));
@@ -397,7 +308,7 @@ mod tests {
             &dir,
             "maya@brightmoor.co",
             server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
         )
         .await
         .expect("the store opens");

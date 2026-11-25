@@ -317,6 +317,42 @@ fn a_clicked_menu_item_sends_its_keystroke_to_what_has_the_keyboard() {
     assert!(app.harness.ctx.input(|input| input.modifiers.command));
     hand_over(&mut app);
     assert!(!app.harness.ctx.input(|input| input.modifiers.command));
+
+    // Edit ▸ Copy in an open message copies the selected text.
+    app.key(Key::Escape);
+    app.key(Key::Enter);
+    let line = (140..400)
+        .step_by(4)
+        .map(|y| egui::pos2(260.0, y as f32))
+        .find(|at| app.hover(*at) == egui::CursorIcon::Text)
+        .expect("the body's first line")
+        + egui::vec2(0.0, 4.0);
+    app.drag(line, egui::pos2(700.0, line.y));
+    launcher.keystroke(exo::desktop::menu::Keystroke::Copy);
+    let ctx = app.harness.ctx.clone();
+    let mut raw = std::mem::take(app.harness.input_mut());
+    eframe::App::raw_input_hook(app.harness.state_mut(), &ctx, &mut raw);
+    *app.harness.input_mut() = raw;
+    let mut copied = None;
+    for _ in 0..200 {
+        app.harness.run_steps(1);
+        copied = copied.or_else(|| {
+            app.harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+        });
+        if copied.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(copied.is_some_and(|text| !text.is_empty()));
 }
 
 #[test]

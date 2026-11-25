@@ -910,12 +910,27 @@ fn is_invite(row: &AttachmentRow) -> bool {
 /// The files attached to `messages`, oldest message first. A later file replaces an earlier one
 /// with the same name, in the earlier one's place. `rows` holds at least their attachment rows.
 fn attached_files(messages: &[&ViewMessage], rows: &[AttachmentRow]) -> Vec<Attachment> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut by_message: HashMap<&str, Vec<&AttachmentRow>> = HashMap::new();
+    for row in rows {
+        if !row.inline && !is_invite(row) {
+            by_message
+                .entry(row.message_id.as_str())
+                .or_default()
+                .push(row);
+        }
+    }
+    if by_message.is_empty() {
+        return Vec::new();
+    }
     let mut files: Vec<Attachment> = Vec::new();
     for message in messages {
-        for row in rows
-            .iter()
-            .filter(|row| row.message_id == message.row.id && !row.inline && !is_invite(row))
-        {
+        let Some(attached) = by_message.get(message.row.id.as_str()) else {
+            continue;
+        };
+        for row in attached {
             let file = Attachment {
                 message_id: row.message_id.clone(),
                 attachment_id: row.attachment_id.clone(),
@@ -941,12 +956,19 @@ fn attached_files(messages: &[&ViewMessage], rows: &[AttachmentRow]) -> Vec<Atta
 /// What a row's attachment icon shows for `messages`. Files win over an invite. `rows` holds at
 /// least their attachment rows.
 fn attachments_of(messages: &[&ViewMessage], rows: &[AttachmentRow]) -> Attachments {
-    let mine = |row: &&AttachmentRow| messages.iter().any(|m| m.row.id == row.message_id);
-    if rows
-        .iter()
-        .filter(mine)
-        .any(|row| !row.inline && !is_invite(row))
-    {
+    let has_file = if rows.is_empty() {
+        false
+    } else if messages.len() > 8 {
+        let ids: std::collections::HashSet<&str> =
+            messages.iter().map(|m| m.row.id.as_str()).collect();
+        rows.iter()
+            .any(|row| !row.inline && !is_invite(row) && ids.contains(row.message_id.as_str()))
+    } else {
+        rows.iter().any(|row| {
+            !row.inline && !is_invite(row) && messages.iter().any(|m| m.row.id == row.message_id)
+        })
+    };
+    if has_file {
         Attachments::Files
     } else if messages.iter().any(|m| m.row.has_attachments) {
         // `has_attachments` is set for files and invites alike, and there are no files.

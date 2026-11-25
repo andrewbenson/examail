@@ -13,6 +13,8 @@ enum Action {
     ScanStop,
     Snippet,
     Emoji,
+    Copy,
+    Cut,
 }
 
 struct App {
@@ -281,4 +283,69 @@ fn a_handled_key_never_reaches_a_focused_text_field() {
     }
     assert_eq!(harness.state().ran, [Action::Snippet, Action::Emoji]);
     assert_eq!(harness.state().text, "ab", "`;` and `:` don't type");
+}
+
+/// egui-winit turns ⌘C and ⌘X into `Event::Copy` and `Event::Cut` and drops the key press. Live
+/// `mod+c` and `mod+x` commands take them; elsewhere they reach a focused text field.
+#[test]
+fn copy_and_cut_events_run_mod_c_and_mod_x_commands_or_reach_text_fields() {
+    struct Screen {
+        commands: Commands<Action>,
+        region: Region,
+        text: String,
+        ran: Vec<Action>,
+    }
+    let mut harness = Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_os(egui::os::OperatingSystem::Mac)
+        .build_ui_state(
+            |ui, screen: &mut Screen| {
+                let ran = screen.commands.dispatch(ui.ctx());
+                screen.ran.extend(ran);
+                let response = ui.text_edit_singleline(&mut screen.text);
+                if screen.region == Region::ComposeForm {
+                    response.request_focus();
+                }
+                screen.commands.set_region(screen.region);
+                screen.commands.add(
+                    Command::shortcut("COPY", Action::Copy)
+                        .key("mod+c")
+                        .regions(&[Region::ThreadMessages]),
+                );
+                screen.commands.add(
+                    Command::shortcut("CUT", Action::Cut)
+                        .key("mod+x")
+                        .regions(&[Region::RecipientList]),
+                );
+                let area = Rect::from_min_max(Pos2::new(0.0, 41.0), Pos2::new(1280.0, 800.0));
+                let ran = screen.commands.show(ui.ctx(), area);
+                screen.ran.extend(ran);
+            },
+            Screen {
+                commands: Commands::new(),
+                region: Region::ThreadMessages,
+                text: "hello".into(),
+                ran: Vec::new(),
+            },
+        );
+    harness.run_steps(2);
+    harness.input_mut().events.push(Event::Copy);
+    harness.run_steps(1);
+    assert_eq!(harness.state().ran, [Action::Copy]);
+
+    harness.state_mut().region = Region::RecipientList;
+    harness.run_steps(1);
+    harness.input_mut().events.push(Event::Cut);
+    harness.run_steps(1);
+    assert_eq!(harness.state().ran, [Action::Copy, Action::Cut]);
+
+    // In compose, neither command is live, so `Event::Cut` reaches the text field.
+    harness.state_mut().region = Region::ComposeForm;
+    harness.run_steps(1);
+    harness.key_press_modifiers(CMD, Key::A);
+    harness.run_steps(1);
+    harness.input_mut().events.push(Event::Cut);
+    harness.run_steps(1);
+    assert_eq!(harness.state().ran, [Action::Copy, Action::Cut]);
+    assert_eq!(harness.state().text, "");
 }

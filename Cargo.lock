@@ -792,15 +792,6 @@ dependencies = [
 
 [[package]]
 name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec 0.8.0",
-]
-
-[[package]]
-name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
@@ -817,12 +808,6 @@ dependencies = [
  "bit-vec 0.10.2",
  "serde",
 ]
-
-[[package]]
-name = "bit-vec"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bit-vec"
@@ -870,7 +855,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -879,7 +864,7 @@ dependencies = [
  "color",
  "cssparser",
  "cursor-icon",
- "debug_timer 0.1.3 (git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations)",
+ "debug_timer 0.1.3 (git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3)",
  "euclid",
  "html-escape",
  "icu_locale_core",
@@ -917,7 +902,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -928,7 +913,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -948,7 +933,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.2",
@@ -959,15 +944,6 @@ dependencies = [
  "serde",
  "smol_str 0.3.7",
  "url",
-]
-
-[[package]]
-name = "block-buffer"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-dependencies = [
- "generic-array",
 ]
 
 [[package]]
@@ -1739,7 +1715,7 @@ checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 
 [[package]]
 name = "der"
@@ -1821,21 +1797,11 @@ dependencies = [
 
 [[package]]
 name = "digest"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
-dependencies = [
- "block-buffer 0.10.4",
- "crypto-common 0.1.7",
-]
-
-[[package]]
-name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
- "block-buffer 0.12.1",
+ "block-buffer",
  "const-oid 0.10.3",
  "crypto-common 0.2.2",
  "ctutils",
@@ -2289,7 +2255,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -2329,15 +2295,13 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "gmail",
- "gmail-mock",
- "html5ever",
  "icu_segmenter",
  "image",
  "jiff",
  "libc",
  "log",
  "mail-parser",
- "markup5ever_rcdom",
+ "mock-servers",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -2351,19 +2315,19 @@ dependencies = [
  "regex",
  "reqwest",
  "resvg",
- "ring",
  "rusqlite",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "thiserror 2.0.21",
  "toasty",
  "tokio",
  "unicode-normalization",
  "url",
  "winit",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2373,9 +2337,9 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "gmail",
- "gmail-mock",
  "jiff",
  "log",
+ "mock-servers",
  "reqwest",
  "security-framework",
  "serde",
@@ -2410,11 +2374,10 @@ dependencies = [
  "exo-mail",
  "exo-ui",
  "getrandom 0.3.4",
- "html5ever",
+ "icu_segmenter",
  "image",
  "jiff",
  "log",
- "markup5ever_rcdom",
  "regex",
  "url",
 ]
@@ -2437,12 +2400,10 @@ dependencies = [
  "blitz-traits",
  "clap",
  "exo-fonts",
- "fancy-regex",
  "gif",
  "gmail",
  "html5ever",
  "image",
- "log",
  "markup5ever_rcdom",
  "parley",
  "peniko",
@@ -2458,14 +2419,13 @@ dependencies = [
 name = "exo-store"
 version = "0.3.7"
 dependencies = [
- "anyhow",
  "futures",
  "getrandom 0.3.4",
  "gmail",
- "gmail-mock",
  "jiff",
  "libc",
  "log",
+ "mock-servers",
  "regex",
  "reqwest",
  "rusqlite",
@@ -2511,17 +2471,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "fancy-regex"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
-dependencies = [
- "bit-set 0.8.0",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "fastbloom"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2535,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "fastframe-autostart"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "fastframe-file",
  "log",
@@ -2549,7 +2498,7 @@ dependencies = [
 [[package]]
 name = "fastframe-desktop"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "log",
  "mac-usernotifications",
@@ -2559,7 +2508,7 @@ dependencies = [
 [[package]]
 name = "fastframe-dirs"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "directories",
 ]
@@ -2567,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "fastframe-emoji"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "egui",
  "fastframe-fonts",
@@ -2585,7 +2534,7 @@ dependencies = [
 [[package]]
 name = "fastframe-file"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "log",
  "windows-sys 0.60.2",
@@ -2594,7 +2543,7 @@ dependencies = [
 [[package]]
 name = "fastframe-fonts"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "directories",
  "egui",
@@ -2607,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "fastframe-graphics"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "eframe",
  "log",
@@ -2620,7 +2569,7 @@ dependencies = [
 [[package]]
 name = "fastframe-icons"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "egui",
 ]
@@ -2628,7 +2577,7 @@ dependencies = [
 [[package]]
 name = "fastframe-instance"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "directories",
  "getrandom 0.4.3",
@@ -2638,7 +2587,7 @@ dependencies = [
 [[package]]
 name = "fastframe-log"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "env_logger",
  "jiff",
@@ -2648,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "fastframe-notifications"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "block2 0.6.2",
  "directories",
@@ -2660,7 +2609,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-user-notifications 0.3.2",
  "png 0.18.1",
- "sha2 0.11.1",
+ "sha2",
  "tokio",
  "url",
  "windows",
@@ -2671,7 +2620,7 @@ dependencies = [
 [[package]]
 name = "fastframe-shell"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "eframe",
  "egui",
@@ -2687,7 +2636,7 @@ dependencies = [
 [[package]]
 name = "fastframe-titlebar"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "directories",
  "eframe",
@@ -2703,7 +2652,7 @@ dependencies = [
 [[package]]
 name = "fastframe-update"
 version = "0.17.0"
-source = "git+https://github.com/m1guelpf-forks/fastframe?branch=notification-subtitle#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
+source = "git+https://github.com/m1guelpf-forks/fastframe?rev=41dc12f6567a2ca99ce6b3f30e3b4668cc087664#41dc12f6567a2ca99ce6b3f30e3b4668cc087664"
 dependencies = [
  "anyhow",
  "fastframe-dirs",
@@ -2711,7 +2660,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2",
  "url",
  "windows-sys 0.60.2",
 ]
@@ -3275,33 +3224,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha2 0.10.9",
+ "sha2",
  "thiserror 2.0.21",
- "url",
-]
-
-[[package]]
-name = "gmail-mock"
-version = "0.3.7"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "clap",
- "env_logger",
- "gmail",
- "jiff",
- "log",
- "mail-parser",
- "reqwest",
- "serde",
- "serde_ignored",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
- "tokio",
- "tower",
- "tower-http",
  "url",
 ]
 
@@ -3466,7 +3390,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
- "digest 0.11.3",
+ "digest",
 ]
 
 [[package]]
@@ -4437,7 +4361,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
  "cfg-if",
- "digest 0.11.3",
+ "digest",
 ]
 
 [[package]]
@@ -4537,6 +4461,32 @@ dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mock-servers"
+version = "0.3.7"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "env_logger",
+ "futures",
+ "gmail",
+ "jiff",
+ "log",
+ "mail-parser",
+ "reqwest",
+ "roxmltree 0.21.2",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "tower-http",
+ "url",
 ]
 
 [[package]]
@@ -5652,7 +5602,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand 0.10.4",
- "sha2 0.11.1",
+ "sha2",
  "stringprep",
 ]
 
@@ -6278,12 +6228,12 @@ dependencies = [
  "crypto-bigint",
  "crypto-common 0.2.2",
  "crypto-primes",
- "digest 0.11.3",
+ "digest",
  "hmac",
  "pkcs1",
  "pkcs8",
  "rand_core 0.10.1",
- "sha2 0.11.1",
+ "sha2",
  "signature",
  "spki 0.8.1",
  "zeroize",
@@ -6743,7 +6693,7 @@ checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
- "digest 0.11.3",
+ "digest",
 ]
 
 [[package]]
@@ -6754,24 +6704,13 @@ checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
- "digest 0.11.3",
+ "digest",
 ]
 
 [[package]]
@@ -6831,7 +6770,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
- "digest 0.11.3",
+ "digest",
  "rand_core 0.10.1",
 ]
 
@@ -7112,7 +7051,7 @@ dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "bytes",
- "digest 0.11.3",
+ "digest",
  "dotenvy",
  "either",
  "futures-core",
@@ -7123,7 +7062,7 @@ dependencies = [
  "rand 0.10.4",
  "rsa",
  "sha1",
- "sha2 0.11.1",
+ "sha2",
  "sqlx-core",
  "thiserror 2.0.21",
  "time",
@@ -7357,7 +7296,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/m1guelpf-forks/blitz?branch=inline-box-decorations#15530812eb934c4081eb80d71a248311921479a3"
+source = "git+https://github.com/m1guelpf-forks/blitz?rev=15530812eb934c4081eb80d71a248311921479a3#15530812eb934c4081eb80d71a248311921479a3"
 dependencies = [
  "bitflags 2.13.2",
  "stylo",
@@ -7941,7 +7880,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
 dependencies = [
  "rustls",
- "sha2 0.11.1",
+ "sha2",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",

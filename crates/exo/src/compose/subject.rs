@@ -41,7 +41,7 @@ pub(super) fn typed_trigger(ui: &Ui) -> bool {
 /// typed this frame.
 pub(super) fn update(ui: &Ui, open: &mut Open, id: Id, line: Rect, style: &TextStyle, typed: bool) {
     let ctx = ui.ctx();
-    let state = &mut open.subject_assistant;
+    let state = &mut open.popups.subject;
     if let Some(caret) = state.caret.take() {
         exo_ui::focus_field(ctx, id, CCursorRange::one(CCursor::new(caret)));
     }
@@ -72,7 +72,8 @@ pub(super) fn update(ui: &Ui, open: &mut Open, id: Id, line: Rect, style: &TextS
             TriggerKind::Snippet => state.armed,
             TriggerKind::Contact(_) => false,
         };
-        let x = exo_ui::field_x(ctx, subject, line, style, start);
+        let x = exo_ui::field_x_scrolled(ctx, id, subject, line, style, start)
+            .clamp(line.left(), line.right());
         shown.then(|| Trigger {
             kind,
             query,
@@ -89,7 +90,8 @@ pub(super) fn update(ui: &Ui, open: &mut Open, id: Id, line: Rect, style: &TextS
 pub(super) fn use_emoji(open: &mut Open) {
     let chars: Vec<char> = open.record.subject.chars().collect();
     let at = open
-        .subject_assistant
+        .popups
+        .subject
         .selection
         .map_or(chars.len(), |(_, end)| end)
         .min(chars.len());
@@ -101,7 +103,7 @@ pub(super) fn use_emoji(open: &mut Open) {
         if space_after { " " } else { "" }
     );
     splice(open, at..at, &text);
-    let state = &mut open.subject_assistant;
+    let state = &mut open.popups.subject;
     state.caret = Some(at + usize::from(space_before) + ":hello".len());
     state.dismissed = false;
 }
@@ -111,7 +113,8 @@ pub(super) fn use_emoji(open: &mut Open) {
 pub(super) fn use_snippet(open: &mut Open) {
     let chars: Vec<char> = open.record.subject.chars().collect();
     let (start, end) = open
-        .subject_assistant
+        .popups
+        .subject
         .selection
         .unwrap_or((chars.len(), chars.len()));
     let (start, end) = (start.min(chars.len()), end.min(chars.len()));
@@ -121,7 +124,7 @@ pub(super) fn use_snippet(open: &mut Open) {
         " ;"
     };
     splice(open, start..end, text);
-    let state = &mut open.subject_assistant;
+    let state = &mut open.popups.subject;
     state.caret = Some(start + text.chars().count());
     state.armed = true;
     state.dismissed = false;
@@ -143,7 +146,7 @@ pub(super) fn replace(open: &mut Open, trigger: &Trigger, text: &str) {
     let len = open.record.subject.chars().count();
     let (start, end) = (trigger.start.offset.min(len), trigger.end.offset.min(len));
     splice(open, start..end, text);
-    let state = &mut open.subject_assistant;
+    let state = &mut open.popups.subject;
     state.caret = Some(start + text.chars().count());
     state.armed = false;
     state.trigger = None;
@@ -151,6 +154,82 @@ pub(super) fn replace(open: &mut Open, trigger: &Trigger, text: &str) {
 
 /// Escape on the subject's dropdown closes the dropdown and keeps the text.
 pub(super) fn dismiss(open: &mut Open) {
-    open.subject_assistant.dismissed = true;
-    open.subject_assistant.trigger = None;
+    open.popups.subject.dismissed = true;
+    open.popups.subject.trigger = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Color32, Id, RawInput, Rect, pos2, vec2};
+    use exo_store::{DraftAction, DraftRecord};
+    use exo_ui::{Family, Font, TextStyle};
+
+    use super::*;
+
+    #[test]
+    fn trigger_anchor_accounts_for_horizontal_scroll_and_clamps_to_line() {
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("fonts");
+        let style = TextStyle::new(Font::new(Family::Sans, 700), 14.0, 20.0);
+        let line = Rect::from_min_size(pos2(20.0, 20.0), vec2(120.0, 20.0));
+        let id = Id::new("scrolled-subject");
+        let mut subject = format!("{} :smile", "long subject prefix ".repeat(8));
+        let caret = subject.chars().count();
+        let trigger_start = subject.rfind(':').expect("trigger");
+
+        let record = DraftRecord {
+            action: DraftAction::Compose,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: subject.clone(),
+            body: String::new(),
+            quoted_content: None,
+            quoted_inlined: false,
+            in_reply_to: None,
+            in_reply_to_rfc822: None,
+            references: Vec::new(),
+            rfc822_id: "x@y".into(),
+            fingerprint: String::new(),
+            attachments: Vec::new(),
+            send_later: None,
+            reminder: None,
+        };
+        let mut open = Open::new("draft".into(), None, record);
+        exo_ui::focus_field(&ctx, id, CCursorRange::one(CCursor::new(caret)));
+
+        let mut scrolled_offset = 0.0;
+        for _ in 0..3 {
+            ctx.run_ui(RawInput::default(), |ui| {
+                let _ = exo_ui::text_field(
+                    ui,
+                    id,
+                    &mut subject,
+                    line,
+                    &style,
+                    Color32::BLACK,
+                    Color32::LIGHT_BLUE,
+                );
+                open.record.subject.clone_from(&subject);
+                scrolled_offset = exo_ui::field_scroll_offset(ui.ctx(), id);
+                update(ui, &mut open, id, line, &style, false);
+            })
+            .drop_without_applying_deltas();
+        }
+
+        assert!(scrolled_offset > 0.0, "long subject scrolled horizontally");
+        let trigger = open.popups.subject.trigger.expect("emoji trigger found");
+        let unscrolled_x = exo_ui::field_x(&ctx, &subject, line, &style, trigger_start);
+        assert!(
+            unscrolled_x > line.right(),
+            "unscrolled trigger would have overflowed past line.right()"
+        );
+        assert!(
+            trigger.anchor.left() >= line.left() && trigger.anchor.left() <= line.right(),
+            "scrolled anchor {} stays clamped within {:?}",
+            trigger.anchor.left(),
+            line.x_range()
+        );
+    }
 }

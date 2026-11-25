@@ -1,14 +1,14 @@
 //! The app's side of attachments: what the fetches report each frame, the file notifications,
 //! the open thread's cards (progress, thumbnails, `Download all`) and the viewer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use egui::{Context, Rect};
 use exo_store::{Attachment, DraftAttachment, MessageDetail};
 
 use super::notifications::{Click, STEP};
 use super::viewer::{Action as ViewerAction, Output as ViewerOutput, Viewer};
-use super::{AttachmentFiles, Event, Failure, Key, Part, Target, Thumbnail, Update};
+use super::{AttachmentFiles, Failure, Key, Part, Target};
 use crate::account::Loader;
 use crate::thread::ThreadView;
 
@@ -32,17 +32,17 @@ impl AttachmentFiles {
         let files = thread.files_mut();
         files.set_progress(progress);
         files.set_zipping(&self.zipping);
-        while let Ok((key, image)) = self.thumbnails.1.try_recv() {
-            files.set_thumbnail(&self.ctx, key, image);
-        }
         for attachment in thread.thumbnail_requests() {
             let key = (attachment.message_id.clone(), attachment.part_id.clone());
-            self.fetch_thumbnail(
-                loader,
-                Part::Gmail(attachment),
-                key,
-                self.thumbnails.0.clone(),
-            );
+            let ui = self.ui.clone();
+            self.fetch_thumbnail(loader, Part::Gmail(attachment), move |image| {
+                ui.send(move |mail| {
+                    let ctx = mail.attachment_files.ctx.clone();
+                    if let Some(thread) = &mut mail.thread {
+                        thread.files_mut().set_thumbnail(&ctx, key, image);
+                    }
+                });
+            });
         }
     }
 
@@ -59,9 +59,7 @@ impl AttachmentFiles {
         folder: &Path,
     ) {
         files.set_zipping(&self.zipping);
-        while let Ok((key, image)) = self.snippet_thumbnails.1.try_recv() {
-            files.set_thumbnail(&self.ctx, key, image);
-        }
+        self.snippet_thumbnails.drain(files);
         for attachment in files.thumbnail_requests([message]) {
             let key = (attachment.message_id.clone(), attachment.part_id.clone());
             match snippet_files
@@ -70,28 +68,27 @@ impl AttachmentFiles {
                 .and_then(|file| Part::of_draft(file, folder))
             {
                 Some(part) => {
-                    self.fetch_thumbnail(loader, part, key, self.snippet_thumbnails.0.clone())
+                    let ctx = self.ctx.clone();
+                    let ui = self.snippet_thumbnails.sender(&ctx);
+                    self.fetch_thumbnail(loader, part, move |image| {
+                        ui.send(move |files| files.set_thumbnail(&ctx, key, image));
+                    });
                 }
                 None => files.set_thumbnail(&self.ctx, key, None),
             }
         }
     }
 
-    /// Fetches `part` and sends its thumbnail, keyed by `key`, to `sender`.
+    /// Fetches `part` and hands its decoded thumbnail (`None` when unreadable) to `done`.
     fn fetch_thumbnail(
         &self,
         loader: &Loader,
         part: Part,
-        key: Key,
-        sender: std::sync::mpsc::Sender<Thumbnail>,
+        done: impl FnOnce(Option<egui::ColorImage>) + Send + 'static,
     ) {
-        let ctx = self.ctx.clone();
-        let pixels_per_point = ctx.pixels_per_point();
+        let pixels_per_point = self.ctx.pixels_per_point();
         let decode = move |bytes: Option<Vec<u8>>| {
-            let image =
-                bytes.and_then(|bytes| super::thumbnails::thumbnail(&bytes, pixels_per_point));
-            let _ = sender.send((key, image));
-            ctx.request_repaint();
+            done(bytes.and_then(|bytes| super::thumbnails::thumbnail(&bytes, pixels_per_point)));
         };
         // Decoding a photo takes a while, so it gets its own thread and leaves the account's
         // tasks free.
@@ -171,7 +168,7 @@ impl AttachmentFiles {
             return;
         };
         self.zipping.insert(id.to_owned());
-        let (sender, ctx, id) = (self.updates.0.clone(), self.ctx.clone(), id.to_owned());
+        let (ui, id) = (self.ui.clone(), id.to_owned());
         loader.run(
             move |store| async move {
                 let mut fetched = Vec::with_capacity(files.len());
@@ -210,12 +207,7 @@ impl AttachmentFiles {
                             .save(&name, &super::zip::archive(&files, &now))
                             .map_err(|error| target.failed(&error))
                     });
-                    let _ = sender.send(Update::Zipped {
-                        message: id,
-                        name,
-                        saved,
-                    });
-                    ctx.request_repaint();
+                    ui.send(move |mail| mail.finish_file_zip(id, name, saved));
                 });
             },
         );
@@ -251,16 +243,27 @@ impl crate::Mail {
         );
     }
 
-    /// Takes in this frame's news of the clicked files. A fetch that failed offline shows the
-    /// offline alert.
-    pub(crate) fn attachment_files_poll(&mut self, now: f64) {
-        for event in self.attachment_files.poll(now) {
-            let text = match event {
-                Event::Offline => OFFLINE,
-                Event::OfflineAll => OFFLINE_ALL,
-            };
-            self.pickers.inform("Sorry!", text.to_owned());
+    pub(super) fn finish_file_download(
+        &mut self,
+        key: &Key,
+        outcome: Result<(PathBuf, bool), Failure>,
+    ) {
+        let now = self.ctx.input(|input| input.time);
+        if self.attachment_files.finish(key, outcome, now) {
+            self.pickers.inform("Sorry!", OFFLINE.to_owned());
         }
+    }
+
+    fn finish_file_zip(&mut self, message: String, name: String, saved: Result<PathBuf, Failure>) {
+        let now = self.ctx.input(|input| input.time);
+        if self.attachment_files.finish_zip(message, name, saved, now) {
+            self.pickers.inform("Sorry!", OFFLINE_ALL.to_owned());
+        }
+    }
+
+    /// Expires finished file notifications and polls Quick Look.
+    pub(crate) fn attachment_files_poll(&mut self, now: f64) {
+        self.attachment_files.poll(now);
     }
 
     /// Draws the file notifications over the toast and does what a click on one asks.
@@ -293,11 +296,17 @@ impl crate::Mail {
             return;
         }
         let now = self.ctx.input(|input| input.time);
+        let images = self
+            .account
+            .settings()
+            .remote_content_blocking
+            .unwrap_or_default();
         self.attachment_files.viewer = Some(Viewer::open(
             &self.ctx,
             &self.account.loader(),
             attachments,
             start,
+            images,
             now,
         ));
     }
@@ -307,21 +316,15 @@ impl crate::Mail {
     /// downloads.
     pub(crate) fn open_result_file(&mut self, file: Attachment, preview: bool) {
         if preview && super::is_previewable(&file) {
-            let files: Vec<Attachment> = self
+            let (files, start) = match self
                 .inbox
                 .threads()
                 .iter()
                 .find(|thread| thread.files.contains(&file))
-                .map(|thread| {
-                    thread
-                        .files
-                        .iter()
-                        .filter(|other| super::is_previewable(other))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![file.clone()]);
-            let start = files.iter().position(|other| *other == file).unwrap_or(0);
+            {
+                Some(thread) => super::preview_selection(&thread.files, &file),
+                None => (vec![file], 0),
+            };
             self.preview_attachments(files, start);
         } else {
             self.attachment_files
@@ -362,10 +365,16 @@ impl crate::Mail {
 
     /// Draws the viewer over `page`, if it's open.
     pub(crate) fn show_viewer(&mut self, ctx: &Context, page: Rect, now: f64) {
+        let images = self
+            .account
+            .settings()
+            .remote_content_blocking
+            .unwrap_or_default();
         let loader = self.account.loader();
         let Some(viewer) = self.attachment_files.viewer.as_mut() else {
             return;
         };
+        viewer.set_images(images);
         let clicked = viewer.show(
             ctx,
             page,
@@ -382,9 +391,7 @@ impl crate::Mail {
             Some(ViewerOutput::Action(action)) => self.viewer_run(action, now),
             // A `mailto:` link's draft opens under the viewer, which closes to show the draft.
             Some(ViewerOutput::Link { url, .. })
-                if url
-                    .get(..7)
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:")) =>
+                if crate::page_menu::strip_mailto(&url).is_some() =>
             {
                 self.viewer_run(ViewerAction::Close, now);
                 self.compose_mailto(&url, false);

@@ -8,7 +8,7 @@
 //!        [--first-get-me-to-zero]
 //!        [--updates]
 //!
-//! The account is an in-process gmail-mock with its defaults (seed 1, now 2026-11-17 09:00 New
+//! The account is in-process mock servers with its defaults (seed 1, now 2026-11-17 09:00 New
 //! York) synced into a fresh store in a temporary directory, so every run shows the same mail.
 //! `--keys` takes steps separated by spaces, each followed by whatever the account does about it.
 //! A step is a key name (`e`, `Shift+M`, `Meta+k`, `!`, `Enter`) or one of these: `wait:800`;
@@ -22,11 +22,11 @@
 //!
 //! `--hover X,Y` puts the pointer there. `--theme` sets the account's theme (`auto` renders Snow,
 //! because an offscreen render has no system appearance). `--eml FILE` delivers that message to
-//! the top of the inbox (gmail-mock's `--eml`). `--settings FILE` starts the account with the
+//! the top of the inbox (mock-servers' `--eml`). `--settings FILE` starts the account with the
 //! settings in that JSON document (splits, `unifiedInbox`), and `--device-settings FILE` with
 //! those settings for this device (`{"localSendsCount": 6}`). `--split-library FILE` uses that
 //! split library instead of Exo's own, or none (`--split-library none`). `--fault JSON` arms a
-//! gmail-mock fault (`/__mock/faults`) once the account has synced, before the keys, such as a
+//! mock-servers fault (`/__mock/faults`) once the account has synced, before the keys, such as a
 //! send that Gmail refuses. `--vacation JSON` sets the mock's vacation responder (Gmail's
 //! `VacationSettings`) and `--calendar-event JSON` adds an event to its primary calendar, both
 //! before the account opens, for the bar and the nudge of Out of Office Reply. `--places` answers
@@ -51,9 +51,9 @@
 //! (the settings say which are signed out). `--accounts a@x.com,!b@x.com` puts more accounts on
 //! the device after the mock's account (`!` marks one that Google signed out). They sign in on the
 //! mock's mailbox, and the mock's account opens. `--photo` gives the mock's account a profile
-//! photo of its own (gmail-mock's `--photo`), and signs it in as `--accounts` does.
+//! photo of its own (mock-servers' `--photo`), and signs it in as `--accounts` does.
 //! `--contact-photos` gives the mock's saved contacts and colleagues photos of their own
-//! (gmail-mock's `--contact-photos`).
+//! (mock-servers' `--contact-photos`).
 //!
 //! `--teardown` shows the `Sorry!` alert for an account whose store can't be opened, for that
 //! reason (a corrupt or locked database, a full disk, another error), with nothing else on screen.
@@ -193,7 +193,7 @@ impl gmail::TokenProvider for Refreshing {
                         .expect_err("nothing listens"),
                 ));
             }
-            Ok(gmail_mock::DEV_ACCESS_TOKEN.to_owned())
+            Ok(mock_servers::DEV_ACCESS_TOKEN.to_owned())
         })
     }
 }
@@ -298,9 +298,9 @@ fn options() -> anyhow::Result<Options> {
             "--locale" => exo::format::locale::install(exo::format::locale::Locale::named(
                 &args.next().context(usage)?,
             )),
-            "--places" => {
-                exo::places::answer_with(places(&percent_decode(&args.next().context(usage)?)))
-            }
+            "--places" => exo::places::answer_with(places(&exo_mail::percent_decode_lossy(
+                &args.next().context(usage)?,
+            ))),
             "--keys" => {
                 options.keys = args
                     .next()
@@ -377,27 +377,6 @@ fn key_events(name: &str) -> anyhow::Result<(Key, Modifiers, Option<String>)> {
     Ok((key, modifiers, text))
 }
 
-/// `%XX` escapes decoded (a `type:` step's text can't hold spaces).
-fn percent_decode(text: &str) -> String {
-    let mut bytes = Vec::new();
-    let mut rest = text.as_bytes();
-    while let Some((&first, tail)) = rest.split_first() {
-        if first == b'%'
-            && let Some(byte) = tail
-                .get(..2)
-                .and_then(|hex| std::str::from_utf8(hex).ok())
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            bytes.push(byte);
-            rest = &tail[2..];
-            continue;
-        }
-        bytes.push(first);
-        rest = tail;
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 /// Runs frames until the account has nothing in flight. Returns how many it ran.
 fn settle(harness: &mut egui_kittest::Harness<'_, exo::App>) -> usize {
     let started = Instant::now();
@@ -415,7 +394,7 @@ fn settle(harness: &mut egui_kittest::Harness<'_, exo::App>) -> usize {
 }
 
 /// A client for the mock's OAuth endpoints, which accept any client.
-fn mock_client(server: &gmail_mock::MockServer) -> ClientConfig {
+fn mock_client(server: &mock_servers::MockServer) -> ClientConfig {
     ClientConfig::new(
         "exo-shot.apps.googleusercontent.com",
         "GOCSPX-shot",
@@ -427,7 +406,7 @@ fn mock_client(server: &gmail_mock::MockServer) -> ClientConfig {
 /// it. Its grant isn't kept, so that launch finds it signed out.
 fn sign_in_once(
     runtime: &tokio::runtime::Runtime,
-    server: &gmail_mock::MockServer,
+    server: &mock_servers::MockServer,
     state: &std::path::Path,
 ) -> anyhow::Result<()> {
     let auth = Auth::open(mock_client(server), state, MemorySecrets::default())?;
@@ -474,7 +453,7 @@ impl eframe::App for Teardown {
 /// `--teardown`: renders that screen and saves it.
 fn teardown(options: &Options, reason: exo::teardown::Reason) -> anyhow::Result<()> {
     // The mock's day, whose Inbox Zero photo is the alert's backdrop.
-    let now = gmail_mock::Config::default().now;
+    let now = mock_servers::Config::default().now;
     let mut harness = egui_kittest::Harness::builder()
         .with_size([options.width, options.height])
         .with_pixels_per_point(2.0)
@@ -507,7 +486,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(reason) = options.teardown {
         return teardown(&options, reason);
     }
-    let config = gmail_mock::Config {
+    let config = mock_servers::Config {
         extra_messages: options
             .eml
             .iter()
@@ -515,15 +494,15 @@ fn main() -> anyhow::Result<()> {
             .collect::<Result<_, _>>()?,
         photo: options.photo,
         contact_photos: options.contact_photos,
-        ..gmail_mock::Config::default()
+        ..mock_servers::Config::default()
     };
     let now = config.now.clone();
     // The mock serves from this runtime, and the account runs on its own.
     let runtime = tokio::runtime::Runtime::new()?;
-    let mut server = runtime.block_on(gmail_mock::MockServer::start(config))?;
+    let mut server = runtime.block_on(mock_servers::MockServer::start(config))?;
     let client = gmail::Client::new(
         server.endpoints(),
-        gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+        gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
     );
     let email = runtime
         .block_on(async { client.gmail().profile().await })?
@@ -578,7 +557,7 @@ fn main() -> anyhow::Result<()> {
                 &stores,
                 &credentials.email,
                 server.endpoints(),
-                gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+                gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
             )
             .await?;
             if let Some(device) = &device {
@@ -812,7 +791,7 @@ fn main() -> anyhow::Result<()> {
         }
         if let Some(url) = name.strip_prefix("link:") {
             // One of Exo's links macOS handed over, in the account on screen.
-            let link = exo::links::parse(&percent_decode(url))
+            let link = exo::links::parse(&exo_mail::percent_decode_lossy(url))
                 .context("`link:URL` needs one of Examail's links")?;
             harness
                 .state_mut()
@@ -992,7 +971,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(text) = name.strip_prefix("type:") {
             // Each character's key (when it has one) and the character it types, as
             // Playwright's `keyboard.type` does.
-            for ch in percent_decode(text).chars() {
+            for ch in exo_mail::percent_decode_lossy(text).chars() {
                 let typed = ch.to_string();
                 match key_events(&typed) {
                     Ok((key, modifiers, _)) => {

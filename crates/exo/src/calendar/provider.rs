@@ -70,10 +70,7 @@ impl ProviderPicker {
                 self.open = None;
             } else if let Some(hovered) = shown.hovered {
                 self.open = Some(hovered);
-            } else if ui.input(|input| input.pointer.any_released())
-                && !response.hovered()
-                && !ui.rect_contains_pointer(shown.rect)
-            {
+            } else if shown.outside_released(ui, response.hovered()) {
                 self.open = None;
             }
         }

@@ -42,7 +42,7 @@ pub fn ready() {
 /// It never does again, even once another app takes them back. macOS may ask to confirm.
 /// `state` is the state folder, which keeps the record (`install.json`). A bare binary (`cargo
 /// run`) never claims, since macOS hands links to bundles only. Don't call it for a run on
-/// gmail-mock.
+/// mock-servers.
 pub fn claim_on_first_run(state: &Path) {
     #[cfg(target_os = "macos")]
     let bundled = macos::is_bundled();

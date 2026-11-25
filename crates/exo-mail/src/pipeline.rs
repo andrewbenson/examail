@@ -14,8 +14,7 @@ use crate::{
 /// What the pipeline needs to know about a message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Message {
-    /// The body as HTML: the `text/html` part, or a plain-text one through [`text_to_html`]
-    /// ([`html_from_payload`] picks it).
+    /// The body as HTML: the `text/html` part, or a plain-text one through [`text_to_html`].
     pub html: String,
     /// The sender's address.
     pub from_email: String,
@@ -84,12 +83,13 @@ pub fn render_with(
         colors::carbonize(&root, classify::is_marketing(&root, &message.from_email));
     }
     classify::mark_small_pre(&root);
+    let read_status_urls = pixels::remove_read_status_pixels(&document);
     let html = dom::outer_html(&document);
     let body_attributes = body_attributes(&document);
 
     // The new part is a copy, so `html` keeps the whole message for the next reply.
-    let unquoted = dom::parse(&html);
-    let read_status_urls = pixels::remove_read_status_pixels(&unquoted);
+    let unquoted = dom::clone_node(&document);
+    dom::drop_tree(document);
     let has_remote_images = remote::has_remote_content(&unquoted);
     let from = sender(message);
     let body = MessageBody::new(&unquoted, &from, &message.rfc822_id);
@@ -116,37 +116,34 @@ pub fn render_with(
             body.content,
         )
     };
+    if let Some((_, previous_doc, _)) = previous {
+        dom::drop_tree(previous_doc);
+    }
     dom::detach_all(&quoted.nodes);
     let quoted_html: String = quoted.nodes.iter().map(dom::outer_html).collect();
     let unquoted_dates = dates::unquoted(&unquoted_body);
     let proposes_time = dates::proposes_time(&unquoted_body);
     classify::mark_flush_top(&unquoted);
 
-    let visible_text = match quoted.hidden {
-        Some(hidden) => {
-            let before = content.formatted_slice(0, hidden.start);
-            let length = content.len();
-            let after = content.formatted_slice(hidden.end, length);
-            match (before.is_empty(), after.is_empty()) {
-                (false, false) => format!("{before}\n{after}"),
-                (false, true) => before,
-                _ => after,
-            }
-        }
-        None => content.to_formatted_string(),
+    let visible_text = format_visible_text(&mut content, quoted.hidden);
+    let unquoted_html = fragment(&unquoted);
+    let unquoted_is_marketing =
+        options.classify && classify::is_marketing(&unquoted, &message.from_email);
+    let quoted_is_marketing =
+        options.classify && classify::is_marketing_nodes(&quoted.nodes, &message.from_email);
+    let has_quoted_content = !quoted.nodes.is_empty();
+    dom::drop_tree(unquoted);
+    for node in quoted.nodes {
+        dom::drop_tree(node);
     }
-    .replace('\u{a0}', " ");
-    let quoted_document = dom::parse(&quoted_html);
     Render {
         html,
-        unquoted_html: fragment(&unquoted),
-        has_quoted_content: !quoted.nodes.is_empty(),
+        unquoted_html,
+        has_quoted_content,
         quoted_html,
         body_attributes,
-        unquoted_is_marketing: options.classify
-            && classify::is_marketing(&unquoted, &message.from_email),
-        quoted_is_marketing: options.classify
-            && classify::is_marketing(&quoted_document, &message.from_email),
+        unquoted_is_marketing,
+        quoted_is_marketing,
         snippet: visible_text.chars().take(200).collect(),
         visible_text,
         read_status_urls,
@@ -161,6 +158,105 @@ pub fn render_with(
     }
 }
 
+/// Computes the visible text of `message` (for search indexing) without running `linkify`,
+/// `<wbr>` insertion, `dates::decorate`, `colors::carbonize`, `classify::is_marketing`, or
+/// HTML serializations, while producing the exact same quote/signature split as [`render`].
+pub fn visible_text(
+    message: &Message,
+    replying_to: Option<&Message>,
+    own_domains: &[String],
+) -> String {
+    let document = prepare_for_text(message);
+    let previous = replying_to.map(|prev| (prev, prepare_for_text(prev), sender(prev)));
+    let text = extract_visible_text(
+        message,
+        &document,
+        previous.as_ref().map(|(prev, doc, from)| Previous {
+            document: doc,
+            from,
+            attachment_names: &prev.attachment_names,
+        }),
+        own_domains,
+    );
+    if let Some((_, prev_doc, _)) = previous {
+        dom::drop_tree(prev_doc);
+    }
+    dom::drop_tree(document);
+    text
+}
+
+/// Computes the visible text of every message in a thread (each optionally replying to an earlier
+/// message `parent < index`), parsing and sanitizing each message once.
+pub fn visible_texts(
+    messages: &[Message],
+    replying_to: &[Option<usize>],
+    own_domains: &[String],
+) -> Vec<String> {
+    let documents: Vec<NodeRef> = messages.iter().map(prepare_for_text).collect();
+    let senders_list: Vec<Sender> = messages.iter().map(sender).collect();
+    let mut out = Vec::with_capacity(messages.len());
+    for (at, message) in messages.iter().enumerate() {
+        let previous = replying_to
+            .get(at)
+            .copied()
+            .flatten()
+            .filter(|&parent| parent < at)
+            .map(|parent| Previous {
+                document: &documents[parent],
+                from: &senders_list[parent],
+                attachment_names: &messages[parent].attachment_names,
+            });
+        out.push(extract_visible_text(
+            message,
+            &documents[at],
+            previous,
+            own_domains,
+        ));
+    }
+    for document in documents {
+        dom::drop_tree(document);
+    }
+    out
+}
+
+fn prepare_for_text(message: &Message) -> NodeRef {
+    let document = sanitize::sanitize(&message.html);
+    let root = document_element(&document);
+    content::trim(&root);
+    document
+}
+
+fn extract_visible_text(
+    message: &Message,
+    document: &NodeRef,
+    previous: Option<Previous<'_>>,
+    own_domains: &[String],
+) -> String {
+    let from = sender(message);
+    let body = MessageBody::new(document, &from, &message.rfc822_id);
+    let body_node = dom::body(document).unwrap_or_else(|| document.clone());
+    links::find_links(&body_node, &body.content, own_domains);
+    let (hidden, mut content) = body.hidden_range(previous);
+    format_visible_text(&mut content, hidden)
+}
+
+fn format_visible_text(content: &mut content::Content, hidden: Option<content::Range>) -> String {
+    match hidden {
+        Some(hidden) => {
+            let before = content.formatted_slice(0, hidden.start);
+            let length = content.len();
+            let after = content.formatted_slice(hidden.end, length);
+            match (before.is_empty(), after.is_empty()) {
+                (false, false) => format!("{before}\n{after}"),
+                (false, true) => before,
+                _ => after,
+            }
+        }
+        None => content.to_formatted_string(),
+    }
+    .replace('\u{a0}', " ")
+}
+
 /// A fragment of a draft's body (a table the compose editor keeps whole) as the editor shows it,
 /// for a [`crate::BodyView`]. Its colours are tagged for the restyle as the editor's content is,
 /// as personal mail. Nothing else of the pipeline runs, because the editor sanitized it as it came
@@ -168,8 +264,10 @@ pub fn render_with(
 pub fn render_fragment(html: &str) -> Render {
     let document = dom::parse(html);
     colors::carbonize(&document_element(&document), false);
+    let unquoted_html = fragment(&document);
+    dom::drop_tree(document);
     Render {
-        unquoted_html: fragment(&document),
+        unquoted_html,
         ..Render::default()
     }
 }
@@ -177,99 +275,6 @@ pub fn render_fragment(html: &str) -> Render {
 /// A plain-text body as HTML: paragraphs, `>` quotes as blockquotes.
 pub fn text_to_html(text: &str) -> String {
     plain::to_html(text)
-}
-
-/// The HTML shown for a Gmail message payload: an alternative's richest part, or each inline
-/// part of a mixed message.
-pub fn html_from_payload(part: &gmail::MessagePart) -> String {
-    html_from_part(part).unwrap_or_default()
-}
-
-fn html_from_part(part: &gmail::MessagePart) -> Option<String> {
-    let mime = part
-        .mime_type
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let data = || {
-        part.body
-            .as_ref()
-            .and_then(|body| body.data.as_ref())
-            .map(|data| String::from_utf8_lossy(data).into_owned())
-    };
-    let is_text =
-        |p: &gmail::MessagePart| matches!(p.mime_type.as_deref(), Some("text/plain" | "text"));
-    match mime.as_str() {
-        "text/plain" | "text" => data().map(|text| plain::to_html(&text)),
-        "text/html" => data(),
-        "multipart/alternative" => {
-            if is_attachment(part) {
-                return None;
-            }
-            let parts = &part.parts;
-            parts
-                .iter()
-                .rev()
-                .filter(|p| !is_text(p))
-                .find_map(|p| html_from_part(p).filter(|html| !html.is_empty()))
-                .or_else(|| {
-                    parts.iter().filter(|p| is_text(p)).find_map(|p| {
-                        let data = p.body.as_ref()?.data.as_ref()?;
-                        let text = String::from_utf8_lossy(data);
-                        text.trim_start()
-                            .to_ascii_lowercase()
-                            .starts_with("<!doctype html")
-                            .then(|| text.into_owned())
-                    })
-                })
-                .or_else(|| {
-                    parts
-                        .iter()
-                        .rev()
-                        .filter(|p| is_text(p))
-                        .find_map(|p| html_from_part(p).filter(|h| !h.is_empty()))
-                })
-        }
-        "multipart/mixed" => Some(
-            part.parts
-                .iter()
-                .map(|p| {
-                    if is_attachment(p) {
-                        String::new()
-                    } else {
-                        html_from_part(p).unwrap_or_default()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => {
-            let nested = mime.starts_with("multipart/") || mime.starts_with("message/rfc822");
-            if !nested {
-                return None;
-            }
-            part.parts
-                .iter()
-                .filter(|p| !is_attachment(p))
-                .filter(|p| {
-                    let mime = p.mime_type.as_deref().unwrap_or_default();
-                    mime.starts_with("multipart/") || mime == "text/html" || is_text(p)
-                })
-                .find_map(|p| html_from_part(p).filter(|h| !h.is_empty()))
-        }
-    }
-}
-
-/// `Content-Disposition: attachment`, except Outlook's TNEF wrappers.
-fn is_attachment(part: &gmail::MessagePart) -> bool {
-    let header = |name: &str| {
-        part.headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| h.value.to_ascii_lowercase())
-    };
-    header("content-disposition").is_some_and(|value| value.contains("attachment"))
-        && !header("content-type").is_some_and(|value| value.contains("application/ms-tnef"))
 }
 
 fn sender(message: &Message) -> Sender {
@@ -412,6 +417,65 @@ mod options_tests {
             !plain.html.contains("exo-color") && !plain.unquoted_is_marketing,
             "{}",
             plain.html
+        );
+    }
+
+    #[test]
+    fn strips_open_tracking_pixels_before_capturing_render_html() {
+        let message = Message {
+            html: "<p>Hello!</p><img src=\"https://email.mailgun.acme.com/o/eJw123\"><img src=\"https://t.yesware.com/t/x.gif\" width=\"1\" height=\"1\">".into(),
+            from_email: "ann@example.com".into(),
+            ..Message::default()
+        };
+        let rendered = render(&message, None, &[]);
+        assert_eq!(
+            rendered.read_status_urls,
+            [
+                "https://email.mailgun.acme.com/o/eJw123",
+                "https://t.yesware.com/t/x.gif",
+            ]
+        );
+        assert!(
+            !rendered.html.contains("mailgun") && !rendered.html.contains("yesware"),
+            "Render::html still retained tracking pixel URLs: {}",
+            rendered.html
+        );
+    }
+
+    #[test]
+    fn visible_text_fast_path_matches_full_render() {
+        let m0 = Message {
+            html: "<div dir=\"ltr\">Hi&nbsp;team — see https://example.com/plan by tomorrow noon.<img src=\"cid:1f600@goomoji.gmail\"><div class=\"gmail_signature\">Zara Ahmed<br><a href=\"https://news.example/u\">Unsubscribe</a></div></div>".into(),
+            from_email: "zara@brightmoor.co".into(),
+            from_name: "Zara Ahmed".into(),
+            ..Message::default()
+        };
+        let m1 = Message {
+            html: format!(
+                "<div dir=\"ltr\">Works for me!</div><br><div class=\"gmail_quote\">On Mon, Nov 16, 2026 at 4:30 PM Zara Ahmed &lt;zara@brightmoor.co&gt; wrote:<blockquote class=\"gmail_quote\">{}</blockquote></div>",
+                m0.html
+            ),
+            from_email: "tom@brightmoor.co".into(),
+            from_name: "Tom Becker".into(),
+            ..Message::default()
+        };
+        let m2 = Message {
+            html: text_to_html(
+                "Count me in too.\n\nBest,\nMaya\n\nOn Mon, Nov 16, 2026 at 5:00 PM Tom Becker <tom@brightmoor.co> wrote:\n> Works for me!",
+            ),
+            from_email: "maya@brightmoor.co".into(),
+            from_name: "Maya Okafor".into(),
+            ..Message::default()
+        };
+        let r0 = render(&m0, None, &[]);
+        let r1 = render(&m1, Some((&m0, &r0)), &[]);
+        let r2 = render(&m2, Some((&m1, &r1)), &[]);
+        assert_eq!(visible_text(&m0, None, &[]), r0.visible_text);
+        assert_eq!(visible_text(&m1, Some(&m0), &[]), r1.visible_text);
+        assert_eq!(visible_text(&m2, Some(&m1), &[]), r2.visible_text);
+        assert_eq!(
+            visible_texts(&[m0, m1, m2], &[None, Some(0), Some(1)], &[]),
+            vec![r0.visible_text, r1.visible_text, r2.visible_text]
         );
     }
 }

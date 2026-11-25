@@ -12,7 +12,10 @@ pub(crate) use copy::{Copied, OTHER_ACCOUNT};
 
 /// What Copy Attachments put on the clipboard, if the clipboard holds it.
 pub(crate) fn pasted(ctx: &egui::Context) -> Option<Copied> {
-    crate::clipboard::read_attachments(ctx).and_then(|json| serde_json::from_str(&json).ok())
+    let mut copied: Copied = crate::clipboard::read_attachments(ctx)
+        .and_then(|json| serde_json::from_str(&json).ok())?;
+    copied.attachments.retain(copy::File::has_safe_ids);
+    (!copied.attachments.is_empty()).then_some(copied)
 }
 
 /// Whether Copy Attachments has anything to copy from a message with `attachments`.
@@ -31,13 +34,12 @@ use std::{
     fs::File,
     io::{ErrorKind, Write as _},
     path::{Path, PathBuf},
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
 use exo_store::Attachment;
 
-use crate::account::Loader;
+use crate::account::{Loader, UiSender, UiTasks};
 
 /// Extensions that only ever download.
 const ARCHIVES: &[&str] = &[
@@ -56,7 +58,9 @@ const CACHE_DIR: &str = "ExoAttachmentPreviewCache";
 
 /// Where `email`'s previews are kept unless [`AttachmentFiles::set_cache`] says otherwise.
 pub(crate) fn default_cache(email: &str) -> PathBuf {
-    std::env::temp_dir().join(CACHE_DIR).join(email)
+    std::env::temp_dir()
+        .join(CACHE_DIR)
+        .join(cache_component(email))
 }
 
 /// Identifies an attachment across fetches by its message and MIME part, because Gmail's
@@ -68,9 +72,6 @@ const FADE_AFTER: f64 = 6.0;
 const GONE_AFTER: f64 = 8.0;
 /// A preview's notification goes this soon after the preview opens.
 const PREVIEW_CLEARS_AFTER: f64 = 1.5;
-
-/// An image card's thumbnail, decoded for the attachment under its key.
-type Thumbnail = (Key, Option<egui::ColorImage>);
 
 /// Where a file comes from.
 #[derive(Clone)]
@@ -85,24 +86,33 @@ impl Part {
     /// Where draft file `file` comes from: kept in `folder` (the draft files), or else still in
     /// Gmail. `None` for a file of this Mac's that isn't kept.
     pub(crate) fn of_draft(file: &exo_store::DraftAttachment, folder: &Path) -> Option<Self> {
-        let kept = folder.join(&file.uuid);
+        let kept = is_safe_id(&file.uuid)
+            .then(|| folder.join(&file.uuid))
+            .filter(|kept| within_cache(folder, kept) && kept.is_file());
+        if let Some(kept) = kept {
+            return Some(Self::Kept(file.name.clone(), kept));
+        }
         match &file.source {
-            _ if kept.is_file() => Some(Self::Kept(file.name.clone(), kept)),
             exo_store::AttachmentSource::Gmail {
                 message_id,
                 attachment_id,
                 part_id,
-            } => Some(Self::Gmail(Attachment {
-                message_id: message_id.clone(),
-                attachment_id: attachment_id.clone(),
-                part_id: part_id.clone(),
-                filename: file.name.clone(),
-                mime_type: file.mime_type.clone(),
-                size: u32::try_from(file.size).unwrap_or(u32::MAX),
-                content_id: None,
-                inline: false,
-            })),
-            exo_store::AttachmentSource::Local => None,
+            } if is_safe_id(message_id)
+                && is_safe_id(part_id)
+                && attachment_id.as_deref().is_none_or(is_safe_id) =>
+            {
+                Some(Self::Gmail(Attachment {
+                    message_id: message_id.clone(),
+                    attachment_id: attachment_id.clone(),
+                    part_id: part_id.clone(),
+                    filename: file.name.clone(),
+                    mime_type: file.mime_type.clone(),
+                    size: u32::try_from(file.size).unwrap_or(u32::MAX),
+                    content_id: None,
+                    inline: false,
+                }))
+            }
+            exo_store::AttachmentSource::Gmail { .. } | exo_store::AttachmentSource::Local => None,
         }
     }
 
@@ -113,24 +123,6 @@ impl Part {
             Self::Kept(name, _) => name,
         }
     }
-}
-
-/// Something a fetch sends back to the UI thread.
-enum Update {
-    /// This much of the file has arrived, in percent.
-    Progress(Key, f32),
-    /// The fetch ended, with where the file was saved and whether to preview it, or why it wasn't
-    /// saved.
-    Done {
-        key: Key,
-        outcome: Result<(PathBuf, bool), Failure>,
-    },
-    /// The files of message `message` were zipped as `name` and saved, or not.
-    Zipped {
-        message: String,
-        name: String,
-        saved: Result<PathBuf, Failure>,
-    },
 }
 
 /// Why a file didn't arrive.
@@ -202,28 +194,17 @@ impl Download {
     }
 }
 
-/// Something the app shows the user about a fetch.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Event {
-    /// A file couldn't be had without a network.
-    Offline,
-    /// A message's files for `Download all` couldn't be had without a network.
-    OfflineAll,
-}
-
 /// Clicked attachments being fetched, saved and shown.
 pub(crate) struct AttachmentFiles {
     ctx: egui::Context,
+    ui: UiSender<crate::Mail>,
     /// The preview cache's folder.
     cache: PathBuf,
     /// Downloads in the order they started, while their notifications show. A click on a file that
     /// is being fetched does nothing.
     downloads: Vec<Download>,
-    updates: (mpsc::Sender<Update>, mpsc::Receiver<Update>),
-    /// Image cards' thumbnails as they're decoded, `None` for an image without one.
-    thumbnails: (mpsc::Sender<Thumbnail>, mpsc::Receiver<Thumbnail>),
-    /// The same for a read-only snippet's cards.
-    snippet_thumbnails: (mpsc::Sender<Thumbnail>, mpsc::Receiver<Thumbnail>),
+    /// Decoded thumbnails arriving for a read-only snippet's cards.
+    snippet_thumbnails: UiTasks<crate::thread::attachments::Files>,
     /// Messages whose `Download all` is zipping.
     zipping: HashSet<String>,
     /// Exo's viewer, while it's open.
@@ -237,14 +218,13 @@ pub(crate) struct AttachmentFiles {
 
 impl AttachmentFiles {
     /// Shows `email`'s files on `ctx`'s window.
-    pub(crate) fn new(ctx: &egui::Context, email: &str) -> Self {
+    pub(crate) fn new(ctx: &egui::Context, email: &str, ui: UiSender<crate::Mail>) -> Self {
         Self {
             ctx: ctx.clone(),
+            ui,
             cache: default_cache(email),
             downloads: Vec::new(),
-            updates: mpsc::channel(),
-            thumbnails: mpsc::channel(),
-            snippet_thumbnails: mpsc::channel(),
+            snippet_thumbnails: UiTasks::default(),
             zipping: HashSet::new(),
             viewer: None,
             #[cfg(target_os = "macos")]
@@ -305,12 +285,15 @@ impl AttachmentFiles {
             return;
         }
         let preview = preview && !is_archive(&attachment.filename);
-        let target = match cache_path(&self.cache, &attachment).filter(|_| preview) {
+        let cached = cache_path(&self.cache, &attachment)
+            .filter(|path| preview && within_cache(&self.cache, path));
+        let target = match cached {
             Some(path) if path.is_file() => {
                 self.show(path, attachment.filename);
                 return;
             }
             Some(path) => Target::Cache(path),
+            None if preview && cfg!(target_os = "macos") => return,
             None => {
                 let Some(folder) = crate::downloads::folder(&self.ctx) else {
                     return;
@@ -319,14 +302,15 @@ impl AttachmentFiles {
             }
         };
         self.start(key.clone(), attachment.filename.clone());
-        let (sender, ctx, started) = (self.updates.0.clone(), self.ctx.clone(), Instant::now());
+        let started = Instant::now();
         let progress = {
-            let (sender, ctx, key) = (sender.clone(), ctx.clone(), key.clone());
+            let (ui, key) = (self.ui.clone(), key.clone());
             move |percent| {
-                let _ = sender.send(Update::Progress(key.clone(), percent));
-                ctx.request_repaint();
+                let key = key.clone();
+                ui.send(move |mail| mail.attachment_files.set_progress(&key, percent));
             }
         };
+        let ui = self.ui.clone();
         let name = attachment.filename.clone();
         loader.download(&attachment, progress, move |bytes| {
             // The loader has logged why a fetch failed.
@@ -338,8 +322,7 @@ impl AttachmentFiles {
                         .map_err(|error| target.failed(&error))
                 });
             let outcome = saved.map(|path| (path, preview && started.elapsed() < PREVIEW_WITHIN));
-            let _ = sender.send(Update::Done { key, outcome });
-            ctx.request_repaint();
+            ui.send(move |mail| mail.finish_file_download(&key, outcome));
         });
     }
 
@@ -352,18 +335,17 @@ impl AttachmentFiles {
             return;
         }
         let preview = preview && !is_archive(&name);
-        let cached = cfg!(target_os = "macos").then(|| {
-            self.cache
-                .join(format!("draft-{id}"))
-                .join(file_name(&name))
-        });
-        let target = match cached.filter(|_| preview) {
+        let cached = cfg!(target_os = "macos")
+            .then(|| draft_cache_file(&self.cache, id, &name))
+            .filter(|cached| preview && within_cache(&self.cache, cached));
+        let target = match cached {
             // A draft's file never changes under its id.
             Some(cached) if cached.is_file() => {
                 self.show(cached, name);
                 return;
             }
             Some(cached) => Target::Cache(cached),
+            None if preview && cfg!(target_os = "macos") => return,
             None => {
                 let Some(folder) = crate::downloads::folder(&self.ctx) else {
                     return;
@@ -372,92 +354,94 @@ impl AttachmentFiles {
             }
         };
         self.start(key.clone(), name.clone());
-        let (sender, ctx) = (self.updates.0.clone(), self.ctx.clone());
+        let ui = self.ui.clone();
         std::thread::spawn(move || {
             let saved = std::fs::read(&path)
                 .and_then(|bytes| target.save(&name, &bytes))
                 .map_err(|error| target.failed(&error));
-            let _ = sender.send(Update::Done {
-                key,
-                outcome: saved.map(|path| (path, preview)),
-            });
-            ctx.request_repaint();
+            let outcome = saved.map(|path| (path, preview));
+            ui.send(move |mail| mail.finish_file_download(&key, outcome));
         });
     }
 
-    /// Takes in what the fetches sent, shows the previews that finished, lets notifications go
-    /// whose time is up, and returns what the app should tell the user. Call once a frame, on the
-    /// UI thread, at `now` (the frame's time).
-    pub(crate) fn poll(&mut self, now: f64) -> Vec<Event> {
-        let mut events = Vec::new();
-        while let Ok(update) = self.updates.1.try_recv() {
-            match update {
-                Update::Progress(key, percent) => {
-                    if let Some(download) = self
-                        .downloads
-                        .iter_mut()
-                        .find(|download| download.key == key)
-                    {
-                        download.progress = download.progress.max(percent);
-                    }
+    fn set_progress(&mut self, key: &Key, percent: f32) {
+        if let Some(download) = self
+            .downloads
+            .iter_mut()
+            .find(|download| &download.key == key)
+        {
+            download.progress = download.progress.max(percent);
+        }
+    }
+
+    /// Records the end of a file fetch, opening Quick Look when `preview` holds and returning
+    /// `true` when an offline failure should show the offline alert instead of a notification.
+    pub(super) fn finish(
+        &mut self,
+        key: &Key,
+        outcome: Result<(PathBuf, bool), Failure>,
+        now: f64,
+    ) -> bool {
+        let Some(at) = self
+            .downloads
+            .iter()
+            .position(|download| &download.key == key)
+        else {
+            return false;
+        };
+        match outcome {
+            Ok((path, preview)) => {
+                let download = &mut self.downloads[at];
+                download.state = State::Saved(path.clone());
+                download.progress = 100.0;
+                download.ended = Some(now);
+                if preview {
+                    download.clear_at = Some(now + PREVIEW_CLEARS_AFTER);
+                    let name = download.name.clone();
+                    self.show(path, name);
                 }
-                Update::Done { key, outcome } => {
-                    let Some(at) = self
-                        .downloads
-                        .iter()
-                        .position(|download| download.key == key)
-                    else {
-                        continue;
-                    };
-                    match outcome {
-                        Ok((path, preview)) => {
-                            let download = &mut self.downloads[at];
-                            download.state = State::Saved(path.clone());
-                            download.progress = 100.0;
-                            download.ended = Some(now);
-                            if preview {
-                                download.clear_at = Some(now + PREVIEW_CLEARS_AFTER);
-                                let name = download.name.clone();
-                                self.show(path, name);
-                            }
-                        }
-                        // Offline, Exo shows an alert instead, and the notification clears at
-                        // once.
-                        Err(Failure::Offline) => {
-                            self.downloads.remove(at);
-                            events.push(Event::Offline);
-                        }
-                        Err(failure) => {
-                            let download = &mut self.downloads[at];
-                            download.state = State::Failed(failure);
-                            download.ended = Some(now);
-                        }
-                    }
-                }
-                // The zip downloads as a file of its own, with a notification saying it's there.
-                Update::Zipped {
-                    message,
-                    name,
-                    saved,
-                } => {
-                    self.zipping.remove(&message);
-                    let state = match saved {
-                        Ok(path) => State::Saved(path),
-                        Err(Failure::Offline) => {
-                            events.push(Event::OfflineAll);
-                            continue;
-                        }
-                        Err(failure) => State::Failed(failure),
-                    };
-                    self.start(("zip".to_owned(), message), name);
-                    if let Some(download) = self.downloads.last_mut() {
-                        download.state = state;
-                        download.progress = 100.0;
-                        download.ended = Some(now);
-                    }
-                }
+                false
+            }
+            // Offline, Exo shows an alert instead, and the notification clears at once.
+            Err(Failure::Offline) => {
+                self.downloads.remove(at);
+                true
+            }
+            Err(failure) => {
+                let download = &mut self.downloads[at];
+                download.state = State::Failed(failure);
+                download.ended = Some(now);
+                false
             }
         }
+    }
+
+    /// Records the end of a `Download all` zip, returning `true` when it failed offline.
+    pub(super) fn finish_zip(
+        &mut self,
+        message: String,
+        name: String,
+        saved: Result<PathBuf, Failure>,
+        now: f64,
+    ) -> bool {
+        self.zipping.remove(&message);
+        let state = match saved {
+            Ok(path) => State::Saved(path),
+            Err(Failure::Offline) => return true,
+            Err(failure) => State::Failed(failure),
+        };
+        self.start(("zip".to_owned(), message), name);
+        if let Some(download) = self.downloads.last_mut() {
+            download.state = state;
+            download.progress = 100.0;
+            download.ended = Some(now);
+        }
+        false
+    }
+
+    /// Lets notifications go whose time is up and polls Quick Look. Call once a frame, on the UI
+    /// thread, at `now` (the frame's time).
+    pub(crate) fn poll(&mut self, now: f64) {
         self.downloads.retain(|download| {
             download.clear_at.is_none_or(|at| now < at)
                 && download.ended.is_none_or(|ended| now < ended + GONE_AFTER)
@@ -484,7 +468,6 @@ impl AttachmentFiles {
         {
             self.ctx.request_repaint_after(wait);
         }
-        events
     }
 
     /// Drags the card of file `part` out from `at` (in egui points, which `zoom` scales to the
@@ -516,17 +499,14 @@ impl AttachmentFiles {
             format!("{name}-{}", self.downloads.len()),
         );
         self.start(key.clone(), name.clone());
-        let (sender, ctx) = (self.updates.0.clone(), self.ctx.clone());
+        let ui = self.ui.clone();
         std::thread::spawn(move || {
             let target = Target::Downloads(folder);
             let saved = target
                 .save(&name, &bytes)
                 .map_err(|error| target.failed(&error));
-            let _ = sender.send(Update::Done {
-                key,
-                outcome: saved.map(|path| (path, false)),
-            });
-            ctx.request_repaint();
+            let outcome = saved.map(|path| (path, false));
+            ui.send(move |mail| mail.finish_file_download(&key, outcome));
         });
     }
 
@@ -604,12 +584,9 @@ impl Target {
     fn save(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
         let path = match self {
             Self::Cache(path) => {
-                // Written aside and renamed, so a write cut short is never taken for a cached file.
-                let folder = path.parent().unwrap_or(path);
-                std::fs::create_dir_all(folder)?;
-                let partial = folder.join(".partial");
-                std::fs::write(&partial, bytes)?;
-                std::fs::rename(&partial, path)?;
+                // Written aside and renamed, so concurrent saves never race and a write cut short
+                // is never taken for a cached file.
+                fastframe_file::write(path, bytes)?;
                 path.clone()
             }
             Self::Downloads(folder) => {
@@ -664,14 +641,16 @@ const IMAGE_TYPES: &[&str] = &[
 pub(crate) fn is_image(attachment: &Attachment) -> bool {
     let extension = extension(&attachment.filename);
     IMAGE_TYPES.contains(&attachment.mime_type.to_ascii_lowercase().as_str())
-        || IMAGE_TYPES
-            .iter()
-            .any(|kind| kind.strip_prefix("image/") == Some(extension.as_str()))
+        || extension.as_deref().is_some_and(|extension| {
+            IMAGE_TYPES
+                .iter()
+                .any(|kind| kind.strip_prefix("image/") == Some(extension))
+        })
 }
 
 /// Whether `attachment` is a message.
 pub(crate) fn is_eml(attachment: &Attachment) -> bool {
-    extension(&attachment.filename) == "eml"
+    extension(&attachment.filename).as_deref() == Some("eml")
         || attachment.mime_type.eq_ignore_ascii_case("message/rfc822")
 }
 
@@ -681,20 +660,42 @@ pub(crate) fn is_previewable(attachment: &Attachment) -> bool {
     is_image(attachment) || is_eml(attachment)
 }
 
-/// `name`'s extension in lowercase (`extension`, the part after the last dot when it has no
-/// spaces).
-fn extension(name: &str) -> String {
-    name.rsplit_once('.')
-        .map(|(_, extension)| extension)
-        .filter(|extension| !extension.contains(' '))
-        .unwrap_or_default()
-        .to_lowercase()
+/// Filters `among` to the attachments Exo's own viewer previews ([`is_previewable`]), and returns
+/// them alongside the index of `target` (matched by `(message_id, part_id)`, defaulting to `0`).
+pub(crate) fn preview_selection<'a>(
+    among: impl IntoIterator<Item = &'a Attachment>,
+    target: &Attachment,
+) -> (Vec<Attachment>, usize) {
+    let files: Vec<Attachment> = among
+        .into_iter()
+        .filter(|candidate| is_previewable(candidate))
+        .cloned()
+        .collect();
+    let start = files
+        .iter()
+        .position(|candidate| {
+            candidate.message_id == target.message_id && candidate.part_id == target.part_id
+        })
+        .unwrap_or(0);
+    (files, start)
 }
 
-/// Whether `name` is an archive, meaning its extension (after the last dot, without spaces) is
+/// `filename`'s extension in lowercase: the non-empty part after the last dot when it contains no
+/// whitespace.
+pub(crate) fn extension(filename: &str) -> Option<String> {
+    filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| !extension.is_empty() && !extension.chars().any(char::is_whitespace))
+        .map(str::to_lowercase)
+}
+
+/// Whether `name` is an archive, meaning its extension (after the last dot, without whitespace) is
 /// one of [`ARCHIVES`].
 fn is_archive(name: &str) -> bool {
-    ARCHIVES.contains(&extension(name).as_str())
+    extension(name)
+        .as_deref()
+        .is_some_and(|extension| ARCHIVES.contains(&extension))
 }
 
 /// Where `attachment`'s preview is cached in `cache`. Each message part gets its own folder, so
@@ -706,8 +707,67 @@ fn cache_path(cache: &Path, attachment: &Attachment) -> Option<PathBuf> {
 /// [`cache_path`] on any platform.
 fn cache_file(cache: &Path, attachment: &Attachment) -> PathBuf {
     cache
-        .join(format!("{}-{}", attachment.message_id, attachment.part_id))
+        .join(format!(
+            "{}-{}",
+            cache_component(&attachment.message_id),
+            cache_component(&attachment.part_id)
+        ))
         .join(file_name(&attachment.filename))
+}
+
+/// Where draft file `id` named `name` is cached in `cache`.
+fn draft_cache_file(cache: &Path, id: &str, name: &str) -> PathBuf {
+    cache
+        .join(format!("draft-{}", cache_component(id)))
+        .join(file_name(name))
+}
+
+/// Whether `id` is a single safe identifier without path separators, `..`, or control/formatting
+/// characters.
+pub(crate) fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains("..")
+        && !id
+            .chars()
+            .any(|c| matches!(c, '/' | '\\') || c.is_control() || is_format(c))
+}
+
+/// Sanitizes an identifier into a single preview-cache folder segment.
+fn cache_component(id: &str) -> String {
+    const MAX_COMPONENT: usize = 120;
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_control() || is_format(c) || "/\\\"*:<>?|~".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .replace("..", "__");
+    let safe = safe.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    let safe = if safe.is_empty() { "part" } else { safe };
+    let mut end = safe.len().min(MAX_COMPONENT);
+    while !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    safe[..end].to_owned()
+}
+
+/// Whether `path` lies strictly beneath `cache` using normal path components only.
+fn within_cache(cache: &Path, path: &Path) -> bool {
+    path.starts_with(cache)
+        && path.strip_prefix(cache).is_ok_and(|relative| {
+            let mut any = false;
+            for component in relative.components() {
+                if !matches!(component, std::path::Component::Normal(_)) {
+                    return false;
+                }
+                any = true;
+            }
+            any
+        })
 }
 
 /// The longest file name macOS allows, in UTF-8 bytes.
@@ -947,5 +1007,93 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"pdf");
         std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn preview_cache_paths_never_escape_cache_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "exo-preview-traversal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cache = root.join("cache");
+        let secret = root.join("secret.txt");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&secret, b"keep").unwrap();
+
+        for (message_id, part_id) in [
+            ("../../outside", "1"),
+            ("18f3a", "../../secret"),
+            ("..\\..\\win", "..\\part"),
+            ("..", "."),
+        ] {
+            let attachment = Attachment {
+                message_id: message_id.into(),
+                attachment_id: Some("att".into()),
+                part_id: part_id.into(),
+                filename: "../../secret.txt".into(),
+                mime_type: "text/plain".into(),
+                size: 4,
+                content_id: None,
+                inline: false,
+            };
+            let path = cache_file(&cache, &attachment);
+            assert!(within_cache(&cache, &path), "{path:?}");
+        }
+
+        for draft_id in ["../../secret", "../outside/id", "..\\escape", ".."] {
+            let path = draft_cache_file(&cache, draft_id, "../secret.txt");
+            assert!(within_cache(&cache, &path), "{path:?}");
+
+            let draft = exo_store::DraftAttachment {
+                uuid: draft_id.into(),
+                name: "secret.txt".into(),
+                mime_type: "text/plain".into(),
+                size: 4,
+                content_id: None,
+                source: exo_store::AttachmentSource::Local,
+            };
+            assert!(Part::of_draft(&draft, &cache).is_none());
+        }
+
+        assert!(!within_cache(&cache, &cache));
+        assert!(!within_cache(&cache, &secret));
+        assert!(!within_cache(&cache, &cache.join("..").join("secret.txt")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_selection_filters_to_images_and_emls_and_tracks_target_index() {
+        let part = |part_id: &str, filename: &str, mime_type: &str| Attachment {
+            message_id: "m1".into(),
+            attachment_id: None,
+            part_id: part_id.into(),
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            size: 10,
+            content_id: None,
+            inline: false,
+        };
+        let pdf = part("1", "deck.pdf", "application/pdf");
+        let png = part("2", "chart.png", "image/png");
+        let eml = part("3", "forwarded.eml", "message/rfc822");
+        let all = [pdf, png.clone(), eml.clone()];
+        let (files, start) = preview_selection(&all, &eml);
+        assert_eq!(files, vec![png, eml]);
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn extension_lowercases_and_rejects_whitespace_or_empty() {
+        assert_eq!(extension("Report.PDF").as_deref(), Some("pdf"));
+        assert_eq!(
+            extension("Room block confirmed.eml").as_deref(),
+            Some("eml")
+        );
+        assert_eq!(extension("Backup.TAR.GZ").as_deref(), Some("gz"));
+        assert_eq!(extension("no_extension"), None);
+        assert_eq!(extension("trailing."), None);
+        assert_eq!(extension("notes.zip copy"), None);
+        assert_eq!(extension("notes.pdf\t"), None);
     }
 }

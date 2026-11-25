@@ -11,6 +11,8 @@
 //! the bands, frame by frame, while they're on screen.
 
 pub(crate) mod fetch;
+mod index;
+mod worker;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -24,15 +26,81 @@ use std::{
 };
 
 use egui::{Color32, ColorImage, Painter, Pos2, Rect, TextureHandle, TextureOptions, pos2, vec2};
-use exo_mail::{BodyView, Fonts, Region, Render, ViewOptions};
+use exo_mail::Render;
 use exo_store::{MessageDetail, RemoteContentBlocking};
+
+pub(crate) use index::visible_texts;
+use worker::{Job, Output, Worker};
 
 use crate::account::Loader;
 
 /// The height of a painted band, in CSS px.
-const BAND: f32 = 512.0;
+pub(super) const BAND: f32 = 512.0;
 /// Painted bands kept past each end of what's on screen, for scrolling back.
 const KEPT_BANDS: u32 = 2;
+/// Multi-click window and slop for double-/triple-click selection in a body.
+const MULTI_CLICK_DELAY: f64 = 0.5;
+const MULTI_CLICK_DISTANCE: f32 = 4.0;
+
+/// Where a body sits on screen and which pointer interactions it accepts.
+pub(crate) struct PointerArea<'a> {
+    pub id: &'a str,
+    /// Visible hit-testable rect of the body on screen.
+    pub body: Rect,
+    /// Top-left of the body's content in screen coordinates (may sit above `body.min` when
+    /// scrolled).
+    pub origin: Pos2,
+    /// Pointer position to test against `body`.
+    pub pointer: Option<Pos2>,
+    /// Whether a secondary click opens the body's context menu.
+    pub context_menu: bool,
+}
+
+/// Cross-frame pointer state for multi-click and drag selection in [`Bodies`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PointerState {
+    /// The last press in a body: when, where, and how many in a row (1..=3).
+    clicks: Option<(f64, Pos2, u32)>,
+    /// The message id currently being drag-selected, if any.
+    selecting: Option<String>,
+    /// Modifiers held on the last primary click in a body (e.g. ⌘ opens links in the background).
+    pub(crate) click_modifiers: egui::Modifiers,
+}
+
+impl PointerState {
+    /// Records a primary press at `time` and `at`, returning the resulting click count (`1..=3`).
+    fn record_press(&mut self, time: f64, at: Pos2) -> u32 {
+        let count = match self.clicks {
+            Some((then, place, count))
+                if time - then < MULTI_CLICK_DELAY && place.distance(at) < MULTI_CLICK_DISTANCE =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.clicks = Some((time, at, count));
+        count
+    }
+
+    fn is_multi_click(&self) -> bool {
+        self.clicks.is_some_and(|(.., count)| count > 1)
+    }
+
+    /// Resets transient multi-click and drag-selection state (e.g. when switching items).
+    pub(crate) fn clear(&mut self) {
+        self.clicks = None;
+        self.selecting = None;
+    }
+}
+
+/// What [`Bodies::handle_pointer`] observed this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PointerOutcome {
+    /// The pointer hovered inside the body rect.
+    pub hovered: bool,
+    /// A new text selection started in the body (so any adjacent header selection should clear).
+    pub started_selection: bool,
+}
 
 /// What the pipeline found in a body, for the parts of the thread view around it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -136,212 +204,30 @@ pub enum Event {
 
 /// The text selection, as the worker reports it.
 #[derive(Clone, Debug, PartialEq)]
-struct Selected {
+pub(super) struct Selected {
     /// The message it's in.
-    message: String,
+    pub message: String,
     /// The selection as HTML, for a reply that quotes it.
-    html: String,
+    pub html: String,
     /// Its text, for ⌘E.
-    text: String,
+    pub text: String,
     /// Its bounding box in the body's CSS px.
-    bounds: Rect,
-}
-
-enum Job {
-    /// A new thread. With `read_receipts` (`Show all images`), its messages load their read
-    /// receipts when first shown.
-    Thread {
-        messages: Vec<MessageDetail>,
-        own_domains: Vec<String>,
-        loader: Loader,
-        read_receipts: bool,
-        options: exo_mail::RenderOptions,
-    },
-    /// Lay a body out, loading nothing remote when `block_remote`.
-    Layout {
-        id: String,
-        look: Look,
-        block_remote: bool,
-    },
-    /// Paint band `band`, `width` CSS px wide (the content's width, capped at the GPU's texture
-    /// limit).
-    Paint {
-        id: String,
-        generation: u64,
-        band: u32,
-        width: f32,
-    },
-    /// Play the animated images showing in `visible` up to `now`.
-    Animate {
-        id: String,
-        generation: u64,
-        now: Duration,
-        visible: Range<f32>,
-    },
-    Hover {
-        id: String,
-        at: Pos2,
-    },
-    Click {
-        id: String,
-        at: Pos2,
-    },
-    SelectFrom {
-        id: String,
-        at: Pos2,
-        granularity: Granularity,
-    },
-    SelectTo {
-        id: String,
-        at: Pos2,
-    },
-    ClearSelection,
-    Copy,
-    /// Find where `#name` points in message `id`.
-    Anchor {
-        id: String,
-        name: String,
-    },
-    /// A right-click at `at` in message `id`, at `screen` on screen. Unless it's on the
-    /// selection, it selects the word under it, or clears the selection when there's no text
-    /// there.
-    ContextMenu {
-        id: String,
-        at: Pos2,
-        screen: Pos2,
-    },
-    /// Render another conversation's `messages`, leaving the open thread be.
-    Render {
-        thread: String,
-        messages: Vec<MessageDetail>,
-        own_domains: Vec<String>,
-    },
-    /// An image a body asked for arrived.
-    Wake,
-    /// Find (⌘F) searches every body for this, or stops.
-    Find(Option<String>),
-    /// Find's current match is now match `.1` in message `.0`, or there's none.
-    CurrentMatch(Option<(String, usize)>),
-    /// Find stopped, and its current match (match `index` in message `id`) becomes the selection.
-    SelectMatch {
-        id: String,
-        index: usize,
-    },
-}
-
-impl Job {
-    /// Whether `later`, queued after this job, makes this one pointless.
-    fn superseded_by(&self, later: &Self) -> bool {
-        match (self, later) {
-            // A later layout of the same body paints all of it again.
-            (Self::Layout { id, .. } | Self::Paint { id, .. }, Self::Layout { id: later, .. })
-            | (Self::Hover { id, .. }, Self::Hover { id: later, .. }) => id == later,
-            // A new thread replaces everything about the old one.
-            (
-                Self::Layout { .. } | Self::Paint { .. } | Self::Hover { .. },
-                Self::Thread { .. },
-            ) => true,
-            (Self::Find(_), Self::Find(_)) | (Self::CurrentMatch(_), Self::CurrentMatch(_)) => true,
-            _ => false,
-        }
-    }
-
-    /// The message the job is about, if it's about one.
-    fn message(&self) -> Option<&str> {
-        match self {
-            Self::Layout { id, .. }
-            | Self::Paint { id, .. }
-            | Self::Animate { id, .. }
-            | Self::Hover { id, .. }
-            | Self::Click { id, .. }
-            | Self::SelectFrom { id, .. }
-            | Self::SelectTo { id, .. }
-            | Self::Anchor { id, .. }
-            | Self::SelectMatch { id, .. }
-            | Self::ContextMenu { id, .. } => Some(id),
-            Self::Thread { .. }
-            | Self::ClearSelection
-            | Self::Copy
-            | Self::Render { .. }
-            | Self::Wake
-            | Self::Find(_)
-            | Self::CurrentMatch(_) => None,
-        }
-    }
-}
-
-enum Output {
-    Rendered(Vec<(String, Facts)>),
-    Laid {
-        id: String,
-        laid: Laid,
-    },
-    Painted {
-        id: String,
-        generation: u64,
-        band: u32,
-        image: exo_mail::Image,
-    },
-    /// New frames of animated images, painted over the bands. Each patch is a part of the body
-    /// (`[left, top, width, height]`, whole CSS px) and its pixels.
-    Animated {
-        id: String,
-        generation: u64,
-        patches: Vec<([f32; 4], exo_mail::Image)>,
-        next: Option<Duration>,
-    },
-    Hovered {
-        id: String,
-        hit: Option<Hit>,
-    },
-    Clicked {
-        id: String,
-        hit: Option<Hit>,
-    },
-    Copied(Option<String>),
-    /// The worker panicked outside a job and started again without the views it had, so the
-    /// thread has to be sent again.
-    Restarted,
-    Conversation {
-        thread: String,
-        facts: Vec<(String, Facts)>,
-    },
-    /// The selection changed, or went.
-    Selected(Option<Selected>),
-    Anchored {
-        id: String,
-        top: Option<f32>,
-    },
-    /// Find's matches for `query` in the body of message `id`, as boxes in the body's CSS px.
-    Found {
-        id: String,
-        query: Option<String>,
-        boxes: Vec<Rect>,
-    },
-    /// What a right-click hit, and the selection's text and box at that moment (in the body's CSS
-    /// px).
-    ContextMenu {
-        id: String,
-        at: Pos2,
-        screen: Pos2,
-        hit: exo_mail::ContextHit,
-        selection: Option<(String, Rect)>,
-    },
+    pub bounds: Rect,
 }
 
 /// The latest layout of a body.
 #[derive(Clone)]
-struct Laid {
-    height: f32,
-    generation: u64,
+pub(super) struct Laid {
+    pub height: f32,
+    pub generation: u64,
     /// The column width it was laid out for, in CSS px.
-    width: f32,
+    pub width: f32,
     /// How much wider than the column it is, when it scrolls sideways (else 0), in CSS px.
-    overflow: f32,
+    pub overflow: f32,
     /// How much it's shrunk to fit the column (1 when it fits).
-    zoom: f32,
+    pub zoom: f32,
     /// Where its animated images are.
-    animations: Vec<[f32; 4]>,
+    pub animations: Vec<[f32; 4]>,
 }
 
 #[derive(Default)]
@@ -377,10 +263,18 @@ struct AnimationState {
     shown: Vec<usize>,
 }
 
+struct WorkerStart {
+    job_receiver: Receiver<Job>,
+    output_sender: Sender<Output>,
+    ctx: egui::Context,
+}
+
 /// The UI's handle on the body worker, and the textures it painted.
 pub struct Bodies {
     jobs: Sender<Job>,
     outputs: Receiver<Output>,
+    /// Held until the first job starts the worker thread, so idle instances spawn no thread.
+    worker_start: std::sync::Mutex<Option<WorkerStart>>,
     /// Jobs sent and not finished yet.
     pending: Arc<AtomicUsize>,
     /// The messages last sent to the pipeline, in order.
@@ -403,13 +297,49 @@ pub struct Bodies {
 }
 
 impl Bodies {
-    /// Starts the worker, which loads the email fonts and repaints `ctx` whenever it has
-    /// something new.
+    /// Creates a handle that spawns its worker thread on the first job, loading the shared email
+    /// fonts and repainting `ctx` whenever it has something new.
     pub fn new(ctx: &egui::Context) -> Self {
         let (jobs, job_receiver) = channel();
         let (output_sender, outputs) = channel();
         let pending = Arc::new(AtomicUsize::new(0));
-        let (wake, worker_pending, ctx) = (jobs.clone(), pending.clone(), ctx.clone());
+        let worker_start = std::sync::Mutex::new(Some(WorkerStart {
+            job_receiver,
+            output_sender,
+            ctx: ctx.clone(),
+        }));
+        Self {
+            jobs,
+            outputs,
+            worker_start,
+            pending,
+            messages: Vec::new(),
+            entries: HashMap::new(),
+            images: RemoteContentBlocking::default(),
+            images_shown: HashSet::new(),
+            selection: None,
+            searched: None,
+            current_match: None,
+            painted_match: None,
+            options: exo_mail::RenderOptions::default(),
+        }
+    }
+
+    fn ensure_worker(&self) {
+        let start = self
+            .worker_start
+            .lock()
+            .expect("worker-start lock is never poisoned")
+            .take();
+        let Some(WorkerStart {
+            job_receiver,
+            output_sender,
+            ctx,
+        }) = start
+        else {
+            return;
+        };
+        let (wake, worker_pending) = (self.jobs.clone(), self.pending.clone());
         // Views aren't `Send`, so the worker is built on its own thread. A panic outside a job
         // restarts the worker, the way an account's background restarts (`recovery`).
         let spawned = std::thread::Builder::new()
@@ -417,20 +347,7 @@ impl Bodies {
             .spawn(move || {
                 let restarts = crate::recovery::Restarts::new(ctx.clone());
                 loop {
-                    let worker = Worker {
-                        fonts: Fonts::load(),
-                        renders: HashMap::new(),
-                        views: HashMap::new(),
-                        fetch: None,
-                        read_receipts: false,
-                        receipts_loaded: HashSet::new(),
-                        selected: None,
-                        query: None,
-                        current_match: None,
-                        generation: 0,
-                        wake: wake.clone(),
-                        pending: worker_pending.clone(),
-                    };
+                    let worker = Worker::new(wake.clone(), worker_pending.clone());
                     let run = std::panic::AssertUnwindSafe(|| {
                         worker.run(&job_receiver, &output_sender, &ctx)
                     });
@@ -451,23 +368,10 @@ impl Bodies {
         if let Err(error) = spawned {
             log::error!("starting the body renderer: {error}");
         }
-        Self {
-            jobs,
-            outputs,
-            pending,
-            messages: Vec::new(),
-            entries: HashMap::new(),
-            images: RemoteContentBlocking::default(),
-            images_shown: HashSet::new(),
-            selection: None,
-            searched: None,
-            current_match: None,
-            painted_match: None,
-            options: exo_mail::RenderOptions::default(),
-        }
     }
 
     fn send(&self, job: Job) {
+        self.ensure_worker();
         self.pending.fetch_add(1, Ordering::SeqCst);
         if self.jobs.send(job).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
@@ -679,11 +583,16 @@ impl Bodies {
         let kept = visible.start.saturating_sub(KEPT_BANDS)..visible.end.saturating_add(KEPT_BANDS);
         entry.bands.retain(|band, _| kept.contains(band));
         entry.asked_bands.retain(|(_, band)| kept.contains(band));
+        let kept_y = (kept.start as f32 * BAND)..(kept.end as f32 * BAND);
+        entry
+            .patches
+            .retain(|_, (_, [_, y, _, h], _)| *y < kept_y.end && *y + *h > kept_y.start);
         let alpha = (opacity * 255.0).round() as u8;
         let tint = Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha);
         let whole = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
         // A band covers the content's whole width, as far as a texture can go.
-        let max_width = painter.ctx().input(|input| input.max_texture_side) as f32 / ppp - 1.0;
+        let max_texture_side = painter.ctx().input(|input| input.max_texture_side);
+        let max_width = max_texture_side as f32 / ppp - 1.0;
         let width = (laid.width + laid.overflow).min(max_width);
         let mut jobs = Vec::new();
         for band in visible {
@@ -743,6 +652,7 @@ impl Bodies {
                     generation: laid.generation,
                     now: Duration::from_secs_f64(now),
                     visible: shown,
+                    max_texture_side,
                 });
             } else if let Some(due) = entry.animation.due {
                 painter.ctx().request_repaint_after_secs((due - now) as f32);
@@ -779,6 +689,94 @@ impl Bodies {
             entry.hover = None;
             entry.hovered_at = None;
         }
+    }
+
+    /// Handles hover hit-testing, cursor icon, multi-click (single/double/triple), drag selection,
+    /// optional right-click context menu, and link clicks over a painted body.
+    pub(crate) fn handle_pointer(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        area: PointerArea<'_>,
+        state: &mut PointerState,
+        clickable_date: impl FnOnce(&str) -> bool,
+    ) -> PointerOutcome {
+        let local = |at: Pos2| (at - area.origin).to_pos2();
+        let mut outcome = PointerOutcome::default();
+        let hover = area.pointer.filter(|at| area.body.contains(*at));
+        match hover {
+            Some(at) if response.hovered() => {
+                outcome.hovered = true;
+                // Every frame, not only while the pointer moves: scrolling, a header unfolding or
+                // a relayout moves the body under a still pointer.
+                self.hover(area.id, local(at));
+                if let Some(hit) = self.hovered(area.id) {
+                    ui.ctx()
+                        .set_cursor_icon(cursor_for_hit(hit, clickable_date));
+                }
+            }
+            _ => self.unhover(area.id),
+        }
+        // A double or triple click selects the word or paragraph as the button goes down, as in
+        // Chromium (and a fourth click in a row is another triple click, as macOS counts them).
+        let (pressed, time) = ui.input(|input| (input.pointer.primary_pressed(), input.time));
+        if pressed
+            && response.hovered()
+            && let Some(at) = hover
+        {
+            let count = state.record_press(time, at);
+            let granularity = match count {
+                1 => None,
+                2 => Some(Granularity::Word),
+                _ => Some(Granularity::Paragraph),
+            };
+            if let Some(granularity) = granularity {
+                self.select_from(area.id, local(at), granularity);
+                state.selecting = Some(area.id.to_owned());
+                outcome.started_selection = true;
+            }
+        }
+        let multi_click = state.is_multi_click();
+        // A selection starts where the button went down, not where the drag was recognized. After
+        // a double or triple click, the drag extends that word or paragraph.
+        if response.drag_started() && !multi_click {
+            state.selecting = None;
+            if let Some(at) = ui
+                .input(|input| input.pointer.press_origin())
+                .filter(|at| area.body.contains(*at))
+            {
+                self.select_from(area.id, local(at), Granularity::Character);
+                state.selecting = Some(area.id.to_owned());
+                outcome.started_selection = true;
+            }
+        }
+        if response.dragged()
+            && state.selecting.as_deref() == Some(area.id)
+            && let Some(at) = response.interact_pointer_pos()
+        {
+            self.select_to(area.id, local(at));
+        }
+        if area.context_menu
+            && response.secondary_clicked()
+            && let Some(at) = response
+                .interact_pointer_pos()
+                .filter(|at| area.body.contains(*at))
+        {
+            exo_ui::claim_right_click(ui.ctx());
+            self.context_menu(area.id, local(at), at);
+        }
+        if response.clicked()
+            && !multi_click
+            && let Some(at) = response
+                .interact_pointer_pos()
+                .filter(|at| area.body.contains(*at))
+        {
+            self.clear_selection();
+            // ⌘ on a link opens it in the background. What the click hit comes back later.
+            state.click_modifiers = ui.input(|input| input.modifiers);
+            self.click(area.id, local(at));
+        }
+        outcome
     }
 
     /// A click at `at` in `id`. [`Bodies::poll`] reports what it hit.
@@ -1005,6 +1003,13 @@ impl Bodies {
                             &image.rgba,
                         );
                         let key = [region[0], region[1]].map(|edge| edge as u32);
+                        entry.patches.retain(|existing, (_, old, _)| {
+                            *existing == key
+                                || old[0] >= region[0] + region[2]
+                                || old[0] + old[2] <= region[0]
+                                || old[1] >= region[1] + region[3]
+                                || old[1] + old[3] <= region[1]
+                        });
                         // A new frame goes into the texture the last one is in, rather than a new
                         // texture every frame.
                         match entry.patches.get_mut(&key) {
@@ -1097,547 +1102,21 @@ impl Bodies {
     }
 }
 
-/// One message's view on the worker.
-struct View {
-    body: BodyView,
-    look: Look,
-    block_remote: bool,
-    height: f32,
-    generation: u64,
-}
-
-impl View {
-    /// Its latest layout, for message `id`.
-    fn laid(&self, id: &str) -> Output {
-        let overflow = if self.body.scrolls() {
-            self.body.content_width() - self.body.width()
-        } else {
-            0.0
-        };
-        let laid = Laid {
-            height: self.height,
-            generation: self.generation,
-            width: self.body.width(),
-            overflow,
-            zoom: self.body.zoom(),
-            animations: self.body.animations(),
-        };
-        Output::Laid {
-            id: id.to_owned(),
-            laid,
+/// The cursor Chromium's `cursor: auto` picks for `hit`: an I-beam over text, a hand over links,
+/// quote toggles, inline images, and clickable dates.
+fn cursor_for_hit(hit: &Hit, clickable_date: impl FnOnce(&str) -> bool) -> egui::CursorIcon {
+    match hit {
+        Hit::Text => egui::CursorIcon::Text,
+        Hit::Link { .. } | Hit::QuoteToggle | Hit::InlineImage { .. } => {
+            egui::CursorIcon::PointingHand
         }
-    }
-}
-
-/// The worker thread's state: every render and view of the open thread.
-struct Worker {
-    fonts: Fonts,
-    renders: HashMap<String, Render>,
-    views: HashMap<String, View>,
-    fetch: Option<Arc<dyn exo_mail::Fetch>>,
-    /// The thread's messages load their read receipts when first shown.
-    read_receipts: bool,
-    /// The messages that have loaded them since the thread was opened.
-    receipts_loaded: HashSet<String>,
-    /// The view holding the text selection.
-    selected: Option<String>,
-    /// What find searches for, and its current match (the message, and which of its matches).
-    query: Option<String>,
-    current_match: Option<(String, usize)>,
-    generation: u64,
-    /// Lets image fetches wake the worker.
-    wake: Sender<Job>,
-    pending: Arc<AtomicUsize>,
-}
-
-impl Worker {
-    fn run(mut self, jobs: &Receiver<Job>, outputs: &Sender<Output>, ctx: &egui::Context) {
-        while let Ok(first) = jobs.recv() {
-            // While a window resizes, layouts queue up faster than they run, so only the newest
-            // layout (and hover) of each body in the queue is worth doing.
-            let mut batch = vec![first];
-            batch.extend(jobs.try_iter());
-            let superseded: Vec<bool> = batch
-                .iter()
-                .enumerate()
-                .map(|(at, job)| batch[at + 1..].iter().any(|later| job.superseded_by(later)))
-                .collect();
-            for (job, skip) in batch.into_iter().zip(superseded) {
-                // A job answers with an output for each thing it changed. Each output is one unit
-                // of `pending` on the UI side, so the job's own unit is swapped for them.
-                let produced = if skip {
-                    Vec::new()
-                } else {
-                    self.handle_caught(job)
-                };
-                self.pending.fetch_add(produced.len(), Ordering::SeqCst);
-                for output in produced {
-                    if outputs.send(output).is_err() {
-                        return;
-                    }
-                }
-                self.pending.fetch_sub(1, Ordering::SeqCst);
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    /// [`Self::handle`], surviving a panic in the body engine. The message the job was about
-    /// loses its view and render (its body stays a placeholder), and the other bodies carry on.
-    /// Otherwise one hostile body would leave every body blank until Exo restarts.
-    fn handle_caught(&mut self, job: Job) -> Vec<Output> {
-        let id = job.message().map(str::to_owned);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(job))).unwrap_or_else(
-            |_| {
-                log::error!("the body renderer panicked on message {id:?}");
-                if let Some(id) = id {
-                    self.views.remove(&id);
-                    self.renders.remove(&id);
-                }
-                Vec::new()
-            },
-        )
-    }
-
-    fn next_generation(&mut self) -> u64 {
-        self.generation += 1;
-        self.generation
-    }
-
-    fn handle(&mut self, job: Job) -> Vec<Output> {
-        match job {
-            Job::Thread {
-                messages,
-                own_domains,
-                loader,
-                read_receipts,
-                options,
-            } => {
-                self.views.clear();
-                self.current_match = None;
-                let had_selection = self.selected.take().is_some();
-                self.read_receipts = read_receipts;
-                self.receipts_loaded.clear();
-                self.renders = render_thread(&messages, &own_domains, options);
-                let inline = messages
-                    .iter()
-                    .flat_map(|message| message.attachments.iter().cloned())
-                    .collect();
-                self.fetch = Some(Arc::new(fetch::Fetcher::new(
-                    loader,
-                    inline,
-                    self.wake.clone(),
-                    self.pending.clone(),
-                )));
-                let facts = messages
-                    .iter()
-                    .filter_map(|message| {
-                        Some((message.id.clone(), facts(self.renders.get(&message.id)?)))
-                    })
-                    .collect();
-                let mut outputs = vec![Output::Rendered(facts)];
-                outputs.extend(had_selection.then(|| self.selection()));
-                outputs
-            }
-            Job::Layout {
-                id,
-                look,
-                block_remote,
-            } => {
-                let selected = self.selected.clone();
-                let mut outputs: Vec<Output> =
-                    self.layout(&id, look, block_remote).into_iter().collect();
-                outputs.extend(self.find(&id));
-                // A new view has no selection.
-                if selected.is_some() && self.selected.is_none() {
-                    outputs.push(self.selection());
-                }
-                outputs
-            }
-            Job::Paint {
-                id,
-                generation,
-                band,
-                width,
-            } => {
-                let Some(view) = self
-                    .views
-                    .get_mut(&id)
-                    .filter(|view| view.generation == generation)
-                else {
-                    return Vec::new();
-                };
-                let top = band as f32 * BAND;
-                let region = Region {
-                    top,
-                    height: BAND.min(view.height - top).max(1.0),
-                    left: 0.0,
-                    width,
-                    phase: [view.look.phase, 0.0],
-                };
-                let image = view.body.paint(region, view.look.background);
-                vec![Output::Painted {
-                    id,
-                    generation,
-                    band,
-                    image,
-                }]
-            }
-            Job::Animate {
-                id,
-                generation,
-                now,
-                visible,
-            } => {
-                // Always answered, because the UI asks again only once this one is.
-                let Some(view) = self.views.get_mut(&id) else {
-                    return vec![Output::Animated {
-                        id,
-                        generation,
-                        patches: Vec::new(),
-                        next: None,
-                    }];
-                };
-                let animated = view.body.animate(now, visible);
-                let patches = if view.generation == generation {
-                    animated
-                        .changed
-                        .into_iter()
-                        .map(|[x, y, w, h]| {
-                            let [left, top] = [x.floor(), y.floor()];
-                            let region = [left, top, (x + w).ceil() - left, (y + h).ceil() - top];
-                            let [left, top, width, height] = region;
-                            (
-                                region,
-                                view.body.paint(
-                                    Region {
-                                        top,
-                                        height,
-                                        left,
-                                        width,
-                                        phase: [view.look.phase, 0.0],
-                                    },
-                                    view.look.background,
-                                ),
-                            )
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                vec![Output::Animated {
-                    id,
-                    generation,
-                    patches,
-                    next: animated.next,
-                }]
-            }
-            Job::Hover { id, at } => {
-                let hit = self
-                    .views
-                    .get(&id)
-                    .and_then(|view| view.body.hit(at.x, at.y));
-                vec![Output::Hovered { id, hit }]
-            }
-            Job::Click { id, at } => {
-                let hit = self
-                    .views
-                    .get(&id)
-                    .and_then(|view| view.body.hit(at.x, at.y));
-                vec![Output::Clicked { id, hit }]
-            }
-            Job::SelectFrom {
-                id,
-                at,
-                granularity,
-            } => {
-                let mut changed = self.clear_selection();
-                if let Some(view) = self.views.get_mut(&id) {
-                    view.body.select_from(at.x, at.y, granularity);
-                    self.selected = Some(id.clone());
-                    changed.extend(self.repaint(&id));
-                }
-                changed.push(self.selection());
-                changed
-            }
-            Job::SelectTo { id, at } => {
-                let moved = self.selected.as_deref() == Some(&id)
-                    && self
-                        .views
-                        .get_mut(&id)
-                        .is_some_and(|view| view.body.select_to(at.x, at.y));
-                if moved {
-                    self.repaint(&id)
-                        .into_iter()
-                        .chain([self.selection()])
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            Job::ContextMenu { id, at, screen } => {
-                let Some(view) = self.views.get(&id) else {
-                    return Vec::new();
-                };
-                let hit = view.body.context_hit(at.x, at.y);
-                let on_selection = self.selected.as_deref() == Some(&id)
-                    && view
-                        .body
-                        .selection_bounds()
-                        .is_some_and(|[left, top, width, height]| {
-                            Rect::from_min_size(pos2(left, top), vec2(width, height)).contains(at)
-                        });
-                let mut out = Vec::new();
-                if !on_selection {
-                    // A Mac's right-click selects the word under it
-                    // (`SelectClosestWordOrLinkFromMouseEvent`).
-                    out = self.clear_selection();
-                    if hit.text
-                        && let Some(view) = self.views.get_mut(&id)
-                    {
-                        view.body.select_from(at.x, at.y, Granularity::Word);
-                        self.selected = Some(id.clone());
-                        out.extend(self.repaint(&id));
-                    }
-                    out.push(self.selection());
-                }
-                let selection = self
-                    .selected
-                    .as_ref()
-                    .and_then(|selected| self.views.get(selected))
-                    .and_then(|view| {
-                        let text = view.body.selected_text().filter(|text| !text.is_empty())?;
-                        let [left, top, width, height] = view.body.selection_bounds()?;
-                        Some((
-                            text,
-                            Rect::from_min_size(pos2(left, top), vec2(width, height)),
-                        ))
-                    });
-                out.push(Output::ContextMenu {
-                    id,
-                    at,
-                    screen,
-                    hit,
-                    selection,
-                });
-                out
-            }
-            Job::ClearSelection => self.clear_selection(),
-            Job::Copy => {
-                let text = self
-                    .selected
-                    .as_ref()
-                    .and_then(|id| self.views.get(id))
-                    .and_then(|view| view.body.selected_text())
-                    .filter(|text| !text.is_empty());
-                vec![Output::Copied(text)]
-            }
-            Job::Anchor { id, name } => {
-                let top = self
-                    .views
-                    .get(&id)
-                    .and_then(|view| view.body.anchor_top(&name));
-                vec![Output::Anchored { id, top }]
-            }
-            Job::Render {
-                thread,
-                messages,
-                own_domains,
-            } => {
-                let renders =
-                    render_thread(&messages, &own_domains, exo_mail::RenderOptions::default());
-                let facts = messages
-                    .iter()
-                    .filter_map(|message| {
-                        Some((message.id.clone(), facts(renders.get(&message.id)?)))
-                    })
-                    .collect();
-                vec![Output::Conversation { thread, facts }]
-            }
-            Job::Wake => {
-                let ids: Vec<String> = self.views.keys().cloned().collect();
-                let mut changed = Vec::new();
-                for id in ids {
-                    let Some(view) = self.views.get_mut(&id) else {
-                        continue;
-                    };
-                    if view.body.poll() {
-                        view.height = view.body.height();
-                        changed.extend(self.find(&id));
-                        changed.extend(self.repaint(&id));
-                    }
-                }
-                changed
-            }
-            Job::Find(query) => {
-                self.query = query;
-                self.current_match = None;
-                let ids: Vec<String> = self.views.keys().cloned().collect();
-                ids.iter()
-                    .flat_map(|id| self.find(id).into_iter().chain(self.repaint(id)))
-                    .collect()
-            }
-            Job::CurrentMatch(current) => {
-                let before = std::mem::replace(&mut self.current_match, current.clone());
-                let mut changed = Vec::new();
-                for (id, index) in [
-                    before.map(|(id, _)| (id, None)),
-                    current.map(|(id, index)| (id, Some(index))),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if let Some(view) = self.views.get_mut(&id) {
-                        view.body.set_current_match(index);
-                        changed.extend(self.repaint(&id));
-                    }
-                }
-                changed
-            }
-            Job::SelectMatch { id, index } => {
-                let mut changed = self.clear_selection();
-                if let Some(view) = self.views.get_mut(&id) {
-                    view.body.select_match(index);
-                    self.selected = Some(id.clone());
-                    changed.extend(self.repaint(&id));
-                }
-                changed.push(self.selection());
-                changed
+        Hit::Date { text, .. } => {
+            if clickable_date(text) {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Text
             }
         }
-    }
-
-    /// Searches message `id`'s body for find's query (or takes its highlights away), keeping the
-    /// current match if it's there. `None` without a view.
-    fn find(&mut self, id: &str) -> Option<Output> {
-        let view = self.views.get_mut(id)?;
-        let boxes = match &self.query {
-            Some(query) => view.body.find(|text| exo_ui::find::matches(text, query)),
-            None => {
-                view.body.clear_find();
-                Vec::new()
-            }
-        };
-        if let Some((_, index)) = self
-            .current_match
-            .as_ref()
-            .filter(|(current, _)| current == id)
-        {
-            view.body.set_current_match(Some(*index));
-        }
-        let boxes = boxes
-            .into_iter()
-            .map(|[left, top, width, height]| {
-                Rect::from_min_size(pos2(left, top), vec2(width, height))
-            })
-            .collect();
-        Some(Output::Found {
-            id: id.to_owned(),
-            query: self.query.clone(),
-            boxes,
-        })
-    }
-
-    /// Lays message `id` out with `look`, building its view if the look (or `block_remote`)
-    /// needs a new one. Under `Show all images`, a message's first view since its thread opened
-    /// loads its read receipts.
-    fn layout(&mut self, id: &str, look: Look, block_remote: bool) -> Option<Output> {
-        let render = self.renders.get(id)?;
-        let fonts = &self.fonts;
-        let rebuild = self.views.get(id).is_none_or(|view| {
-            (
-                view.look.theme,
-                view.look.rem,
-                view.look.show_quoted,
-                view.look.hide_original,
-                view.block_remote,
-            ) != (
-                look.theme,
-                look.rem,
-                look.show_quoted,
-                look.hide_original,
-                block_remote,
-            )
-        });
-        if rebuild {
-            let options = ViewOptions {
-                theme: match look.theme {
-                    exo_ui::Theme::Snow => exo_mail::Theme::Light,
-                    exo_ui::Theme::Carbon => exo_mail::Theme::Dark,
-                },
-                show_quoted: look.show_quoted,
-                rem: look.rem,
-                block_remote_content: block_remote,
-            };
-            let hidden = look.hide_original.then(|| hidden(render));
-            let body = BodyView::new(
-                hidden.as_ref().unwrap_or(render),
-                options,
-                fonts,
-                self.fetch.clone(),
-            );
-            if self.selected.as_deref() == Some(id) {
-                self.selected = None;
-            }
-            if self.read_receipts
-                && self.receipts_loaded.insert(id.to_owned())
-                && let Some(fetch) = &self.fetch
-            {
-                exo_mail::load_read_receipts(render, fetch.as_ref());
-            }
-            self.views.insert(
-                id.to_owned(),
-                View {
-                    body,
-                    look,
-                    block_remote,
-                    height: 0.0,
-                    generation: 0,
-                },
-            );
-        }
-        let generation = self.next_generation();
-        let view = self.views.get_mut(id)?;
-        view.height = view.body.layout(look.width, look.scale);
-        view.look = look;
-        view.generation = generation;
-        Some(view.laid(id))
-    }
-
-    /// Marks `id`'s painted bands stale (its selection or images changed).
-    fn repaint(&mut self, id: &str) -> Option<Output> {
-        let generation = self.next_generation();
-        let view = self.views.get_mut(id)?;
-        view.generation = generation;
-        Some(view.laid(id))
-    }
-
-    fn clear_selection(&mut self) -> Vec<Output> {
-        let Some(id) = self.selected.take() else {
-            return Vec::new();
-        };
-        if let Some(view) = self.views.get_mut(&id) {
-            view.body.clear_selection();
-        }
-        self.repaint(&id)
-            .into_iter()
-            .chain([self.selection()])
-            .collect()
-    }
-
-    /// The selection as the UI keeps it.
-    fn selection(&self) -> Output {
-        let selected = self.selected.as_ref().and_then(|id| {
-            let body = &self.views.get(id)?.body;
-            let [left, top, width, height] = body.selection_bounds()?;
-            Some(Selected {
-                message: id.clone(),
-                html: body.selected_html()?,
-                text: body.selected_text().unwrap_or_default(),
-                bounds: Rect::from_min_size(pos2(left, top), vec2(width, height)),
-            })
-        });
-        Output::Selected(selected)
     }
 }
 
@@ -1648,144 +1127,9 @@ fn visible_bands(from: f32, to: f32, height: f32) -> Range<u32> {
     band((from / BAND).floor())..band((to / BAND).ceil())
 }
 
-/// Runs the pipeline on every message, oldest first, each against the one it replies to, which is
-/// the message its `In-Reply-To` names or else the one before it.
-fn render_thread(
-    sources: &[MessageDetail],
-    own_domains: &[String],
-    options: exo_mail::RenderOptions,
-) -> HashMap<String, Render> {
-    let messages: Vec<exo_mail::Message> = sources
-        .iter()
-        .map(|source| exo_mail::Message {
-            html: body_html(&source.body),
-            from_email: source
-                .from
-                .as_ref()
-                .map(|from| from.email.clone())
-                .unwrap_or_default(),
-            from_name: source
-                .from
-                .as_ref()
-                .and_then(|from| from.name.clone())
-                .unwrap_or_default(),
-            rfc822_id: source.rfc822_id.clone().unwrap_or_default(),
-            attachment_names: source
-                .attachments
-                .iter()
-                .filter(|attachment| !attachment.inline)
-                .map(|attachment| attachment.filename.clone())
-                .collect(),
-        })
-        .collect();
-    let mut renders: Vec<Render> = Vec::with_capacity(messages.len());
-    for (at, message) in messages.iter().enumerate() {
-        let parent = sources[at]
-            .in_reply_to
-            .as_ref()
-            .and_then(|parent| {
-                sources[..at]
-                    .iter()
-                    .position(|earlier| earlier.rfc822_id.as_ref() == Some(parent))
-            })
-            .or(at.checked_sub(1));
-        let replying_to = parent.map(|parent| (&messages[parent], &renders[parent]));
-        renders.push(exo_mail::render_with(
-            message,
-            replying_to,
-            own_domains,
-            options,
-        ));
-    }
-    sources
-        .iter()
-        .map(|source| source.id.clone())
-        .zip(renders)
-        .collect()
-}
-
-/// The text a reader sees in each of `sources`, each read against the one it replies to as
-/// [`render_thread`] reads them. This is what the search index holds (`Store::index_text_with`).
-pub(crate) fn visible_texts(sources: &[exo_store::TextSource]) -> Vec<String> {
-    let messages: Vec<exo_mail::Message> = sources
-        .iter()
-        .map(|source| exo_mail::Message {
-            html: body_html(&source.body),
-            from_email: source.from_email.clone(),
-            from_name: source.from_name.clone(),
-            rfc822_id: source.rfc822_id.clone(),
-            attachment_names: source.attachment_names.clone(),
-        })
-        .collect();
-    let mut renders: Vec<Render> = Vec::with_capacity(messages.len());
-    for (at, message) in messages.iter().enumerate() {
-        let replying_to = sources[at]
-            .replying_to
-            .filter(|parent| *parent < at)
-            .map(|parent| (&messages[parent], &renders[parent]));
-        renders.push(exo_mail::render(message, replying_to, &[]));
-    }
-    renders
-        .into_iter()
-        .map(|render| render.visible_text)
-        .collect()
-}
-
-/// A body as the pipeline takes it, which is its HTML or its plain text as HTML.
-fn body_html(body: &exo_store::Body) -> String {
-    match (&body.html, &body.text) {
-        (Some(html), _) => html.clone(),
-        (None, Some(text)) => exo_mail::text_to_html(text),
-        (None, None) => String::new(),
-    }
-}
-
-fn facts(render: &Render) -> Facts {
-    Facts {
-        snippet: render.snippet.clone(),
-        visible_chars: render.visible_text.chars().count(),
-        has_quoted: render.has_quoted_content,
-        unquoted_marketing: render.unquoted_is_marketing,
-        quoted_marketing: render.quoted_is_marketing,
-        tracking_blocked: !render.read_status_urls.is_empty(),
-        remote_images: render.has_remote_images,
-        unsubscribe: render
-            .unsubscribe_link
-            .as_ref()
-            .map(|link| link.url.clone()),
-        unquoted_html: render.unquoted_html.clone(),
-        quoted_html: render.quoted_html.clone(),
-        html: render.html.clone(),
-        body_attributes: render.body_attributes.clone(),
-        links: render.links.clone(),
-        actions: render.actions.clone(),
-        calendar: render.calendar_data.clone(),
-        unquoted_dates: render.unquoted_dates.clone(),
-        proposes_time: render.proposes_time,
-    }
-}
-
-/// The render of a body that its invite card replaces. It has no new part and no `<body>`
-/// attributes, and the original new part, when it has anything, becomes the quoted part behind
-/// the `…`.
-fn hidden(render: &Render) -> Render {
-    let has_body = !render.unquoted_html.trim().is_empty();
-    Render {
-        unquoted_html: String::new(),
-        quoted_html: if has_body {
-            render.unquoted_html.clone()
-        } else {
-            String::new()
-        },
-        has_quoted_content: has_body,
-        body_attributes: exo_mail::BodyAttributes::default(),
-        ..render.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{worker::clip_animated_region, *};
 
     #[test]
     fn the_images_setting_decides_what_shows_and_changing_it_forgets_shown_messages() {
@@ -1862,9 +1206,9 @@ mod tests {
         assert!(visible_texts(&[source("b", &reply, None)])[0].contains("walrus"));
     }
 
-    /// A store on gmail-mock with the app's visible text, synced.
+    /// A store on mock-servers with the app's visible text, synced.
     async fn indexed_store(
-        server: &gmail_mock::MockServer,
+        server: &mock_servers::MockServer,
         dir: &std::path::Path,
     ) -> exo_store::Store {
         let options = exo_store::Options {
@@ -1875,7 +1219,7 @@ mod tests {
             dir,
             "maya@brightmoor.co",
             server.endpoints(),
-            gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()),
+            gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()),
             options,
         )
         .await
@@ -1889,7 +1233,7 @@ mod tests {
     fn search_finds_what_a_message_shows_and_not_what_it_quotes() {
         let runtime = tokio::runtime::Runtime::new().expect("a runtime");
         runtime.block_on(async {
-            let server = gmail_mock::MockServer::start(gmail_mock::Config::default()).await.expect("the mock starts");
+            let server = mock_servers::MockServer::start(mock_servers::Config::default()).await.expect("the mock starts");
             let dir = std::env::temp_dir().join(format!("exo-index-text-search-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let store = indexed_store(&server, &dir).await;
@@ -1928,11 +1272,11 @@ mod tests {
         type Spent = Arc<std::sync::Mutex<(std::time::Duration, usize, usize)>>;
         let runtime = tokio::runtime::Runtime::new().expect("a runtime");
         runtime.block_on(async {
-            let server = gmail_mock::MockServer::start(gmail_mock::Config::default()).await.expect("the mock starts");
+            let server = mock_servers::MockServer::start(mock_servers::Config::default()).await.expect("the mock starts");
             let dir = std::env::temp_dir().join(format!("exo-index-text-cost-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let options = exo_store::Options { quota: None, ..exo_store::Options::default() };
-            let store = exo_store::Store::open_with(&dir, "maya@brightmoor.co", server.endpoints(), gmail::StaticToken(gmail_mock::DEV_ACCESS_TOKEN.into()), options).await.expect("opens");
+            let store = exo_store::Store::open_with(&dir, "maya@brightmoor.co", server.endpoints(), gmail::StaticToken(mock_servers::DEV_ACCESS_TOKEN.into()), options).await.expect("opens");
             let spent = Spent::default();
             let counted = spent.clone();
             store.index_text_with(Arc::new(move |sources: &[exo_store::TextSource]| {
@@ -1989,5 +1333,121 @@ mod tests {
         );
         // A hostile `height: 1e11px` costs the bands on screen, not 200 million of them.
         assert!(visible_bands(5e10, 5e10 + 800.0, 1e11).len() <= 3);
+    }
+
+    #[test]
+    fn clips_and_clamps_animated_regions_to_viewport_and_max_texture() {
+        assert_eq!(
+            clip_animated_region([10.2, 20.4, 32.0, 32.0], &(0.0..800.0), 600.0, 2.0, 8192),
+            Some([10.0, 20.0, 33.0, 33.0]),
+            "on-screen GIF snaps to whole CSS pixels"
+        );
+        assert_eq!(
+            clip_animated_region(
+                [0.0, 0.0, 2000.0, 50_000.0],
+                &(1200.0..2000.0),
+                640.0,
+                2.0,
+                8192
+            ),
+            Some([0.0, 1200.0, 640.0, 800.0]),
+            "tall tiled background is clipped to visible y-range and body_width"
+        );
+        assert_eq!(
+            clip_animated_region(
+                [0.0, -300.0, 600.0, 500.0],
+                &(-150.0..700.0),
+                600.0,
+                2.0,
+                8192
+            ),
+            Some([0.0, 0.0, 600.0, 200.0]),
+            "negative y and negative visible.start clamp at 0.0"
+        );
+        assert_eq!(
+            clip_animated_region(
+                [0.0, 0.0, 5000.0, 5000.0],
+                &(0.0..5000.0),
+                5000.0,
+                2.0,
+                4096
+            ),
+            Some([0.0, 0.0, 2047.0, 2047.0]),
+            "pixel dimensions clamp to max_texture_side at retina scale"
+        );
+        assert_eq!(
+            clip_animated_region([0.0, 900.0, 100.0, 100.0], &(0.0..800.0), 600.0, 2.0, 8192),
+            None,
+            "below viewport is skipped"
+        );
+        assert_eq!(
+            clip_animated_region([650.0, 100.0, 50.0, 50.0], &(0.0..800.0), 600.0, 2.0, 8192),
+            None,
+            "past body_width is skipped"
+        );
+        assert_eq!(
+            clip_animated_region([10.0, 10.0, 0.0, 50.0], &(0.0..800.0), 600.0, 2.0, 8192),
+            None,
+            "zero-width animation is skipped"
+        );
+    }
+
+    #[test]
+    fn pointer_state_tracks_multi_clicks_and_picks_cursors() {
+        let mut state = PointerState::default();
+        assert_eq!(state.record_press(1.0, pos2(10.0, 10.0)), 1);
+        assert!(!state.is_multi_click());
+        assert_eq!(state.record_press(1.2, pos2(11.0, 11.0)), 2);
+        assert!(state.is_multi_click());
+        assert_eq!(state.record_press(1.4, pos2(11.0, 12.0)), 3);
+        assert_eq!(state.record_press(1.5, pos2(11.0, 12.0)), 3, "caps at 3");
+        assert_eq!(
+            state.record_press(2.5, pos2(11.0, 12.0)),
+            1,
+            "delay resets count"
+        );
+        assert_eq!(
+            state.record_press(2.6, pos2(30.0, 12.0)),
+            1,
+            "distance resets count"
+        );
+
+        assert_eq!(
+            cursor_for_hit(&Hit::Text, |_| false),
+            egui::CursorIcon::Text
+        );
+        assert_eq!(
+            cursor_for_hit(
+                &Hit::Link {
+                    href: "https://example.com".into()
+                },
+                |_| false
+            ),
+            egui::CursorIcon::PointingHand
+        );
+        assert_eq!(
+            cursor_for_hit(&Hit::QuoteToggle, |_| false),
+            egui::CursorIcon::PointingHand
+        );
+        assert_eq!(
+            cursor_for_hit(
+                &Hit::Date {
+                    text: "tomorrow".into(),
+                    bounds: [0.0; 4],
+                },
+                |_| true
+            ),
+            egui::CursorIcon::PointingHand
+        );
+        assert_eq!(
+            cursor_for_hit(
+                &Hit::Date {
+                    text: "someday".into(),
+                    bounds: [0.0; 4],
+                },
+                |_| false
+            ),
+            egui::CursorIcon::Text
+        );
     }
 }

@@ -6,8 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, Context, Rect, Sense, Ui, pos2, vec2};
-use exo_ui::{Dialog, DialogDropdown, DialogResponse, Family, Font, Menu, TextStyle};
+use egui::{Color32, Context, Rect, Ui, pos2};
+use exo_commands::{Command, Commands, Region};
+use exo_ui::{
+    Dialog, DialogResponse, DialogSelect, DialogSelectEvent, DialogSelectState, Family, Font,
+    TextStyle,
+};
 
 /// The subheader: 12px/20px, `padding-top: 24px`, 3px down, `margin-bottom: 16px`.
 const LINE: TextStyle = TextStyle::new(Font::new(Family::Sans, 400), 12.0, 20.0);
@@ -21,8 +25,6 @@ const BODY_HEIGHT: f32 = 88.0;
 /// The subheader's `rgba(0, 0, 0, .85)`, the label's `.7`.
 const SUBHEADER_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 217);
 const LABEL_INK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 179);
-/// The open list: 18px left of the value and 26px under the button.
-const MENU_OFFSET: egui::Vec2 = vec2(-18.0, 26.0);
 const SUBHEADER: &str = "Choose where to download attachments.";
 const LABEL: &str = "Download attachments to:";
 
@@ -99,29 +101,71 @@ pub enum Event {
 /// The open list's highlighted row, between frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    menu: Option<usize>,
+    menu: DialogSelectState,
 }
 
 impl State {
     /// Whether the list is open, so that Escape closes it rather than the dialog.
     pub fn menu_open(&self) -> bool {
-        self.menu.is_some()
+        self.menu.is_open()
+    }
+
+    /// Registers the dialog's keyboard bindings in `Region::Dialog` (plus its alert's dismiss
+    /// bindings while `alert` is showing).
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        alert: bool,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::Downloads(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        if self.menu_open() {
+            commands.add(key(
+                "DOWNLOADS_MENU_DOWN",
+                Event::MenuMove(1),
+                &["down", "j", "n"],
+            ));
+            commands.add(key(
+                "DOWNLOADS_MENU_UP",
+                Event::MenuMove(-1),
+                &["up", "k", "p"],
+            ));
+            commands.add(key(
+                "DOWNLOADS_MENU_PICK",
+                Event::MenuPick,
+                &["enter", "tab"],
+            ));
+            commands.add(key("DOWNLOADS_MENU_ESCAPE", Event::MenuClose, &["esc"]));
+        } else {
+            commands.add(key(
+                "DOWNLOADS_MENU_OPEN",
+                Event::ToggleMenu,
+                &["enter", "space", "down", "j", "n", "up", "k", "p"],
+            ));
+        }
+        if alert {
+            crate::notice::register_alert_dismiss(
+                commands,
+                wrap(super::Action::DismissDownloadsAlert),
+            );
+        }
     }
 
     /// Applies `event` to the list, whose rows are `choices`, and returns the row chosen.
     pub fn handle(&mut self, event: Event, choices: &[Choice]) -> Option<Choice> {
         match event {
-            Event::ToggleMenu => self.menu = if self.menu.is_some() { None } else { Some(0) },
-            Event::MenuMove(step) => {
-                self.menu = self
-                    .menu
-                    .map(|at| (at as isize + step).rem_euclid(choices.len() as isize) as usize)
-            }
-            Event::MenuClose => self.menu = None,
-            Event::Highlight(row) => self.menu = Some(row),
-            Event::MenuPick => return self.menu.take().and_then(|at| choices.get(at).cloned()),
+            Event::ToggleMenu => self.menu.toggle(0),
+            Event::MenuMove(step) => self.menu.step(step, choices.len(), 0, true, false),
+            Event::MenuClose => self.menu.close(),
+            Event::Highlight(row) => self.menu.open_at(row),
+            Event::MenuPick => return self.menu.confirm().and_then(|at| choices.get(at).cloned()),
             Event::Choose(choice) => {
-                self.menu = None;
+                self.menu.close();
                 return Some(choice);
             }
         }
@@ -160,73 +204,35 @@ fn draw(ui: &mut Ui, body: Rect, state: &State, choices: &[Choice]) -> Option<Ev
         None,
     );
     let names: Vec<String> = choices.iter().map(Choice::name).collect();
-    // The dropdown has the keyboard, so its caret shows.
-    let palette = exo_ui::palette(ui.ctx());
-    let style = DialogDropdown {
-        value: palette.ink(0.7, 0.7),
-        caret: palette.ink(0.5, 0.5),
-        gap: 10.0,
-    };
-    let selected = names.first().map_or("Downloads", String::as_str);
-    let button = exo_ui::paint_dialog_dropdown_with(
-        ui,
+    let items: Vec<&str> = names.iter().map(String::as_str).collect();
+    let selected = items.first().copied().unwrap_or("Downloads");
+    DialogSelect::new(
+        exo_ui::id(ui.ctx(), "downloads-location"),
         pos2(left + label + VALUE_LEFT, top + VALUE_TOP),
         selected,
-        style,
-    );
-    let response = ui
-        .interact(
-            button,
-            exo_ui::id(ui.ctx(), "downloads-location"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let mut event = response.clicked().then_some(Event::ToggleMenu);
-    if let Some(highlighted) = state.menu {
-        let items: Vec<&str> = names.iter().map(String::as_str).collect();
-        let list = Menu {
-            items: &items,
-            highlighted,
-        }
-        .show_in_dialog(
-            ui,
-            exo_ui::id(ui.ctx(), "downloads-location-list"),
-            button.left_top() + MENU_OFFSET,
-        );
-        if let Some(clicked) = list.clicked {
-            event = Some(Event::Choose(choices[clicked].clone()));
-        } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-            event = Some(Event::Highlight(hovered));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
-            event = Some(Event::MenuClose);
-        }
-    }
-    event
+        &items,
+        state.menu.highlighted(),
+    )
+    .show(ui)
+    .map(|ev| match ev {
+        DialogSelectEvent::Toggle => Event::ToggleMenu,
+        DialogSelectEvent::Highlight(row) => Event::Highlight(row),
+        DialogSelectEvent::Pick(row) => Event::Choose(choices[row].clone()),
+        DialogSelectEvent::Close => Event::MenuClose,
+    })
 }
 
 /// `Could not change download folder` over the dialog in `area`. Returns whether it was
 /// dismissed (`OK`, or a click beside it).
 pub fn alert(ctx: &Context, area: Rect) -> bool {
-    let alert = exo_ui::Alert {
+    let (clicked, backdrop) = (exo_ui::Alert {
         title: "Could not change download folder",
         text: "Your download folder could not be changed. Please try again.",
         actions: &["OK"],
         selected: 0,
-    };
-    egui::Area::new(exo_ui::id(ctx, "downloads-alert"))
-        .order(egui::Order::Tooltip)
-        .fixed_pos(area.min)
-        .show(ctx, |ui| {
-            // The alert's backdrop, over the dialog's.
-            let backdrop = ui.allocate_rect(area, Sense::click());
-            ui.painter()
-                .rect_filled(area, 0.0, Color32::from_black_alpha(128));
-            alert.show(ui, area).is_some() || backdrop.clicked()
-        })
-        .inner
+    })
+    .show_modal(ctx, "downloads-alert", area);
+    clicked.is_some() || backdrop
 }
 
 #[cfg(test)]
@@ -259,9 +265,9 @@ mod tests {
         let rows = choices(None, None, None);
         let mut state = State::default();
         assert_eq!(state.handle(Event::ToggleMenu, &rows), None);
-        assert_eq!(state.menu, Some(0), "on the folder in use");
+        assert_eq!(state.menu.highlighted(), Some(0), "on the folder in use");
         state.handle(Event::MenuMove(-1), &rows);
-        assert_eq!(state.menu, Some(2), "wraps");
+        assert_eq!(state.menu.highlighted(), Some(2), "wraps");
         assert_eq!(state.handle(Event::MenuPick, &rows), Some(Choice::Other));
         assert!(!state.menu_open());
         state.handle(Event::ToggleMenu, &rows);

@@ -54,7 +54,7 @@ open target/release/Examail.app
 A local build is signed ad hoc, so macOS might ask you for Keychain access after each rebuild.
 You can optionally set a signing identity with `EXO_SIGN_IDENTITY` to avoid that.
 
-Run `cargo test --workspace` to run the tests. They use a mock Gmail server (`crates/gmail-mock`), so they never hit Google's servers.
+Run `cargo test --workspace` to run the tests. They use mock Google and Microsoft servers (`crates/mock-servers`), so they never hit Google's servers.
 
 ## Releasing
 

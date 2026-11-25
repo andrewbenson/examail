@@ -20,9 +20,7 @@ mod notifications;
 mod reminders;
 mod signatures;
 
-pub(crate) use blocked_senders::{
-    highlight as block_highlight, paint_footer as paint_dialog_footer,
-};
+pub(crate) use exo_ui::{dialog_highlight as block_highlight, paint_dialog_footer};
 pub(crate) use menu::footer_shadow;
 mod split_inbox;
 mod split_library;
@@ -53,10 +51,7 @@ pub(crate) use split_inbox::{
 
 /// The announcement the gear's dot is for. The dot shows until Settings is opened on this device.
 const NEW_SETTING: &str = "2023-06-13-salespackUI";
-/// Where Escape closes a dialog.
 const DIALOG: &[Region] = &[Region::Dialog];
-/// Where an alert's keys work.
-const ALERT: &[Region] = &[Region::Alert];
 
 /// What a settings command, row or button does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,13 +328,6 @@ impl Settings {
         });
     }
 
-    /// Split Inbox's sender picker, while a template's settings show it.
-    pub(crate) fn sender_picker_mut(
-        &mut self,
-    ) -> Option<&mut crate::contact_picker::ContactPicker> {
-        self.splits.sender_picker_mut()
-    }
-
     /// What `key` does in the Accounts dialog's open color picker, whose rows are `accounts`. It
     /// gives the color an account changes to, if any.
     pub fn account_picker_key(
@@ -422,7 +410,14 @@ impl Settings {
                 self.splits.open_library_at_role(&role);
                 self.open(Dialog::SplitInbox);
             }
-            Action::CloseDialog => self.dialog_open = false,
+            Action::CloseDialog => {
+                if self.dialog == Some(Dialog::Reminders)
+                    && let Some(saved) = self.reminders.close(&account.settings().reminders, now)
+                {
+                    account.update_settings(|settings| settings.reminders = saved);
+                }
+                self.dialog_open = false;
+            }
             Action::SetTheme(theme) => account.update_settings(|settings| settings.theme = theme),
             // The messages whose images were shown are forgotten as the body sees the change.
             Action::SetImages(images) => {
@@ -469,10 +464,7 @@ impl Settings {
                     }
                     // `Gmail settings`, signed in as the account (`authuser`).
                     Some(signatures::Event::OpenGmail) => {
-                        let url = format!(
-                            "https://mail.google.com/?shxr=0&authuser={}#settings/general",
-                            account.email()
-                        );
+                        let url = gmail_settings_url(account.email());
                         self.ctx.open_url(egui::OpenUrl::new_tab(url));
                     }
                     _ => {}
@@ -656,9 +648,9 @@ impl Settings {
         self.dialog_open = true;
     }
 
-    /// Registers Escape for hiding the menu while it shows, and the split dialogs' keys while one
-    /// is open. Call after the screens register their own Escape, which this shadows. Backspace,
-    /// which shares their action, leaves the menu as it is.
+    /// Registers Escape for hiding the menu while it shows, and the open dialog's keys. Call after
+    /// the screens register their own Escape, which this shadows. Backspace, which shares their
+    /// action, leaves the menu as it is.
     pub fn register_escape<A: Clone + 'static>(
         &self,
         commands: &mut Commands<A>,
@@ -671,350 +663,30 @@ impl Settings {
                     .regions(LIST_AND_THREAD),
             );
         }
-        if self.dialog_open && self.dialog == Some(Dialog::Accounts) && self.accounts.picker_open()
-        {
-            // The colour picker's region shortcuts, as every colour picker has them.
-            crate::calendar::register_picker_keys(commands, DIALOG, |key| {
-                wrap(Action::AccountPicker(key))
-            });
+        if !self.dialog_open {
+            return;
         }
-        if self.dialog_open && self.dialog == Some(Dialog::Reminders) {
-            use reminders::Event;
-            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::Reminders(event)))
-                    .keys(keys.iter().copied())
-                    .regions(DIALOG)
-            };
-            if self.reminders.menu_open() {
-                commands.add(key(
-                    "REMINDERS_MENU_DOWN",
-                    Event::MenuMove(1),
-                    &["down", "j"],
-                ));
-                commands.add(key("REMINDERS_MENU_UP", Event::MenuMove(-1), &["up", "k"]));
-                commands.add(key("REMINDERS_MENU_ESCAPE", Event::MenuClose, &["esc"]));
+        let Some(dialog) = self.dialog else {
+            return;
+        };
+        match dialog {
+            Dialog::Accounts => self.accounts.register_keys(commands, &wrap),
+            Dialog::Reminders => self.reminders.register_keys(commands, &wrap),
+            Dialog::AutoAdvance => self.auto_advance.register_keys(commands, &wrap),
+            Dialog::Signatures => self.signatures.register_keys(commands, &wrap),
+            Dialog::Downloads => {
+                self.downloads
+                    .register_keys(commands, self.downloads_alert, &wrap);
             }
-            commands.add(key("REMINDERS_TAB", Event::Tab(1), &["tab"]));
-            commands.add(key("REMINDERS_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
-            commands.add(key("REMINDERS_ENTER", Event::Enter, &["enter"]));
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::AutoAdvance) {
-            // The dropdown has the keyboard from the start. The arrows open the list or move round
-            // it, and Enter opens it or takes the row. With the list open, Tab takes the row and
-            // Escape closes the list.
-            use auto_advance::Event;
-            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::AutoAdvance(event)))
-                    .keys(keys.iter().copied())
-                    .regions(DIALOG)
-            };
-            commands.add(key(
-                "AUTO_ADVANCE_DOWN",
-                Event::Move(1),
-                &["down", "j", "n"],
-            ));
-            commands.add(key("AUTO_ADVANCE_UP", Event::Move(-1), &["up", "k", "p"]));
-            if self.auto_advance.menu_open() {
-                commands.add(key("AUTO_ADVANCE_ENTER", Event::Enter, &["enter", "tab"]));
-                commands.add(key("AUTO_ADVANCE_ESCAPE", Event::MenuClose, &["esc"]));
-            } else {
-                commands.add(key("AUTO_ADVANCE_ENTER", Event::ToggleMenu, &["enter"]));
+            Dialog::AutoBcc => self.auto_bcc.register_keys(commands, &wrap),
+            Dialog::Emoji => emoji::State::register_keys(commands, &wrap),
+            Dialog::InstantIntro => self.instant_intro.register_keys(commands, &wrap),
+            Dialog::Notifications => self.notifications.register_keys(commands, &wrap),
+            Dialog::BlockedSenders => self.blocked.register_keys(commands, &wrap),
+            Dialog::SplitInbox | Dialog::HideEmptySplits => {
+                self.splits.register_keys(commands, &wrap);
             }
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::Signatures) {
-            use signatures::{Event, Focus};
-            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::Signatures(event)))
-                    .keys(keys.iter().copied())
-                    .regions(DIALOG)
-            };
-            if self.signatures.menu_open() {
-                commands.add(key(
-                    "SIGNATURES_MENU_DOWN",
-                    Event::MenuMove(1),
-                    &["down", "j", "n"],
-                ));
-                commands.add(key(
-                    "SIGNATURES_MENU_UP",
-                    Event::MenuMove(-1),
-                    &["up", "k", "p"],
-                ));
-                commands.add(key(
-                    "SIGNATURES_MENU_PICK",
-                    Event::MenuPick,
-                    &["enter", "tab"],
-                ));
-                commands.add(key("SIGNATURES_MENU_ESCAPE", Event::MenuClose, &["esc"]));
-            } else {
-                if self.signatures.focus() == Some(Focus::Dropdown) {
-                    commands.add(key(
-                        "SIGNATURES_MENU_OPEN",
-                        Event::ToggleMenu,
-                        &["down", "j", "n", "up", "k", "p"],
-                    ));
-                }
-                commands.add(key("SIGNATURES_TAB", Event::Tab(1), &["tab"]));
-                commands.add(key("SIGNATURES_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
-                commands.add(key(
-                    "SIGNATURES_ACTIVATE",
-                    Event::Activate,
-                    &["enter", "space"],
-                ));
-            }
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::Downloads) {
-            use downloads::Event;
-            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::Downloads(event)))
-                    .keys(keys.iter().copied())
-                    .regions(DIALOG)
-            };
-            if self.downloads.menu_open() {
-                commands.add(key(
-                    "DOWNLOADS_MENU_DOWN",
-                    Event::MenuMove(1),
-                    &["down", "j", "n"],
-                ));
-                commands.add(key(
-                    "DOWNLOADS_MENU_UP",
-                    Event::MenuMove(-1),
-                    &["up", "k", "p"],
-                ));
-                commands.add(key(
-                    "DOWNLOADS_MENU_PICK",
-                    Event::MenuPick,
-                    &["enter", "tab"],
-                ));
-                commands.add(key("DOWNLOADS_MENU_ESCAPE", Event::MenuClose, &["esc"]));
-            } else {
-                // The dropdown has the keyboard, so Enter or Space clicks it and an arrow opens it.
-                commands.add(key(
-                    "DOWNLOADS_MENU_OPEN",
-                    Event::ToggleMenu,
-                    &["enter", "space", "down", "j", "n", "up", "k", "p"],
-                ));
-            }
-            if self.downloads_alert {
-                commands.add(
-                    Command::shortcut("ALERT_OK", wrap(Action::DismissDownloadsAlert))
-                        .keys(["enter", "mod+enter", "space", "esc"])
-                        .regions(ALERT),
-                );
-            }
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::AutoBcc) {
-            use auto_bcc::Event;
-            let key = |id: &'static str, event: Event, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::AutoBcc(event)))
-                    .keys(keys.iter().copied())
-                    .regions(DIALOG)
-            };
-            commands.add(key("AUTO_BCC_TAB", Event::Tab(1), &["tab"]));
-            commands.add(key("AUTO_BCC_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
-            // Space types in the inputs. On a link or a trash can it works as Enter.
-            let activate: &[&str] = if self.auto_bcc.typing() {
-                &["enter"]
-            } else {
-                &["enter", "space"]
-            };
-            commands.add(key("AUTO_BCC_ENTER", Event::Activate, activate));
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::Emoji) {
-            let step = |id: &'static str, delta: isize, keys: &[&'static str]| {
-                Command::shortcut(id, wrap(Action::Emoji(emoji::Event::Step(delta))))
-                    .keys(keys.iter().copied())
-                    .repeat(wrap(Action::Emoji(emoji::Event::Step(delta))))
-                    .regions(DIALOG)
-            };
-            commands.add(step("EMOJI_SKIN_TONE_NEXT", 1, &["tab", "right"]));
-            commands.add(step("EMOJI_SKIN_TONE_PREVIOUS", -1, &["shift+tab", "left"]));
-            commands.add(
-                Command::shortcut("EMOJI_SKIN_TONE_ENTER", wrap(Action::CloseDialog))
-                    .key("enter")
-                    .regions(DIALOG),
-            );
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::InstantIntro) {
-            use instant_intro::Event;
-            let key = |id: &'static str,
-                       event: Event,
-                       keys: &[&'static str],
-                       region: &'static [Region]| {
-                Command::shortcut(id, wrap(Action::InstantIntro(event)))
-                    .keys(keys.iter().copied())
-                    .regions(region)
-            };
-            commands.add(key("INSTANT_INTRO_TAB", Event::Tab(1), &["tab"], DIALOG));
-            commands.add(key(
-                "INSTANT_INTRO_SHIFT_TAB",
-                Event::Tab(-1),
-                &["shift+tab"],
-                DIALOG,
-            ));
-            commands.add(key("INSTANT_INTRO_ENTER", Event::Enter, &["enter"], DIALOG));
-            commands.add(key(
-                "ALERT_CONFIRM",
-                Event::AlertConfirm,
-                &["enter", "mod+enter", "space"],
-                ALERT,
-            ));
-            commands.add(key("ALERT_ESCAPE", Event::AlertDismiss, &["esc"], ALERT));
-            commands.add(key(
-                "ALERT_NEXT",
-                Event::AlertCycle(-1),
-                &["right", "tab"],
-                ALERT,
-            ));
-            commands.add(key(
-                "ALERT_PREVIOUS",
-                Event::AlertCycle(1),
-                &["left", "shift+tab"],
-                ALERT,
-            ));
-        }
-        if self.dialog_open
-            && self.dialog == Some(Dialog::Notifications)
-            && self.notifications.menu_open()
-        {
-            commands.add(
-                Command::shortcut(
-                    "NOTIFY_ME_ESCAPE",
-                    wrap(Action::Notifications(NotificationsEvent::Escape)),
-                )
-                .key("esc")
-                .regions(DIALOG),
-            );
-        }
-        if self.dialog_open
-            && self.dialog == Some(Dialog::Notifications)
-            && self.notifications.picker_open()
-        {
-            crate::calendar::register_picker_keys(commands, crate::calendar::PICKER, |key| {
-                wrap(Action::Notifications(NotificationsEvent::PickerKey(key)))
-            });
-        }
-        if self.dialog_open && self.dialog == Some(Dialog::BlockedSenders) {
-            use blocked_senders::Event;
-            let blocked = |id: &'static str,
-                           event: Event,
-                           keys: &[&'static str],
-                           region: &'static [Region]| {
-                Command::shortcut(id, wrap(Action::Blocked(event)))
-                    .keys(keys.iter().copied())
-                    .regions(region)
-            };
-            commands.add(blocked(
-                "BLOCKED_DOWN",
-                Event::Move(1),
-                &["down", "j", "tab", "ctralt+j", "ctralt+n"],
-                DIALOG,
-            ));
-            commands.add(blocked(
-                "BLOCKED_UP",
-                Event::Move(-1),
-                &["up", "k", "shift+tab", "ctralt+k", "ctralt+p"],
-                DIALOG,
-            ));
-            commands.add(blocked(
-                "BLOCKED_ENTER",
-                Event::Activate,
-                &["enter"],
-                DIALOG,
-            ));
-            commands.add(blocked(
-                "ALERT_CONFIRM",
-                Event::AlertAction(0),
-                &["enter", "mod+enter", "space"],
-                ALERT,
-            ));
-            commands.add(blocked(
-                "ALERT_ESCAPE",
-                Event::AlertDismiss,
-                &["esc"],
-                ALERT,
-            ));
-            commands.add(blocked(
-                "ALERT_NEXT",
-                Event::AlertCycle(-1),
-                &["right", "tab"],
-                ALERT,
-            ));
-            commands.add(blocked(
-                "ALERT_PREVIOUS",
-                Event::AlertCycle(1),
-                &["left", "shift+tab"],
-                ALERT,
-            ));
-        }
-        if self.dialog_open
-            && matches!(
-                self.dialog,
-                Some(Dialog::SplitInbox | Dialog::HideEmptySplits)
-            )
-        {
-            let split = |id: &'static str,
-                         event: SplitEvent,
-                         keys: &[&'static str],
-                         region: &'static [Region]| {
-                Command::shortcut(id, wrap(Action::Split(event)))
-                    .keys(keys.iter().copied())
-                    .regions(region)
-            };
-            // The alert's keys: the selected action, dismiss, and
-            // moving the selection.
-            commands.add(split(
-                "ALERT_CONFIRM",
-                SplitEvent::AlertConfirm,
-                &["enter", "mod+enter", "space"],
-                ALERT,
-            ));
-            commands.add(split(
-                "ALERT_ESCAPE",
-                SplitEvent::AlertDismiss,
-                &["esc"],
-                ALERT,
-            ));
-            commands.add(split(
-                "ALERT_NEXT",
-                SplitEvent::AlertCycle(-1),
-                &["right", "tab"],
-                ALERT,
-            ));
-            commands.add(split(
-                "ALERT_PREVIOUS",
-                SplitEvent::AlertCycle(1),
-                &["left", "shift+tab"],
-                ALERT,
-            ));
-            // Escape runs the dialog's close (with the form's discard check), and Enter its
-            // primary action.
-            commands.add(split(
-                "SPLIT_DIALOG_ESCAPE",
-                SplitEvent::Close,
-                &["esc"],
-                DIALOG,
-            ));
-            if let Some(enter) = self.splits.enter() {
-                commands.add(split("SPLIT_DIALOG_ENTER", enter, &["enter"], DIALOG));
-            }
-            if let Some(remove) = self.splits.row_delete() {
-                commands.add(split(
-                    "SPLIT_DIALOG_REMOVE_ROW",
-                    remove,
-                    &["backspace", "del"],
-                    DIALOG,
-                ));
-            }
-            // The keys of VIP's contact picker, which win over Enter and Escape while the picker
-            // takes them.
-            for (id, key, keys) in self.splits.picker_keys() {
-                commands.add(split(
-                    id,
-                    SplitEvent::Template(split_template::TemplateEvent::PickerKey(key)),
-                    keys,
-                    DIALOG,
-                ));
-            }
+            Dialog::Theme | Dialog::Images | Dialog::Autocorrect => {}
         }
     }
 
@@ -1064,241 +736,169 @@ impl Settings {
         now: &jiff::Zoned,
     ) -> Option<Action> {
         let dialog = self.dialog?;
-        if dialog == Dialog::AutoAdvance {
-            let response = auto_advance::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &self.auto_advance,
-                account.settings().desktop_auto_advance,
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::AutoAdvance)
-            };
-        }
-        if dialog == Dialog::Signatures {
-            let (snapshot, loader) = (account.snapshot(), account.loader());
-            let shown = signatures::Shown {
-                aliases: &snapshot.aliases,
-                on_replies: account.settings().include_signature_on_replies(),
-                account: account.email(),
-                loader: &loader,
-            };
-            let preview = self
-                .signature_preview
-                .get_or_insert_with(|| signatures::Preview::new(ctx));
-            let response = signatures::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &mut self.signatures,
-                preview,
-                &shown,
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Signatures)
-            };
-        }
-        if dialog == Dialog::Downloads {
-            let choices = self.download_choices();
-            let mut response =
-                downloads::dialog(ctx, area, self.dialog_open, &self.downloads, &choices);
-            let Some(event) = response.inner.take() else {
-                self.dialog = None;
-                return None;
-            };
-            if self.downloads_alert {
-                return downloads::alert(ctx, area).then_some(Action::DismissDownloadsAlert);
+        match dialog {
+            Dialog::AutoAdvance => {
+                let response = auto_advance::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &self.auto_advance,
+                    account.settings().desktop_auto_advance,
+                );
+                self.finish_dialog(response, Action::AutoAdvance)
             }
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Downloads)
-            };
-        }
-        if dialog == Dialog::Reminders {
-            let response = reminders::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &mut self.reminders,
-                &account.settings().reminders,
-                now,
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Reminders)
-            };
-        }
-        if dialog == Dialog::Emoji {
-            let response = emoji::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &mut self.emoji,
-                account.settings().emoji_skin_tone.unwrap_or_default(),
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Emoji)
-            };
-        }
-        if dialog == Dialog::InstantIntro {
-            let response =
-                instant_intro::dialog(ctx, area, self.dialog_open, &mut self.instant_intro);
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::InstantIntro)
-            };
-        }
-        if dialog == Dialog::AutoBcc {
-            let response = auto_bcc::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &mut self.auto_bcc,
-                account.settings(),
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::AutoBcc)
-            };
-        }
-        if dialog == Dialog::Notifications {
-            let shown = notifications::Shown {
-                settings: account.settings(),
-                device: account.device_settings(),
-                calendars,
-            };
-            let response =
-                notifications::dialog(ctx, area, self.dialog_open, &self.notifications, &shown);
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Notifications)
-            };
-        }
-        if dialog == Dialog::Accounts {
-            // The keycaps in the page's theme, while the dialog draws its card in Snow's.
-            let keycaps = exo_ui::KeycapColors::shortcuts_pane(exo_ui::palette(ctx));
-            let response = account_settings::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                &mut self.accounts,
-                accounts,
-                keycaps,
-            );
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Accounts)
-            };
-        }
-        if dialog == Dialog::BlockedSenders {
-            let senders = blocked_senders::senders(&account.settings().blocked_senders);
-            let response =
-                blocked_senders::show(ctx, area, self.dialog_open, &self.blocked, &senders);
-            let Some(event) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                event.map(Action::Blocked)
-            };
-        }
-        if dialog == Dialog::Autocorrect {
-            let response = autocorrect::dialog(ctx, area, self.dialog_open, self.autocorrect);
-            let Some(action) = response.inner else {
-                self.dialog = None;
-                return None;
-            };
-            return if response.close {
-                Some(Action::CloseDialog)
-            } else {
-                action
-            };
-        }
-        if dialog == Dialog::Images {
-            let response = images::dialog(
-                ctx,
-                area,
-                self.dialog_open,
-                account
-                    .settings()
-                    .remote_content_blocking
-                    .unwrap_or_default(),
-            );
-            if response.inner.is_none() {
-                self.dialog = None;
+            Dialog::Signatures => {
+                let (snapshot, loader) = (account.snapshot(), account.loader());
+                let shown = signatures::Shown {
+                    aliases: &snapshot.aliases,
+                    on_replies: account.settings().include_signature_on_replies(),
+                    account: account.email(),
+                    loader: &loader,
+                };
+                let preview = self
+                    .signature_preview
+                    .get_or_insert_with(|| signatures::Preview::new(ctx));
+                let response = signatures::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &mut self.signatures,
+                    preview,
+                    &shown,
+                );
+                self.finish_dialog(response, Action::Signatures)
             }
-            if response.close {
-                return Some(Action::CloseDialog);
+            Dialog::Downloads => {
+                let choices = self.download_choices();
+                let mut response =
+                    downloads::dialog(ctx, area, self.dialog_open, &self.downloads, &choices);
+                let Some(event) = response.inner.take() else {
+                    self.dialog = None;
+                    return None;
+                };
+                if self.downloads_alert {
+                    return downloads::alert(ctx, area).then_some(Action::DismissDownloadsAlert);
+                }
+                if response.close {
+                    Some(Action::CloseDialog)
+                } else {
+                    event.map(Action::Downloads)
+                }
             }
-            return response.inner.flatten();
+            Dialog::Reminders => {
+                let response = reminders::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &mut self.reminders,
+                    &account.settings().reminders,
+                    now,
+                );
+                self.finish_dialog(response, Action::Reminders)
+            }
+            Dialog::Emoji => {
+                let response = emoji::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &mut self.emoji,
+                    account.settings().emoji_skin_tone.unwrap_or_default(),
+                );
+                self.finish_dialog(response, Action::Emoji)
+            }
+            Dialog::InstantIntro => {
+                let response =
+                    instant_intro::dialog(ctx, area, self.dialog_open, &mut self.instant_intro);
+                self.finish_dialog(response, Action::InstantIntro)
+            }
+            Dialog::AutoBcc => {
+                let response = auto_bcc::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &mut self.auto_bcc,
+                    account.settings(),
+                );
+                self.finish_dialog(response, Action::AutoBcc)
+            }
+            Dialog::Notifications => {
+                let shown = notifications::Shown {
+                    settings: account.settings(),
+                    device: account.device_settings(),
+                    calendars,
+                };
+                let response =
+                    notifications::dialog(ctx, area, self.dialog_open, &self.notifications, &shown);
+                self.finish_dialog(response, Action::Notifications)
+            }
+            Dialog::Accounts => {
+                let keycaps = exo_ui::KeycapColors::shortcuts_pane(exo_ui::palette(ctx));
+                let response = account_settings::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    &mut self.accounts,
+                    accounts,
+                    keycaps,
+                );
+                self.finish_dialog(response, Action::Accounts)
+            }
+            Dialog::BlockedSenders => {
+                let senders = blocked_senders::senders(&account.settings().blocked_senders);
+                let response =
+                    blocked_senders::show(ctx, area, self.dialog_open, &self.blocked, &senders);
+                self.finish_dialog(response, Action::Blocked)
+            }
+            Dialog::Autocorrect => {
+                let response = autocorrect::dialog(ctx, area, self.dialog_open, self.autocorrect);
+                self.finish_dialog(response, std::convert::identity)
+            }
+            Dialog::Images => {
+                let response = images::dialog(
+                    ctx,
+                    area,
+                    self.dialog_open,
+                    account
+                        .settings()
+                        .remote_content_blocking
+                        .unwrap_or_default(),
+                );
+                self.finish_dialog(response, std::convert::identity)
+            }
+            Dialog::Theme => {
+                let response = theme::dialog(ctx, area, self.dialog_open, account.settings().theme);
+                self.finish_dialog(response, std::convert::identity)
+            }
+            Dialog::SplitInbox | Dialog::HideEmptySplits => {
+                let Some((event, close)) =
+                    self.splits.show(ctx, area, self.dialog_open, account, book)
+                else {
+                    self.dialog = None;
+                    return None;
+                };
+                if close {
+                    Some(Action::Split(SplitEvent::Close))
+                } else {
+                    event.map(Action::Split)
+                }
+            }
         }
-        if dialog != Dialog::Theme {
-            let Some((event, close)) = self.splits.show(ctx, area, self.dialog_open, account, book)
-            else {
-                self.dialog = None;
-                return None;
-            };
-            return if close {
-                Some(Action::Split(SplitEvent::Close))
-            } else {
-                event.map(Action::Split)
-            };
-        }
-        let response = theme::dialog(ctx, area, self.dialog_open, account.settings().theme);
-        if response.inner.is_none() {
+    }
+
+    fn finish_dialog<E>(
+        &mut self,
+        response: exo_ui::DialogResponse<Option<E>>,
+        map: impl FnOnce(E) -> Action,
+    ) -> Option<Action> {
+        let Some(event) = response.inner else {
             self.dialog = None;
-        }
+            return None;
+        };
         if response.close {
-            return Some(Action::CloseDialog);
+            Some(Action::CloseDialog)
+        } else {
+            event.map(map)
         }
-        response.inner.flatten()
     }
 }
 
@@ -1489,6 +1089,8 @@ fn notify(event: NotificationsEvent, account: &mut Account) {
         }
         // The list's and the picker's own events, or the app's (`Enable a calendar`).
         NotificationsEvent::ToggleMenu
+        | NotificationsEvent::MenuMove(_)
+        | NotificationsEvent::MenuPick
         | NotificationsEvent::Highlight(_)
         | NotificationsEvent::Swatch(..)
         | NotificationsEvent::PickerKey(_)
@@ -1764,6 +1366,14 @@ pub fn register<A: Clone + 'static>(
     );
 }
 
+/// Gmail's general settings signed in as `email`, with `authuser` query-encoded.
+pub(crate) fn gmail_settings_url(email: &str) -> String {
+    let mut url = url::Url::parse("https://mail.google.com/?shxr=0#settings/general")
+        .expect("static Gmail settings URL is valid");
+    url.query_pairs_mut().append_pair("authuser", email);
+    url.into()
+}
+
 /// How `Set Theme: Match …` names the operating system.
 fn os_name(os: egui::os::OperatingSystem) -> &'static str {
     match os {
@@ -1776,6 +1386,14 @@ fn os_name(os: egui::os::OperatingSystem) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gmail_settings_url_encodes_authuser() {
+        assert_eq!(
+            gmail_settings_url("alice+work@example.com"),
+            "https://mail.google.com/?shxr=0&authuser=alice%2Bwork%40example.com#settings/general"
+        );
+    }
 
     #[test]
     fn match_system_follows_the_system_and_defaults_to_snow() {

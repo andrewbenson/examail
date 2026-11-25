@@ -25,12 +25,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
-use toasty::stmt::Value;
 use toasty::{Db, Executor, Json};
 
 use crate::db::{
     self, AttachmentRow, BodyRow, CalendarChangeRow, EVICTED_BEFORE, EventRow, ListCursor,
-    ListEntry, MessageRow, ThreadRow, query_i64, strings,
+    ListEntry, MessageRow, ThreadRow, query_col, query_i64, query_rows,
 };
 use crate::error::Result;
 use crate::ids::ThreadId;
@@ -221,14 +220,14 @@ impl Store {
                         evicted.threads += 1;
                         evicted.bytes += stored.bytes;
                         before = before.max(stored.newest);
-                        let rows = AttachmentRow::filter(
-                            AttachmentRow::fields()
-                                .message_id()
-                                .in_list(messages.as_slice()),
-                        )
-                        .exec(write.exec())
-                        .await?;
-                        parts.extend(rows.into_iter().map(|row| (row.message_id, row.part_id)));
+                        for chunk in messages.chunks(db::IN_LIST_CHUNK) {
+                            let rows = AttachmentRow::filter(
+                                AttachmentRow::fields().message_id().in_list(chunk),
+                            )
+                            .exec(write.exec())
+                            .await?;
+                            parts.extend(rows.into_iter().map(|row| (row.message_id, row.part_id)));
+                        }
                     }
                 }
                 if evicted.threads > 0 {
@@ -289,39 +288,28 @@ const AUTO_VACUUM_INCREMENTAL: i64 = 2;
 
 /// Every conversation with a body stored ([`STORED`]).
 async fn stored(exec: &mut dyn Executor) -> Result<Vec<Stored>> {
-    let rows = toasty::sql::query(STORED).exec(exec).await?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| match row {
-            Value::Record(row) => match &row.fields[..] {
-                [Value::String(thread), Value::I64(newest), Value::I64(bytes)] => Some(Stored {
-                    thread: thread.clone(),
-                    newest: *newest,
-                    bytes: u64::try_from(*bytes).unwrap_or_default(),
-                }),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect())
+    Ok(
+        query_rows::<(String, i64, i64)>(exec, toasty::sql::query(STORED))
+            .await?
+            .into_iter()
+            .map(|(thread, newest, bytes)| Stored {
+                thread,
+                newest,
+                bytes: u64::try_from(bytes).unwrap_or_default(),
+            })
+            .collect(),
+    )
 }
 
 /// Every conversation with no message since `cutoff` ([`QUIET`]).
 async fn quiet(exec: &mut dyn Executor, cutoff: i64) -> Result<Vec<Quiet>> {
-    let rows = toasty::sql::query(QUIET).bind(cutoff).exec(exec).await?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| match row {
-            Value::Record(row) => match &row.fields[..] {
-                [Value::String(thread), Value::I64(newest)] => Some(Quiet {
-                    thread: thread.clone(),
-                    newest: *newest,
-                }),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect())
+    Ok(
+        query_rows::<(String, i64)>(exec, toasty::sql::query(QUIET).bind(cutoff))
+            .await?
+            .into_iter()
+            .map(|(thread, newest)| Quiet { thread, newest })
+            .collect(),
+    )
 }
 
 /// The conversations that eviction leaves alone: the open one, the first threads of each list
@@ -347,23 +335,23 @@ async fn kept(
         } else {
             depth
         };
-        kept.extend(strings(
-            toasty::sql::query(FIRST)
-                .bind(list)
-                .bind(i64::from(depth))
-                .exec(exec)
-                .await?,
-        ));
-    }
-    kept.extend(strings(
-        toasty::sql::query(DRAFTED)
-            .bind(DRAFT)
-            .bind(SH_SCHEDULED)
-            .exec(exec)
+        kept.extend(
+            query_col::<String>(
+                exec,
+                toasty::sql::query(FIRST).bind(list).bind(i64::from(depth)),
+            )
             .await?,
-    ));
+        );
+    }
+    kept.extend(
+        query_col::<String>(
+            exec,
+            toasty::sql::query(DRAFTED).bind(DRAFT).bind(SH_SCHEDULED),
+        )
+        .await?,
+    );
     if keep == Keep::Rows {
-        kept.extend(strings(toasty::sql::query(PENDING).exec(exec).await?));
+        kept.extend(query_col::<String>(exec, toasty::sql::query(PENDING)).await?);
     }
     Ok(kept)
 }
@@ -415,10 +403,12 @@ async fn evict_thread(
         return Ok(None);
     }
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
-    BodyRow::filter(BodyRow::fields().message_id().in_list(ids.as_slice()))
-        .delete()
-        .exec(exec)
-        .await?;
+    for chunk in ids.chunks(db::IN_LIST_CHUNK) {
+        BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
+            .delete()
+            .exec(exec)
+            .await?;
+    }
     for message in &messages {
         let headers: Vec<Header> = message
             .headers
@@ -473,12 +463,16 @@ async fn evict_rows(
     let entries = ListEntry::filter_by_thread_id(&quiet.thread)
         .exec(exec)
         .await?;
-    let parts = AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(ids.as_slice()))
-        .exec(exec)
-        .await?
-        .into_iter()
-        .map(|row| (row.message_id, row.part_id))
-        .collect();
+    let mut parts = Vec::new();
+    for chunk in ids.chunks(db::IN_LIST_CHUNK) {
+        parts.extend(
+            AttachmentRow::filter(AttachmentRow::fields().message_id().in_list(chunk))
+                .exec(exec)
+                .await?
+                .into_iter()
+                .map(|row| (row.message_id, row.part_id)),
+        );
+    }
     crate::provider::delete_messages(exec, &ids).await?;
     ThreadRow::filter_by_id(&quiet.thread)
         .delete()
@@ -543,22 +537,13 @@ async fn evict_events(inner: &Inner, db: &mut Db, cutoff: i64) -> Result<usize> 
         .lock()
         .expect("calendar-read lock is never poisoned")
         .clone();
-    let ended = toasty::sql::query(ENDED)
-        .bind(cutoff)
-        .exec(&mut *db)
-        .await?;
+    let ended =
+        query_rows::<(String, String, i64, i64)>(&mut *db, toasty::sql::query(ENDED).bind(cutoff))
+            .await?;
     let mut gone: HashMap<String, Vec<String>> = HashMap::new();
-    for row in &ended {
-        if let Value::Record(row) = row
-            && let [
-                Value::String(calendar),
-                Value::String(id),
-                Value::I64(start),
-                Value::I64(end),
-            ] = &row.fields[..]
-            && !read.iter().any(|(from, to)| start < to && end > from)
-        {
-            gone.entry(calendar.clone()).or_default().push(id.clone());
+    for (calendar, id, start, end) in ended {
+        if !read.iter().any(|&(from, to)| start < to && end > from) {
+            gone.entry(calendar).or_default().push(id);
         }
     }
     let mut evicted = 0;

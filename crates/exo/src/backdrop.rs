@@ -96,15 +96,14 @@ fn index(now: &Zoned) -> usize {
 /// Where the photos are, which is `Contents/Resources/inbox-zero` in `Exo.app` (`cargo
 /// xtask build`), or else `assets/inbox-zero` in the checkout.
 fn photos_dir() -> PathBuf {
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources/inbox-zero")));
-    bundled.filter(|dir| dir.is_dir()).unwrap_or_else(|| {
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/inbox-zero"
-        ))
-    })
+    crate::bundled_resource("inbox-zero")
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(|| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/inbox-zero"
+            ))
+        })
 }
 
 /// The backdrop: the day's photo, decoding or decoded.

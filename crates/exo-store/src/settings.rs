@@ -608,17 +608,6 @@ impl Default for CalendarAccount {
 }
 
 impl Settings {
-    /// The settings for calendar `id`, from any signed-in calendar account (`authed`) that has
-    /// them. A calendar's settings are kept the same under every account that has the calendar
-    /// ([`Settings::update_calendar`]), so any of those accounts will do.
-    #[must_use]
-    pub fn calendar_setting(&self, id: &str) -> Option<&CalendarSetting> {
-        self.calendar_accounts
-            .values()
-            .filter(|account| account.authed)
-            .find_map(|account| account.calendars.get(id))
-    }
-
     /// Applies `change` to the settings for calendar `id` under calendar account `account`, and
     /// under every other account that has them. The settings, and the account, are made if new.
     pub fn update_calendar(

@@ -45,7 +45,12 @@ fn main() -> Result<()> {
 fn build() -> Result<()> {
     let identity = env::var("EXO_SIGN_IDENTITY").unwrap_or_default();
     let app = bundle()?;
-    sign(&app, if identity.is_empty() { "-" } else { &identity }, false, false)?;
+    sign(
+        &app,
+        if identity.is_empty() { "-" } else { &identity },
+        false,
+        false,
+    )?;
     let signed = if identity.is_empty() {
         "ad hoc".to_owned()
     } else {
@@ -77,12 +82,27 @@ fn release() -> Result<()> {
     let key = ApiKey::from_env(&work.0)?;
     // notarytool takes an archive of the app, and the ticket is stapled to the app itself.
     let archive = work.0.join(format!("{NAME}.zip"));
-    run("ditto", [os("-c"), os("-k"), os("--keepParent"), app.as_os_str(), archive.as_os_str()])?;
+    run(
+        "ditto",
+        [
+            os("-c"),
+            os("-k"),
+            os("--keepParent"),
+            app.as_os_str(),
+            archive.as_os_str(),
+        ],
+    )?;
     key.notarize(&archive)?;
     staple(&app)?;
     run(
         "spctl",
-        [os("--assess"), os("--type"), os("execute"), os("--verbose=4"), app.as_os_str()],
+        [
+            os("--assess"),
+            os("--type"),
+            os("execute"),
+            os("--verbose=4"),
+            app.as_os_str(),
+        ],
     )?;
 
     let image = disk_image(&app)?;
@@ -104,7 +124,11 @@ fn release() -> Result<()> {
 
     let directory = image.parent().context("the image has a folder")?;
     let name = image.file_name().context("the image has a name")?;
-    let sums = output(Command::new("shasum").args([os("-a"), os("256"), name]).current_dir(directory))?;
+    let sums = output(
+        Command::new("shasum")
+            .args([os("-a"), os("256"), name])
+            .current_dir(directory),
+    )?;
     fs::write(directory.join("checksums.txt"), sums)?;
     println!("{} ({VERSION}, notarized)", image.display());
     Ok(())
@@ -127,7 +151,10 @@ fn bundle() -> Result<PathBuf> {
     fs::create_dir_all(&resources)?;
     fs::copy(release.join("exo"), contents.join("MacOS").join(NAME))?;
 
-    copy_tree(&root.join("assets/images"), &resources.join("assets/images"))?;
+    copy_tree(
+        &root.join("assets/images"),
+        &resources.join("assets/images"),
+    )?;
 
     let icon_plist = release.join("AppIcon.plist");
     run_in(
@@ -152,9 +179,18 @@ fn bundle() -> Result<PathBuf> {
     )?;
     remove(&icon_plist)?;
 
-    fs::copy(root.join("THIRD_PARTY_NOTICES.md"), resources.join("THIRD_PARTY_NOTICES.md"))?;
-    copy_tree(&root.join("assets/inbox-zero"), &resources.join("inbox-zero"))?;
-    for (folder, notices) in [("fonts", ["OFL.txt", "SOURCES.txt"]), ("icons", ["LICENSE", "SOURCES.txt"])] {
+    fs::copy(
+        root.join("THIRD_PARTY_NOTICES.md"),
+        resources.join("THIRD_PARTY_NOTICES.md"),
+    )?;
+    copy_tree(
+        &root.join("assets/inbox-zero"),
+        &resources.join("inbox-zero"),
+    )?;
+    for (folder, notices) in [
+        ("fonts", ["OFL.txt", "SOURCES.txt"]),
+        ("icons", ["LICENSE", "SOURCES.txt"]),
+    ] {
         fs::create_dir_all(resources.join(folder))?;
         for notice in notices {
             fs::copy(
@@ -186,7 +222,10 @@ fn info_plist() -> String {
         Dict(vec![
             ("CFBundleTypeRole", S(role)),
             ("CFBundleURLName", S(name)),
-            ("CFBundleURLSchemes", Array(schemes.iter().map(|scheme| S(scheme)).collect())),
+            (
+                "CFBundleURLSchemes",
+                Array(schemes.iter().map(|scheme| S(scheme)).collect()),
+            ),
         ])
     };
     let version: &'static str = VERSION;
@@ -208,7 +247,10 @@ fn info_plist() -> String {
         ("NSRequiresAquaSystemAppearance", Bool(false)),
         ("NSSupportsAutomaticGraphicsSwitching", Bool(true)),
         ("NSPrefersDisplaySafeAreaCompatibilityMode", Bool(false)),
-        ("LSApplicationCategoryType", S("public.app-category.productivity")),
+        (
+            "LSApplicationCategoryType",
+            S("public.app-category.productivity"),
+        ),
         (
             "NSDownloadsFolderUsageDescription",
             S("Examail saves the attachments you download to your Downloads folder."),
@@ -264,7 +306,9 @@ fn write_value(xml: &mut String, value: &Value, depth: usize) {
 }
 
 fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Wraps `app` in `examail-vX.Y.Z-macos-arm64.dmg` beside it, with a link to Applications to drag
@@ -309,7 +353,15 @@ fn sign(path: &Path, identity: &str, hardened: bool, timestamped: bool) -> Resul
     }
     args.push(path.as_os_str());
     run("codesign", args)?;
-    run("codesign", [os("--verify"), os("--strict"), os("--deep"), path.as_os_str()])
+    run(
+        "codesign",
+        [
+            os("--verify"),
+            os("--strict"),
+            os("--deep"),
+            path.as_os_str(),
+        ],
+    )
 }
 
 /// Staples the notarization ticket to `path` and checks it's there.
@@ -330,11 +382,22 @@ struct Keychain {
 impl Keychain {
     fn create(work: &Path) -> Result<Self> {
         let path = work.join("examail-release.keychain-db");
-        let search_list = keychains(output(Command::new("security").args(["list-keychains", "-d", "user"]))?);
-        let default = keychains(output(Command::new("security").args(["default-keychain", "-d", "user"]))?)
-            .into_iter()
-            .next();
-        run("security", [os("create-keychain"), os("-p"), os(""), path.as_os_str()])?;
+        let search_list = keychains(output(Command::new("security").args([
+            "list-keychains",
+            "-d",
+            "user",
+        ]))?);
+        let default = keychains(output(Command::new("security").args([
+            "default-keychain",
+            "-d",
+            "user",
+        ]))?)
+        .into_iter()
+        .next();
+        run(
+            "security",
+            [os("create-keychain"), os("-p"), os(""), path.as_os_str()],
+        )?;
         let keychain = Self {
             path,
             search_list,
@@ -342,12 +405,18 @@ impl Keychain {
         };
         let path = keychain.path.as_os_str();
         // Locks itself after an hour, longer than a release takes.
-        run("security", [os("set-keychain-settings"), os("-lut"), os("3600"), path])?;
+        run(
+            "security",
+            [os("set-keychain-settings"), os("-lut"), os("3600"), path],
+        )?;
         run("security", [os("unlock-keychain"), os("-p"), os(""), path])?;
         let mut list = vec![os("list-keychains"), os("-d"), os("user"), os("-s"), path];
         list.extend(keychain.search_list.iter().map(os));
         run("security", list)?;
-        run("security", [os("default-keychain"), os("-d"), os("user"), os("-s"), path])?;
+        run(
+            "security",
+            [os("default-keychain"), os("-d"), os("user"), os("-s"), path],
+        )?;
         Ok(keychain)
     }
 
@@ -358,7 +427,8 @@ impl Keychain {
             .context("DEVELOPER_ID_P12_BASE64 isn't set")?
             .split_whitespace()
             .collect();
-        let password = env::var("DEVELOPER_ID_P12_PASSWORD").context("DEVELOPER_ID_P12_PASSWORD isn't set")?;
+        let password =
+            env::var("DEVELOPER_ID_P12_PASSWORD").context("DEVELOPER_ID_P12_PASSWORD isn't set")?;
         let p12 = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .context("DEVELOPER_ID_P12_BASE64 isn't base64")?;
@@ -402,7 +472,16 @@ impl Drop for Keychain {
         list.extend(self.search_list.iter().map(os));
         let _ = run("security", list);
         if let Some(default) = &self.default {
-            let _ = run("security", [os("default-keychain"), os("-d"), os("user"), os("-s"), os(default)]);
+            let _ = run(
+                "security",
+                [
+                    os("default-keychain"),
+                    os("-d"),
+                    os("user"),
+                    os("-s"),
+                    os(default),
+                ],
+            );
         }
         let _ = run("security", [os("delete-keychain"), self.path.as_os_str()]);
     }
@@ -426,10 +505,12 @@ struct ApiKey {
 
 impl ApiKey {
     fn from_env(work: &Path) -> Result<Self> {
-        let id = env::var("APP_STORE_CONNECT_API_KEY_KEY_ID").context("APP_STORE_CONNECT_API_KEY_KEY_ID isn't set")?;
-        let issuer =
-            env::var("APP_STORE_CONNECT_API_KEY_ISSUER_ID").context("APP_STORE_CONNECT_API_KEY_ISSUER_ID isn't set")?;
-        let content = env::var("APP_STORE_CONNECT_API_KEY_KEY").context("APP_STORE_CONNECT_API_KEY_KEY isn't set")?;
+        let id = env::var("APP_STORE_CONNECT_API_KEY_KEY_ID")
+            .context("APP_STORE_CONNECT_API_KEY_KEY_ID isn't set")?;
+        let issuer = env::var("APP_STORE_CONNECT_API_KEY_ISSUER_ID")
+            .context("APP_STORE_CONNECT_API_KEY_ISSUER_ID isn't set")?;
+        let content = env::var("APP_STORE_CONNECT_API_KEY_KEY")
+            .context("APP_STORE_CONNECT_API_KEY_KEY isn't set")?;
         let file = work.join(format!("AuthKey_{id}.p8"));
         fs::write(&file, pem(&content)?)?;
         Ok(Self { id, issuer, file })
@@ -448,18 +529,37 @@ impl ApiKey {
             os(&self.issuer),
         ];
         let submitted = Command::new("xcrun")
-            .args([os("notarytool"), os("submit"), path.as_os_str(), os("--wait"), os("--output-format"), os("json")])
+            .args([
+                os("notarytool"),
+                os("submit"),
+                path.as_os_str(),
+                os("--wait"),
+                os("--output-format"),
+                os("json"),
+            ])
             .args(key)
             .stderr(Stdio::inherit())
             .output()
             .context("running notarytool")?;
-        let answer: serde_json::Value = serde_json::from_slice(&submitted.stdout)
-            .with_context(|| format!("notarytool's answer: {}", String::from_utf8_lossy(&submitted.stdout)))?;
+        let answer: serde_json::Value =
+            serde_json::from_slice(&submitted.stdout).with_context(|| {
+                format!(
+                    "notarytool's answer: {}",
+                    String::from_utf8_lossy(&submitted.stdout)
+                )
+            })?;
         let status = answer["status"].as_str().unwrap_or_default();
         if let Some(id) = answer["id"].as_str() {
-            let _ = Command::new("xcrun").args([os("notarytool"), os("log"), os(id)]).args(key).status();
+            let _ = Command::new("xcrun")
+                .args([os("notarytool"), os("log"), os(id)])
+                .args(key)
+                .status();
         }
-        ensure!(status == "Accepted", "notarizing {} ended {status:?}: {answer}", path.display());
+        ensure!(
+            status == "Accepted",
+            "notarizing {} ended {status:?}: {answer}",
+            path.display()
+        );
         Ok(())
     }
 }
@@ -472,7 +572,10 @@ fn pem(content: &str) -> Result<String> {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(text.split_whitespace().collect::<String>())
             .context("APP_STORE_CONNECT_API_KEY_KEY is neither a PEM key nor base64")?;
-        text = String::from_utf8(decoded).context("the decoded API key isn't text")?.trim().to_owned();
+        text = String::from_utf8(decoded)
+            .context("the decoded API key isn't text")?
+            .trim()
+            .to_owned();
     }
     const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
     const END: &str = "-----END PRIVATE KEY-----";
@@ -516,8 +619,15 @@ impl Drop for Scratch {
 /// Copies `source` to `destination` (whose parent is made), keeping modes and times, without the
 /// Finder's `.DS_Store` files.
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination.parent().context("the destination has a folder")?)?;
-    run("cp", [os("-Rp"), source.as_os_str(), destination.as_os_str()])?;
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("the destination has a folder")?,
+    )?;
+    run(
+        "cp",
+        [os("-Rp"), source.as_os_str(), destination.as_os_str()],
+    )?;
     remove_ds_store(destination)
 }
 
@@ -592,7 +702,9 @@ where
 {
     let mut command = Command::new(program);
     command.args(args);
-    let done = command.output().with_context(|| format!("running {}", describe(&command)))?;
+    let done = command
+        .output()
+        .with_context(|| format!("running {}", describe(&command)))?;
     if !done.status.success() {
         bail!(
             "{} failed ({}): {}",
@@ -606,7 +718,9 @@ where
 
 fn status(command: &mut Command) -> Result<()> {
     println!("$ {}", describe(command));
-    let done = command.status().with_context(|| format!("running {}", describe(command)))?;
+    let done = command
+        .status()
+        .with_context(|| format!("running {}", describe(command)))?;
     ensure!(done.success(), "{} failed ({done})", describe(command));
     Ok(())
 }
@@ -617,7 +731,12 @@ fn output(command: &mut Command) -> Result<String> {
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("running {}", describe(command)))?;
-    ensure!(done.status.success(), "{} failed ({})", describe(command), done.status);
+    ensure!(
+        done.status.success(),
+        "{} failed ({})",
+        describe(command),
+        done.status
+    );
     Ok(String::from_utf8(done.stdout)?)
 }
 

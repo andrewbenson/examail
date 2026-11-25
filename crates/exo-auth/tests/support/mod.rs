@@ -1,4 +1,4 @@
-//! An `Auth` against an in-process gmail-mock, and a scripted browser.
+//! An `Auth` against in-process mock servers, and a scripted browser.
 
 #![allow(dead_code)] // Each test binary uses a different part of this module.
 
@@ -6,7 +6,7 @@ use std::io;
 use std::sync::Arc;
 
 use exo_auth::{Auth, ClientConfig, MemorySecrets};
-use gmail_mock::{Config, MockServer};
+use mock_servers::{Config, MockServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};

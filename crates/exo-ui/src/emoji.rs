@@ -9,11 +9,15 @@
 //! so one in faded text is faded too. Pictures are drawn at the cell's size in device pixels and
 //! kept per context.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use egui::{
-    Color32, ColorImage, FontData, Galley, Id, Painter, Pos2, Rect, TextureHandle, TextureOptions,
-    epaint::text::Glyph, pos2, vec2,
+    Color32, ColorImage, FontData, FontDefinitions, FontFamily, Galley, Id, Painter, Pos2, Rect,
+    TextureHandle, TextureOptions,
+    epaint::text::{ByteIndex, Glyph, LayoutSection},
+    pos2,
+    text::LayoutJob,
+    vec2,
 };
 use skrifa::{FontRef, MetadataProvider as _, instance::LocationRef, instance::Size};
 
@@ -78,6 +82,86 @@ pub(crate) fn install(ctx: &egui::Context, cell: Cell) {
     ctx.data_mut(|data| data.insert_temp(cell_id(), cell));
 }
 
+/// The emoji-first egui font family, containing only `AppleColorEmoji` so emoji base codepoints
+/// (`'1'` in `"1️⃣"`, `'❤'` in `"❤️"`) never draw monochrome text outlines underneath [`paint`].
+pub(crate) fn family() -> FontFamily {
+    FontFamily::Name(FONT_NAME.into())
+}
+
+/// Registers [`family`] in `definitions`.
+pub(crate) fn register_family(definitions: &mut FontDefinitions) {
+    definitions
+        .families
+        .insert(family(), vec![FONT_NAME.to_owned()]);
+}
+
+/// Splits `job`'s sections on [`fastframe_emoji::pieces`] so each [`fastframe_emoji::Piece::Emoji`]
+/// cluster is shaped in [`family`] at the section's exact CSS font size and line height.
+pub(crate) fn split_sections(ctx: &egui::Context, mut job: LayoutJob) -> LayoutJob {
+    if job.text.is_ascii() || ctx.data(|data| data.get_temp::<Cell>(cell_id())).is_none() {
+        return job;
+    }
+    let emoji_family = family();
+    let has_emoji = job.sections.iter().any(|section| {
+        let slice = &job.text[section.byte_range.start.0..section.byte_range.end.0];
+        !slice.is_ascii()
+            && section.format.font_id.family != emoji_family
+            && fastframe_emoji::pieces(slice)
+                .iter()
+                .any(|piece| matches!(piece, fastframe_emoji::Piece::Emoji(_)))
+    });
+    if !has_emoji {
+        return job;
+    }
+    let base_ptr = job.text.as_ptr() as usize;
+    for section in std::mem::take(&mut job.sections) {
+        let slice = &job.text[section.byte_range.start.0..section.byte_range.end.0];
+        if slice.is_ascii() || section.format.font_id.family == emoji_family {
+            job.sections.push(section);
+            continue;
+        }
+        let pieces = fastframe_emoji::pieces(slice);
+        if !pieces
+            .iter()
+            .any(|piece| matches!(piece, fastframe_emoji::Piece::Emoji(_)))
+        {
+            job.sections.push(section);
+            continue;
+        }
+        let line_height = section
+            .format
+            .line_height
+            .or_else(|| Some(ctx.fonts_mut(|fonts| fonts.row_height(&section.format.font_id))));
+        let mut emoji_format = section.format.clone();
+        emoji_format.font_id.family = emoji_family.clone();
+        emoji_format.line_height = line_height;
+        emoji_format.italics = false;
+        emoji_format.coords = Default::default();
+        let mut leading_space = section.leading_space;
+        for piece in pieces {
+            let (part, format) = match piece {
+                fastframe_emoji::Piece::Text("") => continue,
+                fastframe_emoji::Piece::Text(part) => (part, section.format.clone()),
+                fastframe_emoji::Piece::Emoji(part) => (part, emoji_format.clone()),
+            };
+            let start = part.as_ptr() as usize - base_ptr;
+            job.sections.push(LayoutSection {
+                leading_space: std::mem::take(&mut leading_space),
+                byte_range: ByteIndex(start)..ByteIndex(start + part.len()),
+                format,
+            });
+        }
+    }
+    job
+}
+
+fn section_at(sections: &[LayoutSection], byte_offset: usize) -> Option<&LayoutSection> {
+    let idx = sections.partition_point(|section| section.byte_range.end.0 <= byte_offset);
+    sections
+        .get(idx)
+        .filter(|section| section.byte_range.start.0 <= byte_offset)
+}
+
 /// The advance Chromium lays an Apple Color Emoji cluster out with at `size` px. It's a whole
 /// number of px, wider than the font's 1em up to 24px (CoreText's optical advances): 1.25em
 /// rounded up to 16px, then `(size + 25) / 2` rounded down, which meets 1em at 24px, then 1em
@@ -102,35 +186,75 @@ pub(crate) fn fit_advances(ctx: &egui::Context, galley: &mut Arc<Galley>) {
         return;
     };
     let pixels_per_point = ctx.pixels_per_point();
-    let correction = |glyph: &Glyph| {
-        let size = glyph.advance_width / (cell.advance * ADVANCE_SCALE);
-        let correction =
-            ((advance(size) - glyph.advance_width) * pixels_per_point).round() / pixels_per_point;
-        (glyph.advance_width > 0.0 && cluster_of(&clusters, glyph).is_some()).then_some(correction)
+    let glyph_correction = |glyph: &Glyph, seen_start: &mut Option<usize>| -> Option<f32> {
+        let (range, _) = cluster_containing(&clusters, glyph.cluster as usize)?;
+        let target = if *seen_start == Some(range.start) {
+            0.0
+        } else {
+            *seen_start = Some(range.start);
+            let (size, letter_spacing) = section_at(&job.sections, glyph.cluster as usize).map_or(
+                (glyph.advance_width / (cell.advance * ADVANCE_SCALE), 0.0),
+                |section| {
+                    (
+                        section.format.font_id.size,
+                        section.format.extra_letter_spacing,
+                    )
+                },
+            );
+            advance(size) + letter_spacing
+        };
+        Some(((target - glyph.advance_width) * pixels_per_point).round() / pixels_per_point)
     };
     if galley.rows.iter().all(|placed| {
-        placed
-            .row
-            .glyphs
-            .iter()
-            .all(|glyph| correction(glyph).is_none_or(|c| c == 0.0))
+        let mut seen = None;
+        placed.row.glyphs.iter().all(|glyph| {
+            let in_emoji = cluster_containing(&clusters, glyph.cluster as usize).is_some();
+            (!in_emoji || glyph.uv_rect.is_nothing())
+                && glyph_correction(glyph, &mut seen).is_none_or(|c| c == 0.0)
+        })
     }) {
         return;
     }
     let galley = Arc::make_mut(galley);
     for placed in &mut galley.rows {
-        if placed
-            .glyphs
-            .iter()
-            .all(|glyph| correction(glyph).is_none())
-        {
+        let mut check_seen = None;
+        if placed.glyphs.iter().all(|glyph| {
+            let in_emoji = cluster_containing(&clusters, glyph.cluster as usize).is_some();
+            (!in_emoji || glyph.uv_rect.is_nothing())
+                && glyph_correction(glyph, &mut check_seen).is_none_or(|c| c == 0.0)
+        }) {
             continue;
         }
         let row = Arc::make_mut(&mut placed.row);
         let mut offset = 0.0;
+        let mut seen = None;
         for index in 0..row.glyphs.len() {
+            if cluster_containing(&clusters, row.glyphs[index].cluster as usize).is_some()
+                && !row.glyphs[index].uv_rect.is_nothing()
+            {
+                let first = row.glyphs[index].first_vertex as usize;
+                if row.visuals.glyph_vertex_range.contains(&first)
+                    && let Some(quad) = row.visuals.mesh.vertices.get_mut(first..first + 4)
+                {
+                    for vertex in quad {
+                        vertex.pos = Pos2::ZERO;
+                        vertex.uv = Pos2::ZERO;
+                        vertex.color = Color32::TRANSPARENT;
+                    }
+                }
+                row.glyphs[index].uv_rect = Default::default();
+            }
             shift_glyph(row, index, vec2(offset, 0.0));
-            offset += correction(&row.glyphs[index]).unwrap_or(0.0);
+            if let Some(c) = glyph_correction(&row.glyphs[index], &mut seen) {
+                row.glyphs[index].advance_width = (row.glyphs[index].advance_width + c).max(0.0);
+                offset += c;
+            }
+        }
+        if row.visuals.glyph_vertex_range.start == 0
+            && row.glyphs.iter().all(|glyph| glyph.uv_rect.is_nothing())
+        {
+            row.visuals.mesh.clear();
+            row.visuals.glyph_vertex_range = 0..0;
         }
         row.size.x += offset;
         row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
@@ -138,8 +262,8 @@ pub(crate) fn fit_advances(ctx: &egui::Context, galley: &mut Arc<Galley>) {
     update_bounds(galley);
 }
 
-/// The emoji clusters of `text` (the start of each, in bytes, and the cluster).
-fn clusters(text: &str) -> Vec<(usize, &str)> {
+/// The emoji clusters of `text` (each cluster's UTF-8 byte range, and the cluster).
+fn clusters(text: &str) -> Vec<(Range<usize>, &str)> {
     // Emoji start at U+00A9, so ASCII text has none, and most text is ASCII.
     if text.is_ascii() {
         return Vec::new();
@@ -148,19 +272,21 @@ fn clusters(text: &str) -> Vec<(usize, &str)> {
         .into_iter()
         .filter_map(|piece| match piece {
             fastframe_emoji::Piece::Emoji(cluster) => {
-                Some((cluster.as_ptr() as usize - text.as_ptr() as usize, cluster))
+                let start = cluster.as_ptr() as usize - text.as_ptr() as usize;
+                Some((start..start + cluster.len(), cluster))
             }
             fastframe_emoji::Piece::Text(_) => None,
         })
         .collect()
 }
 
-/// The cluster `glyph` starts, if it's one of `clusters`.
-fn cluster_of<'a>(clusters: &[(usize, &'a str)], glyph: &Glyph) -> Option<&'a str> {
-    clusters
-        .iter()
-        .find(|(start, _)| *start == glyph.cluster as usize)
-        .map(|(_, cluster)| *cluster)
+/// The cluster containing byte offset `byte`, if it's one of `clusters`.
+fn cluster_containing<'a>(
+    clusters: &'a [(Range<usize>, &'a str)],
+    byte: usize,
+) -> Option<&'a (Range<usize>, &'a str)> {
+    let idx = clusters.partition_point(|(range, _)| range.end <= byte);
+    clusters.get(idx).filter(|(range, _)| range.start <= byte)
 }
 
 /// Paints the pictures of the emoji in `galley`, with its top left at `origin` and its glyphs on
@@ -174,11 +300,21 @@ pub(crate) fn paint(painter: &Painter, origin: Pos2, galley: &Galley) {
         return;
     };
     for row in &galley.rows {
+        let mut painted_start = None;
         for glyph in row.glyphs.iter().filter(|glyph| glyph.advance_width > 0.0) {
-            let Some(cluster) = cluster_of(&clusters, glyph) else {
+            let Some((range, cluster)) = cluster_containing(&clusters, glyph.cluster as usize)
+            else {
                 continue;
             };
-            let em = glyph.advance_width / (cell.advance * ADVANCE_SCALE);
+            if painted_start == Some(range.start) {
+                continue;
+            }
+            painted_start = Some(range.start);
+            let section = section_at(&galley.job.sections, glyph.cluster as usize);
+            let em = section.map_or(
+                glyph.advance_width / (cell.advance * ADVANCE_SCALE),
+                |section| section.format.font_id.size,
+            );
             let baseline = origin.y + row.pos.y + glyph.pos.y;
             let rect = Rect::from_min_size(
                 pos2(
@@ -187,15 +323,7 @@ pub(crate) fn paint(painter: &Painter, origin: Pos2, galley: &Galley) {
                 ),
                 vec2(cell.advance * em, (cell.ascent + cell.descent) * em),
             );
-            let alpha = galley
-                .job
-                .sections
-                .iter()
-                .find(|section| {
-                    section
-                        .byte_range
-                        .contains(&egui::text::ByteIndex(glyph.cluster as usize))
-                })
+            let alpha = section
                 .map(|section| section.format.color)
                 .filter(|color| *color != Color32::PLACEHOLDER)
                 .map_or(u8::MAX, |color| color.a());

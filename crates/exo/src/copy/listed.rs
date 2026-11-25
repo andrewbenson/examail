@@ -3,32 +3,18 @@
 //! conversation. The bodies come from the store (sync usually has them already) and are rendered
 //! off screen to find their new parts.
 
-use std::sync::{
-    Arc,
-    mpsc::{Receiver, Sender, channel},
-};
+use std::sync::Arc;
 
 use exo_commands::Hint;
-use exo_store::{MessageDetail, ThreadDetail, ThreadId};
+use exo_store::{MessageDetail, ThreadDetail};
 
 use crate::{Mail, body::Facts, clipboard, compose};
 
-type Read = (String, Option<Arc<ThreadDetail>>);
-
 /// The copy under way.
+#[derive(Default)]
 pub(crate) struct Listed {
     /// The conversation being copied, and its messages once the store has read them.
     target: Option<(String, Option<Arc<ThreadDetail>>)>,
-    read: (Sender<Read>, Receiver<Read>),
-}
-
-impl Default for Listed {
-    fn default() -> Self {
-        Self {
-            target: None,
-            read: channel(),
-        }
-    }
 }
 
 /// The hint after copying a message, with `more` messages to copy or without.
@@ -68,56 +54,39 @@ impl Mail {
             return;
         };
         self.copy_listed.target = Some((id.clone(), None));
-        let (sender, ctx) = (self.copy_listed.read.0.clone(), self.ctx.clone());
-        self.account.loader().run(
-            move |store| async move {
-                let thread = ThreadId::new(id.clone());
-                if let Err(error) = store.load_bodies(&thread).await {
-                    log::info!("fetching the bodies of {id} to copy it: {error}");
-                }
-                let detail = store
-                    .thread(&thread)
-                    .await
-                    .inspect_err(|error| log::error!("reading thread {id}: {error}"))
-                    .ok()
-                    .flatten();
-                (id, detail.map(Arc::new))
-            },
-            move |read| {
-                let _ = sender.send(read);
-                ctx.request_repaint();
-            },
-        );
+        let ui = self.ui_sender();
+        self.account
+            .loader()
+            .read_thread_with_bodies(id, "to copy it", move |id, detail| {
+                ui.send(move |mail| mail.copy_listed_read(&id, detail));
+            });
     }
 
-    /// Takes in the conversation the store read, and has its messages rendered. Call every
-    /// frame.
-    pub(crate) fn copy_listed_frame(&mut self) {
-        while let Ok((id, detail)) = self.copy_listed.read.1.try_recv() {
-            let Some((target, waiting)) = self
-                .copy_listed
-                .target
-                .as_mut()
-                .filter(|(target, _)| *target == id)
-            else {
-                continue;
-            };
-            let Some(detail) = detail else {
-                self.copy_listed.target = None;
-                continue;
-            };
-            let messages: Vec<&MessageDetail> = detail
-                .messages
-                .iter()
-                .filter(|message| !message.is_draft())
-                .collect();
-            if messages.is_empty() {
-                self.copy_listed.target = None;
-                continue;
-            }
-            self.bodies.render(target, &messages, self.account.email());
-            *waiting = Some(detail);
+    /// Takes in the conversation the store read, and has its messages rendered.
+    fn copy_listed_read(&mut self, id: &str, detail: Option<Arc<ThreadDetail>>) {
+        let Some((target, waiting)) = self
+            .copy_listed
+            .target
+            .as_mut()
+            .filter(|(target, _)| target == id)
+        else {
+            return;
+        };
+        let Some(detail) = detail else {
+            self.copy_listed.target = None;
+            return;
+        };
+        let messages: Vec<&MessageDetail> = detail
+            .messages
+            .iter()
+            .filter(|message| !message.is_draft())
+            .collect();
+        if messages.is_empty() {
+            self.copy_listed.target = None;
+            return;
         }
+        self.bodies.render(target, &messages, self.account.email());
+        *waiting = Some(detail);
     }
 
     /// The messages of conversation `id` were rendered. If it's the conversation being copied,

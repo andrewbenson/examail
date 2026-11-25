@@ -80,16 +80,24 @@ fn find_delimiter(body: &[u8], delimiter: &[u8], from: usize) -> Option<usize> {
             .position(|window| window == delimiter)?;
         let found = at + offset;
         let starts_line = found == 0 || body[found - 1] == b'\n';
-        // RFC 2046: only `--`, whitespace or a line break may follow the boundary.
-        let ends_delimiter = body
-            .get(found + delimiter.len())
-            .is_none_or(|byte| b"-\r\n \t".contains(byte));
-        if starts_line && ends_delimiter {
+        if starts_line && ends_delimiter(&body[found + delimiter.len()..]) {
             return Some(found);
         }
         at = found + 1;
     }
     None
+}
+
+/// RFC 2046 §5.1.1: after `--boundary`, only an optional `--` close marker, optional linear
+/// whitespace (transport padding), and a line break (`\r\n` / `\n`) or EOF may follow.
+fn ends_delimiter(rest: &[u8]) -> bool {
+    let rest = rest.strip_prefix(b"--").unwrap_or(rest);
+    let pad = rest
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(rest.len());
+    let tail = &rest[pad..];
+    tail.is_empty() || tail.starts_with(b"\n") || tail.starts_with(b"\r\n")
 }
 
 /// Parses headers up to the first blank line. The rest is the body.
@@ -246,5 +254,39 @@ ETag: "etag/animals"
         assert_eq!(boundary("multipart/mixed; boundary=\"a b\""), Some("a b"));
         assert_eq!(boundary("multipart/related;boundary=xyz"), Some("xyz"));
         assert_eq!(boundary("text/plain; boundary=xyz"), None);
+    }
+
+    #[test]
+    fn ignores_boundary_prefixes_and_accepts_rfc2046_delimiters() {
+        let nested_payload = concat!(
+            "before\r\n",
+            "--boundary-nested\r\n",
+            "inner\r\n",
+            "--boundary-nested--\r\n",
+            "--boundary--extra\r\n",
+            "--boundary---triple\r\n",
+            "--boundary  trailing text\r\n",
+            "--boundary--  trailing text\r\n",
+            "after"
+        );
+        let raw = format!(
+            "--boundary\r\nContent-Type: text/plain\r\n\r\n{nested_payload}\r\n--boundary  \t\r\nContent-Type: text/plain\r\n\r\nsecond\r\n--boundary--"
+        );
+        let parts = split(raw.as_bytes(), "boundary").expect("splits");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].body, nested_payload.as_bytes());
+        assert_eq!(parts[1].body, b"second");
+
+        // Closing delimiter with transport padding and CRLF.
+        let padded_close = b"--boundary\r\n\r\nonly\r\n--boundary-- \t\r\n";
+        let parts = split(padded_close, "boundary").expect("splits");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].body, b"only");
+
+        // Bare `\r` not followed by `\n` is not a valid delimiter ending.
+        let bare_cr = b"--boundary\r\n\r\nline\r\n--boundary\rnot-lf\r\n--boundary--\r\n";
+        let parts = split(bare_cr, "boundary").expect("splits");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].body, b"line\r\n--boundary\rnot-lf");
     }
 }

@@ -8,8 +8,12 @@
 //! Metrics are at a 1280×800 window. In Carbon the card keeps Snow's colours.
 
 use egui::{Color32, Context, Id, Rect, Sense, Stroke, Ui, pos2, text::CCursorRange, vec2};
+use exo_commands::{Command, Commands, Region};
 use exo_store::{ReminderSettings, TriggerCondition};
-use exo_ui::{Dialog, DialogDropdown, DialogResponse, Family, Font, Menu, TextStyle};
+use exo_ui::{
+    Dialog, DialogDropdown, DialogResponse, DialogSelect, DialogSelectEvent, Family, Font,
+    TextStyle,
+};
 use jiff::Zoned;
 
 use crate::time_suggest::{self, Options};
@@ -64,10 +68,8 @@ const LABEL_GAP: f32 = 16.0;
 const DAYS_CHAR: f32 = 7.0;
 const DAYS_EXTRA: f32 = 4.0;
 const TIME_WIDTH: f32 = 52.0;
-/// The dropdown's value sits 1px into its box, with the caret 4px after it. Its list opens 18px
-/// left of the value and 26px under the button's top.
+/// The dropdown's value sits 1px into its box, with the caret 4px after it.
 const VALUE_LEFT: f32 = 1.0;
-const MENU_OFFSET: egui::Vec2 = vec2(-18.0, 26.0);
 /// The dropdown's rows: their names and the triggers they pick.
 const TRIGGERS: [(&str, TriggerCondition); 2] = [
     ("if no reply", TriggerCondition::IfNoReply),
@@ -170,6 +172,32 @@ impl State {
         self.menu.is_some()
     }
 
+    /// Registers the dialog's keyboard bindings in `Region::Dialog`.
+    pub fn register_keys<A: Clone + 'static>(
+        &self,
+        commands: &mut Commands<A>,
+        wrap: &impl Fn(super::Action) -> A,
+    ) {
+        const DIALOG: &[Region] = &[Region::Dialog];
+        let key = |id: &'static str, event: Event, keys: &[&'static str]| {
+            Command::shortcut(id, wrap(super::Action::Reminders(event)))
+                .keys(keys.iter().copied())
+                .regions(DIALOG)
+        };
+        if self.menu_open() {
+            commands.add(key(
+                "REMINDERS_MENU_DOWN",
+                Event::MenuMove(1),
+                &["down", "j"],
+            ));
+            commands.add(key("REMINDERS_MENU_UP", Event::MenuMove(-1), &["up", "k"]));
+            commands.add(key("REMINDERS_MENU_ESCAPE", Event::MenuClose, &["esc"]));
+        }
+        commands.add(key("REMINDERS_TAB", Event::Tab(1), &["tab"]));
+        commands.add(key("REMINDERS_SHIFT_TAB", Event::Tab(-1), &["shift+tab"]));
+        commands.add(key("REMINDERS_ENTER", Event::Enter, &["enter"]));
+    }
+
     /// Applies `event` to `settings`, and returns the settings to save, if it changed them.
     pub fn handle(
         &mut self,
@@ -236,10 +264,26 @@ impl State {
                 }
             }
             Event::ToggleWeekdays => saved.business_days_only = Some(!saved.weekdays_only()),
-            Event::Days(days) => saved.days = days,
+            Event::Days(days) => saved.days = days.max(1),
             Event::Time(hour, minute) => (saved.hour, saved.minute) = (hour, minute),
         }
         (saved != *settings).then_some(saved)
+    }
+
+    /// Commits and clamps any empty or zero-valued days input back to `1` as the dialog closes.
+    pub fn close(&mut self, settings: &ReminderSettings, now: &Zoned) -> Option<ReminderSettings> {
+        let blurred = self.move_focus(None, settings, now);
+        if blurred.is_some() {
+            return blurred;
+        }
+        if self.days.parse::<u32>().unwrap_or(0) == 0 {
+            self.days = "1".into();
+            return (settings.days != 1).then(|| ReminderSettings {
+                days: 1,
+                ..settings.clone()
+            });
+        }
+        None
     }
 
     /// Moves the keyboard to `to`, blurring what had it. The time input shows the saved time, and
@@ -258,7 +302,7 @@ impl State {
         self.select = to.is_some();
         self.time = formatted(settings, now);
         self.time_invalid = false;
-        if from == Some(Control::Days) && (self.days.is_empty() || self.days == "0") {
+        if from == Some(Control::Days) && self.days.parse::<u32>().unwrap_or(0) == 0 {
             self.days = "1".into();
             return (settings.days != 1).then(|| ReminderSettings {
                 days: 1,
@@ -350,10 +394,12 @@ fn draw(
         event = Some(Event::Focus(Control::Days));
     }
     if state.days != typed {
-        // Two digits at most and nothing else. A number is saved.
+        // Two digits at most and nothing else. Only positive numbers (>= 1) are saved.
         if state.days.chars().count() > 2 || !state.days.chars().all(|c| c.is_ascii_digit()) {
             state.days = typed;
-        } else if let Ok(days) = state.days.parse() {
+        } else if let Ok(days) = state.days.parse::<u32>()
+            && days >= 1
+        {
             event = Some(Event::Days(days));
         }
     }
@@ -387,27 +433,32 @@ fn draw(
     x += TIME_WIDTH + LABEL_GAP;
 
     let value = pos2(x + VALUE_LEFT, top + VALUE_TOP);
+    let trigger_id = exo_ui::id(&ctx, "reminders-trigger");
     // Black while it has the keyboard or (as of the last frame) the pointer.
     let lit = state.focus == Some(Control::Trigger)
         || ctx
-            .read_response(exo_ui::id(&ctx, "reminders-trigger"))
+            .read_response(trigger_id)
             .is_some_and(|response| response.hovered());
     let style = DialogDropdown {
         value: STRONG,
         caret: if lit { Color32::BLACK } else { CARET },
         gap: 4.0,
     };
-    let button =
-        exo_ui::paint_dialog_dropdown_with(ui, value, TRIGGERS[trigger_index(settings)].0, style);
-    let response = ui
-        .interact(
-            button,
-            exo_ui::id(ui.ctx(), "reminders-trigger"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.clicked() {
-        event = Some(Event::ToggleMenu);
+    let current = trigger_index(settings);
+    let names = TRIGGERS.map(|(name, _)| name);
+    if let Some(select_event) =
+        DialogSelect::new(trigger_id, value, TRIGGERS[current].0, &names, state.menu)
+            .current(current)
+            .style(style)
+            .focused(state.focus == Some(Control::Trigger))
+            .show(ui)
+    {
+        event = Some(match select_event {
+            DialogSelectEvent::Toggle => Event::ToggleMenu,
+            DialogSelectEvent::Highlight(row) => Event::Highlight(row),
+            DialogSelectEvent::Pick(row) => Event::Trigger(TRIGGERS[row].1),
+            DialogSelectEvent::Close => Event::MenuClose,
+        });
     }
     painter.hline(body.x_range(), top + RULE_TOP + 0.5, Stroke::new(1.0, RULE));
 
@@ -467,29 +518,6 @@ fn draw(
             .clicked()
         {
             event = Some(row.toggle);
-        }
-    }
-
-    if let Some(highlighted) = state.menu {
-        let names = TRIGGERS.map(|(name, _)| name);
-        let list = Menu {
-            items: &names,
-            highlighted,
-        }
-        .show_in_dialog(
-            ui,
-            exo_ui::id(ui.ctx(), "reminders-trigger-list"),
-            button.left_top() + MENU_OFFSET,
-        );
-        if let Some(clicked) = list.clicked {
-            event = Some(Event::Trigger(TRIGGERS[clicked].1));
-        } else if let Some(hovered) = list.hovered.filter(|hovered| *hovered != highlighted) {
-            event = Some(Event::Highlight(hovered));
-        } else if ui.input(|input| input.pointer.any_released())
-            && !response.hovered()
-            && !ui.rect_contains_pointer(list.rect)
-        {
-            event = Some(Event::MenuClose);
         }
     }
     event
@@ -560,7 +588,7 @@ fn input(
 mod tests {
     use super::*;
 
-    /// gmail-mock's now: Tuesday, November 17th 2026, 9:00 AM in New York.
+    /// mock-servers' now: Tuesday, November 17th 2026, 9:00 AM in New York.
     fn now() -> Zoned {
         "2026-11-17T09:00[America/New_York]".parse().expect("now")
     }
@@ -664,5 +692,48 @@ mod tests {
             Some(Some(true)),
             "unset reads as off"
         );
+    }
+
+    #[test]
+    fn zero_and_double_zero_days_are_never_saved_and_clamp_to_one_on_blur_and_close() {
+        let settings = ReminderSettings::default();
+        let mut state = State::open(&settings, &now());
+
+        // Event::Days(0) defensively clamps to 1.
+        assert_eq!(
+            state
+                .handle(Event::Days(0), &settings, &now())
+                .map(|saved| saved.days),
+            Some(1)
+        );
+
+        // Typing "0" or "00" and blurring clamps back to "1" and saves 1.
+        state.days = "00".into();
+        assert_eq!(
+            state
+                .handle(Event::Tab(1), &settings, &now())
+                .map(|saved| saved.days),
+            Some(1)
+        );
+        assert_eq!(state.days, "1");
+
+        // Closing the dialog with "00" or empty clamps back to "1" and saves 1.
+        let mut closing = State::open(&settings, &now());
+        closing.days = "00".into();
+        assert_eq!(
+            closing.close(&settings, &now()).map(|saved| saved.days),
+            Some(1)
+        );
+        assert_eq!(closing.days, "1");
+
+        let mut closing_empty = State::open(&settings, &now());
+        closing_empty.days.clear();
+        assert_eq!(
+            closing_empty
+                .close(&settings, &now())
+                .map(|saved| saved.days),
+            Some(1)
+        );
+        assert_eq!(closing_empty.days, "1");
     }
 }

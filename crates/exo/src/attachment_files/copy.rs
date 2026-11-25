@@ -42,6 +42,16 @@ fn is_inline_image(attachment: &Attachment) -> bool {
                 && attachment.content_id.is_some()))
 }
 
+impl File {
+    /// Whether this entry's Gmail identifiers are single safe tokens (no path separators, `..`, or
+    /// control characters from a crafted clipboard payload).
+    pub(crate) fn has_safe_ids(&self) -> bool {
+        super::is_safe_id(&self.message_id)
+            && super::is_safe_id(&self.part_id)
+            && self.attachment_id.as_deref().is_none_or(super::is_safe_id)
+    }
+}
+
 impl Copied {
     /// `attachments` of `account`'s message, for the clipboard.
     pub(crate) fn new(account: &str, attachments: &[Attachment]) -> Self {
@@ -61,13 +71,15 @@ impl Copied {
         }
     }
 
-    /// The files as a draft's, by reference to their Gmail parts, each with a new id.
+    /// The files as a draft's, by reference to their Gmail parts, each with a new id. Entries
+    /// whose Gmail part identifiers contain path-traversal or control characters are dropped.
     pub(crate) fn into_draft_attachments(self) -> Vec<DraftAttachment> {
         self.attachments
             .into_iter()
+            .filter(File::has_safe_ids)
             .map(|file| DraftAttachment {
                 uuid: crate::compose::uuid_v4(),
-                name: file.name,
+                name: super::file_name(&file.name),
                 mime_type: file.mime_type,
                 size: file.size,
                 content_id: None,
@@ -129,5 +141,57 @@ mod tests {
             }
         );
         assert_ne!(draft[0].uuid, draft[1].uuid);
+    }
+
+    #[test]
+    fn pasted_attachments_drop_path_traversal_identifiers_and_sanitize_names() {
+        let copied = Copied {
+            account: "maya@brightmoor.co".into(),
+            attachments: vec![
+                File {
+                    message_id: "../../etc".into(),
+                    attachment_id: Some("att-1".into()),
+                    part_id: "1".into(),
+                    name: "deck.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    size: 3,
+                },
+                File {
+                    message_id: "18f3a".into(),
+                    attachment_id: Some("att-2".into()),
+                    part_id: "../2".into(),
+                    name: "deck.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    size: 3,
+                },
+                File {
+                    message_id: "18f3a".into(),
+                    attachment_id: Some("../att-3".into()),
+                    part_id: "3".into(),
+                    name: "deck.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    size: 3,
+                },
+                File {
+                    message_id: "18f3a".into(),
+                    attachment_id: Some("att-4".into()),
+                    part_id: "4".into(),
+                    name: "../../.zshrc".into(),
+                    mime_type: "text/plain".into(),
+                    size: 3,
+                },
+            ],
+        };
+        let draft = copied.into_draft_attachments();
+        assert_eq!(draft.len(), 1);
+        assert_eq!(draft[0].name, "_.._.zshrc");
+        assert_eq!(
+            draft[0].source,
+            AttachmentSource::Gmail {
+                message_id: "18f3a".into(),
+                attachment_id: Some("att-4".into()),
+                part_id: "4".into(),
+            }
+        );
     }
 }

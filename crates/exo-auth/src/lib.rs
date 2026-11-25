@@ -1,9 +1,3 @@
-#![deny(
-    clippy::correctness,
-    clippy::suspicious,
-    clippy::complexity,
-    clippy::perf
-)]
 //! Google sign-in for Exo, the half without UI.
 //!
 //! Exo has no server to keep refresh tokens and hand out access tokens, so it runs Google's

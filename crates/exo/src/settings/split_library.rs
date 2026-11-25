@@ -2,7 +2,7 @@
 //! grid of template cards per section. Picking a category scrolls to it (and scrolling highlights
 //! the section on top). Picking a role shows only its templates.
 
-use egui::{Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use exo_store::{SplitLibrary, Template};
 use exo_ui::{
     ActionKind, DIALOG_ACTION_HEIGHT, DialogAction, Family, Font, TextStyle, motion, paint_icon,
@@ -40,14 +40,6 @@ const PREVIEW_HEIGHT: f32 = 104.0;
 const GRID_GAP: f32 = 12.0;
 /// Classic's corners on the sidebar's selection, `Build your own` and hovered cards.
 const RADIUS: u8 = 4;
-
-/// The fill of the selected sidebar item and a hovered card, `#f2f4fa` or `#dee3f2` in Carbon.
-fn highlight(ctx: &egui::Context) -> Color32 {
-    match exo_ui::app_theme(ctx) {
-        exo_ui::Theme::Snow => Color32::from_rgb(0xf2, 0xf4, 0xfa),
-        exo_ui::Theme::Carbon => Color32::from_rgb(0xde, 0xe3, 0xf2),
-    }
-}
 
 /// What the user did in the library.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,7 +187,11 @@ pub(super) fn show(
             let rect = Rect::from_min_size(pos2(sidebar_left, y), vec2(SIDEBAR_WIDTH, 32.0));
             // Items at `rgba(0, 0, 0, .55)`, the selected one's at `.9`.
             let ink = if selected == Some(index) {
-                painter.rect_filled(rect, CornerRadius::same(RADIUS), highlight(&ctx));
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same(RADIUS),
+                    exo_ui::dialog_surface_highlight(&ctx),
+                );
                 tokens.text_base_default
             } else {
                 tokens.ink(0.55, 0.55)
@@ -540,7 +536,7 @@ pub(super) fn show(
                     content.painter().rect_filled(
                         rect,
                         CornerRadius::same(RADIUS),
-                        highlight(&ctx),
+                        exo_ui::dialog_surface_highlight(&ctx),
                     );
                 }
                 paint_card(&content, rect, template, in_use(template));

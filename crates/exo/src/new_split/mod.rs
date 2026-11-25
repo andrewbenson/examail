@@ -15,10 +15,7 @@ pub(crate) mod dialog;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        mpsc::{Receiver, Sender, channel},
-    },
+    sync::Arc,
 };
 
 use exo_commands::{Command, Region, SubPalette};
@@ -124,32 +121,17 @@ pub enum Kind {
     Label,
 }
 
-/// A conversation the store read, by id.
-type Read = (String, Option<Arc<ThreadDetail>>);
-
 /// The split commands' state between frames.
+#[derive(Default)]
 pub(crate) struct NewSplit {
     /// Conversations read for the palette, by id (`None` for one the store doesn't have), and
     /// those being read.
     read: HashMap<String, Option<Arc<ThreadDetail>>>,
     reading: HashSet<String>,
-    channel: (Sender<Read>, Receiver<Read>),
     /// Definitions to offer once their conversations are read, and whether they're for adding.
     waiting: Option<bool>,
     /// The New Split dialog, while it's open.
     pub(crate) dialog: Option<dialog::State>,
-}
-
-impl Default for NewSplit {
-    fn default() -> Self {
-        Self {
-            read: HashMap::new(),
-            reading: HashSet::new(),
-            channel: channel(),
-            waiting: None,
-            dialog: None,
-        }
-    }
 }
 
 /// The non-draft messages of a conversation, oldest first.
@@ -218,9 +200,12 @@ pub(crate) fn definitions(
             let domain = sender
                 .email
                 .rsplit_once('@')
-                .map_or("", |(_, domain)| domain);
-            if !crate::format::names::is_popular_domain(domain)
-                && !domains.iter().any(|known| known == domain)
+                .map_or("", |(_, domain)| domain.trim());
+            if !domain.is_empty()
+                && !crate::format::names::is_popular_domain(&domain.to_lowercase())
+                && !domains
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(domain))
             {
                 domains.push(domain.to_owned());
             }
@@ -325,7 +310,7 @@ pub(crate) fn definitions(
 /// What a label is called. That's its Gmail name, except for Trash and Spam, which take the app's
 /// names for them.
 fn label_name(label: &Label) -> String {
-    crate::pickers::label_name(&label.id, std::slice::from_ref(label)).to_owned()
+    crate::triage_copy::label_name(&label.id, std::slice::from_ref(label)).to_owned()
 }
 
 /// A definition with brackets outside quotes, which a definition can't be added to.
@@ -380,11 +365,18 @@ fn with_definition(
     definitions: Definitions<'_>,
 ) -> SplitInbox {
     let query = if split.is_default() {
-        let mut items = settings::split_template::query_items(split.kind.as_deref(), split.query());
-        items.extend(definition.items.iter().cloned());
+        let mut items: Vec<String> = Vec::new();
+        for item in settings::split_template::query_items(split.kind.as_deref(), split.query())
+            .into_iter()
+            .chain(definition.items.iter().cloned())
+        {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() && !items.iter().any(|kept| kept.eq_ignore_ascii_case(trimmed)) {
+                items.push(trimmed.to_owned());
+            }
+        }
         let from = items
             .iter()
-            .filter(|item| !item.is_empty())
             .map(|item| format!("from:{item}"))
             .collect::<Vec<_>>();
         match split.kind.as_deref() {
@@ -560,11 +552,6 @@ impl Mail {
     /// Reads the conversations the palette's split rows need while it's open, and forgets them
     /// once it's closed. Call every frame.
     pub(crate) fn new_split_frame(&mut self) {
-        while let Ok((id, detail)) = self.new_split.channel.1.try_recv() {
-            if self.new_split.reading.remove(&id) {
-                self.new_split.read.insert(id, detail);
-            }
-        }
         if self.commands.region() != Region::Command && self.new_split.waiting.is_none() {
             self.new_split.read.clear();
             self.new_split.reading.clear();
@@ -581,7 +568,7 @@ impl Mail {
             if self.new_split.read.contains_key(&id) || !self.new_split.reading.insert(id.clone()) {
                 continue;
             }
-            let (sender, ctx) = (self.new_split.channel.0.clone(), self.ctx.clone());
+            let ui = self.ui_sender();
             self.account.loader().run(
                 move |store| async move {
                     let detail = store
@@ -592,12 +579,22 @@ impl Mail {
                         .flatten();
                     (id, detail.map(Arc::new))
                 },
-                move |read| {
-                    let _ = sender.send(read);
-                    ctx.request_repaint();
+                move |(id, detail)| {
+                    ui.send(move |mail| mail.new_split_thread_read(id, detail));
                 },
             );
         }
+        self.maybe_open_definitions();
+    }
+
+    fn new_split_thread_read(&mut self, id: String, detail: Option<Arc<ThreadDetail>>) {
+        if self.new_split.reading.remove(&id) {
+            self.new_split.read.insert(id, detail);
+        }
+        self.maybe_open_definitions();
+    }
+
+    fn maybe_open_definitions(&mut self) {
         if let Some(adding) = self.new_split.waiting
             && self
                 .split_sources()
@@ -737,7 +734,7 @@ impl Mail {
             Action::Subject { adding, subject } => self.defined(
                 adding,
                 Definition {
-                    query: format!("subject:\"{subject}\""),
+                    query: crate::subject_query(&subject),
                     kind: Kind::Subject,
                     items: Vec::new(),
                 },
@@ -915,14 +912,20 @@ impl Mail {
                 self.pickers.ask_update_split(&existing, query);
                 None
             }
-            Some(existing) if existing.is_disabled => settings::toggle_split(
+            Some(existing) if existing.is_disabled => match settings::toggle_split(
                 &mut self.account,
                 &mut self.commands,
                 &wrap,
                 &existing,
                 SplitChanges::default(),
                 &self.list,
-            ),
+            ) {
+                Ok(show) => show,
+                Err(()) => {
+                    self.pickers.split_too_long(self.settings.dialog_open());
+                    None
+                }
+            },
             Some(existing) => Some(ListId::Split(existing.id)),
             None => {
                 let (labels, me) = settings::split_definitions(&self.account);
@@ -1316,5 +1319,69 @@ mod tests {
         assert!(titles(&list).is_empty(), "only for forums mail");
         list.labels = vec!["CATEGORY_FORUMS".into()];
         assert_eq!(titles(&list), ["New Split Inbox: rust-users@lists.example"]);
+    }
+
+    #[test]
+    fn definitions_skips_empty_domain_and_with_definition_deduplicates_items() {
+        let mut msg = message("m", "no-at-sign", &["maya@brightmoor.co"], "Hi");
+        let detail = ThreadDetail {
+            id: ThreadId::new("t-no-at"),
+            subject: "Hi".into(),
+            labels: vec!["INBOX".into()],
+            muted: false,
+            reminder: None,
+            messages: vec![msg.clone()],
+        };
+        let rows = definitions(false, None, &[&detail], None, &[]);
+        assert!(
+            !rows.iter().any(|(title, _)| title.contains("with domain:")),
+            "at-less sender must not offer empty domain: {rows:?}"
+        );
+
+        msg.from = Some(Contact {
+            name: None,
+            email: "trailing@".into(),
+            is_me: false,
+        });
+        let trailing = ThreadDetail {
+            messages: vec![msg],
+            ..detail
+        };
+        let rows = definitions(false, None, &[&trailing], None, &[]);
+        assert!(
+            !rows.iter().any(|(title, _)| title.contains("with domain:")),
+            "trailing-@ sender must not offer empty domain: {rows:?}"
+        );
+
+        let defs = Definitions {
+            labels: &[],
+            me: &[],
+        };
+        let dup = Definition {
+            query: "from:priya@brightmoor.co OR from:new@brightmoor.co".into(),
+            kind: Kind::Sender,
+            items: vec![
+                "PRIYA@brightmoor.co".into(),
+                "new@brightmoor.co".into(),
+                "NEW@BRIGHTMOOR.CO".into(),
+            ],
+        };
+        assert_eq!(
+            with_definition(
+                &split("VIP", "from:priya@brightmoor.co", Some("vip")),
+                &dup,
+                defs
+            )
+            .query(),
+            "from:priya@brightmoor.co OR from:new@brightmoor.co"
+        );
+    }
+
+    #[test]
+    fn subject_action_escapes_embedded_quotes_via_subject_query() {
+        assert_eq!(
+            crate::subject_query("15\" MacBook OR in:trash"),
+            "subject:\"15\" subject:\"MacBook OR in:trash\""
+        );
     }
 }

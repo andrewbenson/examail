@@ -607,9 +607,11 @@ mod tests {
             None
         );
         assert_eq!(
-            Ntfy::from_settings(&json!({ "ntfy": { "server": "https://169.254.169.254", "topic": "t" } }))
-                .unwrap()
-                .server,
+            Ntfy::from_settings(
+                &json!({ "ntfy": { "server": "https://169.254.169.254", "topic": "t" } })
+            )
+            .unwrap()
+            .server,
             "https://ntfy.sh"
         );
     }

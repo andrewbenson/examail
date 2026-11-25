@@ -21,7 +21,7 @@ const PADDING_X: f32 = 4.0;
 /// `max-width: 100px`, padding included.
 const MAX_WIDTH: f32 = 100.0;
 /// The chip's height: line height plus vertical padding.
-pub const LABEL_CHIP_HEIGHT: f32 = 16.0;
+pub(crate) const LABEL_CHIP_HEIGHT: f32 = 16.0;
 
 /// The eight colors a label can get, by name, the same in both themes.
 const HUES: [(&str, &str); 8] = [
@@ -43,7 +43,7 @@ fn hex(css: &str) -> Color32 {
 const WATERMELON: &str = "#ef8e8e";
 
 /// The fill and text colors of a chip for label `name` in `theme`.
-pub fn label_colors(name: &str, theme: Theme) -> (Color32, Color32) {
+pub(crate) fn label_colors(name: &str, theme: Theme) -> (Color32, Color32) {
     let name = name.to_lowercase();
     // Spam and Trash, names Gmail keeps for its own labels, aren't hashed. They get watermelon
     // and `default`.
@@ -87,7 +87,8 @@ impl LabelChip {
         let mut job = LayoutJob::single_section(name.to_lowercase(), STYLE.format(text));
         // A name too long for `max-width` overflows the content box, so the box stays at the
         // maximum and the text ends in an ellipsis inside it.
-        let width = (painter.layout_job(job.clone()).size().x + 2.0 * PADDING_X).min(MAX_WIDTH);
+        let width =
+            (crate::layout(painter.ctx(), job.clone()).size().x + 2.0 * PADDING_X).min(MAX_WIDTH);
         job.wrap = TextWrapping::truncate_at_width(MAX_WIDTH - 2.0 * PADDING_X);
         Self {
             name: name.to_owned(),
@@ -163,5 +164,28 @@ mod tests {
             (hex("#c5bbda"), hex("#27292d"))
         );
         assert_eq!(label_colors("Family", Theme::Snow).1, Color32::WHITE);
+    }
+
+    #[test]
+    fn chip_width_uses_emoji_optical_layout() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx).expect("system fonts");
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let name = "❤️ urgent";
+            let chip = LabelChip::new(ui.painter(), name, false);
+            let expected = (crate::layout(
+                ui.ctx(),
+                LayoutJob::single_section(name.to_lowercase(), STYLE.format(Color32::WHITE)),
+            )
+            .size()
+            .x + 2.0 * PADDING_X)
+                .min(MAX_WIDTH);
+            assert!(
+                (chip.width() - expected).abs() < 0.01,
+                "chip width {} != expected {expected}",
+                chip.width()
+            );
+        })
+        .drop_without_applying_deltas();
     }
 }

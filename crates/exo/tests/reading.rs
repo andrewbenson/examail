@@ -1,4 +1,4 @@
-//! Reading a conversation end to end on gmail-mock: Open Links & Attachments (`⌘O`), replies
+//! Reading a conversation end to end on mock-servers: Open Links & Attachments (`⌘O`), replies
 //! that quote a selection, the Bcc reply-all warning, the palette's Google apps rows and View
 //! Raw Email Data (`|`). Links never reach a browser. The tests read what the app asked egui to
 //! open.
@@ -468,15 +468,16 @@ fn pipe_shows_the_conversation_as_gmail_sends_it_until_escape() {
     assert!(selected, "its text is selected once it's in");
     let source = text.to_owned();
     // ⌘C copies it all.
+    let release = Event::Key {
+        key: Key::C,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: CMD,
+    };
     let mut copied = None;
-    for pressed in [true, false] {
-        app.harness.input_mut().events.push(Event::Key {
-            key: Key::C,
-            physical_key: None,
-            pressed,
-            repeat: false,
-            modifiers: CMD,
-        });
+    for event in [Event::Copy, release] {
+        app.harness.input_mut().events.push(event);
         app.harness.run_steps(1);
         copied = copied.or_else(|| {
             app.harness

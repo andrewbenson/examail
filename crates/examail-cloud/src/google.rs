@@ -99,7 +99,10 @@ impl Google {
     async fn kms(&self, verb: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let response = self
             .http
-            .post(format!("https://cloudkms.googleapis.com/v1/{}:{verb}", self.kms_key))
+            .post(format!(
+                "https://cloudkms.googleapis.com/v1/{}:{verb}",
+                self.kms_key
+            ))
             .bearer_auth(self.access_token().await?)
             .json(&body)
             .send()
@@ -107,7 +110,10 @@ impl Google {
             .with_context(|| format!("calling KMS {verb}"))?;
         let status = response.status();
         if !status.is_success() {
-            bail!("KMS {verb} failed ({status}): {}", response.text().await.unwrap_or_default());
+            bail!(
+                "KMS {verb} failed ({status}): {}",
+                response.text().await.unwrap_or_default()
+            );
         }
         Ok(response.json().await?)
     }

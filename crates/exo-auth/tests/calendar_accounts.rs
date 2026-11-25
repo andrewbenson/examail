@@ -1,5 +1,5 @@
 //! Calendar accounts, the other Google accounts a mail account signs in for their calendars
-//! alone, tested against gmail-mock. There, a `login_hint` signs in another address, with
+//! alone, tested against mock-servers. There, a `login_hint` signs in another address, with
 //! calendars of its own.
 
 mod support;

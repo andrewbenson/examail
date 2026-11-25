@@ -6,7 +6,7 @@ use exo_commands::{Hint, Toast};
 use exo_store::Snippet;
 use jiff::Timestamp;
 
-use super::{Action, Alert, AlertThen, Field, Fields, Open, draft::SnippetEdit, factory};
+use super::{Action, Alert, AlertThen, Field, Fields, Open, factory};
 use crate::commands;
 
 /// Where leaving a snippet with unsaved changes was going, once `Save Snippet?` lets it.
@@ -24,12 +24,7 @@ impl crate::Mail {
         // `"use default"`, which means the From of the draft the snippet is used in.
         record.from = None;
         let mut open = Open::new(factory::new_id(), None, record);
-        open.snippet = Some(SnippetEdit { name, saved: None });
-        open.state = super::draft::State {
-            header_expanded: false,
-            cc_bcc_shown: false,
-            field: Field::SnippetName,
-        };
+        open.set_snippet(name, None, false);
         self.open_snippet_pane(open);
     }
 
@@ -58,21 +53,13 @@ impl crate::Mail {
         let mut open = Open::new(snippet.id.clone(), None, record);
         let shown = !(snippet.to.is_empty() && snippet.cc.is_empty() && snippet.bcc.is_empty())
             || !snippet.subject.is_empty();
-        open.state = super::draft::State {
-            header_expanded: shown,
-            cc_bcc_shown: shown,
-            field: Field::SnippetName,
-        };
         // The saved copy holds the body as the editor reads it back, so an untouched snippet
         // counts as unchanged.
         let saved = Snippet {
             body: open.editor.html(),
             ..snippet.clone()
         };
-        open.snippet = Some(SnippetEdit {
-            name: snippet.name.clone(),
-            saved: Some(saved),
-        });
+        open.set_snippet(snippet.name.clone(), Some(saved), shown);
         self.open_snippet_pane(open);
     }
 
@@ -94,6 +81,7 @@ impl crate::Mail {
     /// shows the folder again, with the `⌘ ;` hint the first three times.
     pub(super) fn save_snippet(&mut self) {
         let aliases = self.snapshot.aliases.clone();
+        let now = self.ctx.input(|input| input.time);
         let Some(id) = self
             .compose
             .focus
@@ -102,9 +90,17 @@ impl crate::Mail {
         else {
             return;
         };
-        let Some(open) = self.compose.get_mut(&id).filter(|open| open.is_snippet()) else {
+        let Some(at) = self
+            .compose
+            .drafts
+            .iter()
+            .position(|open| open.id == id && open.is_snippet())
+        else {
             return;
         };
+        let book = self.compose.book.as_ref().map(|(_, index)| index.as_ref());
+        let open = &mut self.compose.drafts[at];
+        super::form::commit_all(open, now, book);
         let html = super::outgoing::html(open, &aliases);
         if let Some(problem) = super::checks::check(
             open,
@@ -122,7 +118,7 @@ impl crate::Mail {
             ));
             return;
         }
-        let Some(snippet) = snippet_of(open) else {
+        let Some(snippet) = open.to_snippet() else {
             return;
         };
         let at = Timestamp::now().to_string();
@@ -167,7 +163,11 @@ impl crate::Mail {
     /// `Create Snippet from Draft`: a new snippet with the focused draft's recipients, subject,
     /// body and files.
     pub(crate) fn snippet_from_draft(&mut self) {
-        let Some(open) = self.compose.focused_mut().filter(|open| !open.is_snippet()) else {
+        let Some(open) = self
+            .compose
+            .focused_mut()
+            .filter(|open| open.persists_to_gmail())
+        else {
             return;
         };
         open.sync_body();
@@ -224,15 +224,7 @@ impl crate::Mail {
         record.attachments = snippet.attachments;
         let mut open = Open::new(factory::new_id(), None, record);
         let shown = open.recipients().next().is_some() || !open.record.subject.is_empty();
-        open.state = super::draft::State {
-            header_expanded: shown,
-            cc_bcc_shown: shown,
-            field: Field::SnippetName,
-        };
-        open.snippet = Some(SnippetEdit {
-            name: String::new(),
-            saved: None,
-        });
+        open.set_snippet(String::new(), None, shown);
         self.open_snippet_pane(open);
     }
 
@@ -302,12 +294,14 @@ impl crate::Mail {
             return;
         };
         let Some(query) = open
-            .snippet_trigger
+            .popups
+            .snippets
+            .trigger
             .as_ref()
             .map(|trigger| trigger.query.clone())
         else {
-            open.snippet_rows.clear();
-            open.snippet_hint = false;
+            open.popups.snippets.rows.clear();
+            open.popups.snippets.hint = false;
             return;
         };
         // A snippet being edited isn't offered in itself.
@@ -326,11 +320,11 @@ impl crate::Mail {
                     preview: super::snippets::preview(snippet),
                 })
                 .collect();
-        if rows != open.snippet_rows {
-            open.snippet_pick = 0;
-            open.snippet_rows = rows;
+        if rows != open.popups.snippets.rows {
+            open.popups.snippets.pick = 0;
+            open.popups.snippets.rows = rows;
         }
-        open.snippet_hint = query.is_empty() && settings.snippets.is_empty();
+        open.popups.snippets.hint = query.is_empty() && settings.snippets.is_empty();
     }
 
     /// Enter, Tab or a press in the `;` picker removes the typed `;query` and puts the snippet in
@@ -340,20 +334,22 @@ impl crate::Mail {
             return;
         };
         let Some(row) = open
-            .snippet_rows
-            .get(index.unwrap_or(open.snippet_pick))
+            .popups
+            .snippets
+            .rows
+            .get(index.unwrap_or(open.popups.snippets.pick))
             .cloned()
         else {
             return;
         };
-        if let Some(trigger) = open.snippet_trigger.take() {
+        if let Some(trigger) = open.popups.snippets.trigger.take() {
             if open.state.field == Field::Subject {
                 super::subject::replace(open, &trigger, "");
             } else {
                 open.editor.replace(trigger.start, trigger.end, "");
             }
         }
-        open.snippet_rows.clear();
+        open.popups.snippets.rows.clear();
         let Some(snippet) = self
             .account
             .settings()
@@ -377,7 +373,7 @@ impl crate::Mail {
         let Some(open) = self.compose.focused() else {
             return;
         };
-        if is_dirty(open) {
+        if open.is_snippet_dirty() {
             let draft = open.id.clone();
             self.compose.alert = Some(Alert::new(
                 Some("Discard changes?"),
@@ -451,12 +447,7 @@ impl crate::Mail {
         let Some(open) = self.compose.focused() else {
             return;
         };
-        if open
-            .snippet
-            .as_ref()
-            .is_some_and(|edit| edit.saved.is_none())
-            && is_empty(open)
-        {
+        if open.is_new_snippet() && open.is_snippet_empty() {
             self.close_snippet();
         } else {
             self.compose.focus = None;
@@ -479,7 +470,7 @@ impl crate::Mail {
 
     /// Whether the snippet in the pane has changes that Done hasn't saved.
     pub(crate) fn snippet_unsaved(&self) -> bool {
-        self.pane_snippet().is_some_and(is_dirty)
+        self.pane_snippet().is_some_and(Open::is_snippet_dirty)
     }
 
     /// The snippet open in the pane.
@@ -499,10 +490,7 @@ impl crate::Mail {
         let Some(open) = self.pane_snippet() else {
             return;
         };
-        let never_saved = open
-            .snippet
-            .as_ref()
-            .is_some_and(|edit| edit.saved.is_none());
+        let never_saved = open.is_new_snippet();
         let actions = vec![
             "Save",
             "Cancel",
@@ -561,68 +549,86 @@ impl crate::Mail {
     }
 }
 
-/// The snippet `open` holds, as Done saves it (without its date and analytics).
-pub(super) fn snippet_of(open: &mut Open) -> Option<Snippet> {
-    open.sync_body();
-    let edit = open.snippet.as_ref()?;
-    let record = &open.record;
-    Some(Snippet {
-        id: open.id.clone(),
-        name: edit.name.clone(),
-        subject: record.subject.clone(),
-        body: record.body.clone(),
-        to: record.to.clone(),
-        cc: record.cc.clone(),
-        bcc: record.bcc.clone(),
-        from: record.from.clone(),
-        attachments: record.attachments.clone(),
-        date: String::new(),
-        analytics: exo_store::SnippetAnalytics::default(),
-    })
-}
-
-/// Whether the snippet has nothing in it at all.
-fn is_empty(open: &Open) -> bool {
-    open.snippet
-        .as_ref()
-        .is_some_and(|edit| edit.name.trim().is_empty())
-        && open.is_body_empty()
-        && open.recipients().next().is_none()
-        && open.record.subject.trim().is_empty()
-        && open.record.attachments.is_empty()
-}
-
-/// Whether the snippet differs from what was last saved. A new snippet differs once anything is
-/// in it.
-fn is_dirty(open: &Open) -> bool {
-    let Some(edit) = &open.snippet else {
-        return false;
-    };
-    match &edit.saved {
-        None => !is_empty(open),
-        Some(saved) => {
-            let record = &open.record;
-            edit.name != saved.name
-                || record.subject != saved.subject
-                || open.editor.html() != saved.body
-                || record.to != saved.to
-                || record.cc != saved.cc
-                || record.bcc != saved.bcc
-                || record.from != saved.from
-                || record.attachments != saved.attachments
-        }
-    }
-}
-
 /// The pane's title for a snippet.
 pub(crate) fn pane_title(open: &Open) -> &'static str {
-    if open
-        .snippet
-        .as_ref()
-        .is_some_and(|edit| edit.saved.is_some())
-    {
+    if open.is_saved_snippet() {
         "Edit Private Snippet"
     } else {
         "New Private Snippet"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::compose::draft::List;
+
+    #[test]
+    fn save_snippet_commits_uncommitted_recipient_inputs_before_checks() {
+        let ctx = egui::Context::default();
+        let _ = exo_ui::install(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "exo-snippet-commit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let account = crate::account::Account::open(
+            &dir,
+            crate::account::Credentials {
+                email: "maya@brightmoor.co".into(),
+                endpoints,
+                tokens: Arc::new(gmail::StaticToken("dev".into())),
+            },
+            ctx.clone(),
+        )
+        .expect("account opens");
+        let mut mail =
+            crate::Mail::new(&ctx, &crate::assets_dir(), account, crate::Clock::system());
+
+        mail.create_snippet("Follow up".into());
+        mail.compose
+            .focused_mut()
+            .expect("snippet open")
+            .input_mut(List::To)
+            .text = "priya@brightmoor.co".into();
+        mail.save_snippet();
+
+        let saved = mail
+            .account
+            .settings()
+            .snippets
+            .iter()
+            .find(|snippet| snippet.name == "Follow up")
+            .expect("snippet saved");
+        assert_eq!(saved.to.len(), 1);
+        assert_eq!(saved.to[0].email, "priya@brightmoor.co");
+
+        // An invalid uncommitted recipient is committed and rejected by checks.
+        mail.create_snippet("Bad".into());
+        mail.compose
+            .focused_mut()
+            .expect("snippet open")
+            .input_mut(List::To)
+            .text = "not-an-email".into();
+        mail.save_snippet();
+        assert!(
+            mail.compose.alert.is_some(),
+            "invalid address triggers alert"
+        );
+        assert!(
+            mail.account
+                .settings()
+                .snippets
+                .iter()
+                .all(|snippet| snippet.name != "Bad"),
+            "invalid snippet was not saved"
+        );
+
+        mail.discard();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -72,7 +72,11 @@ pub fn attachment_bottom_row(card: Rect) -> f32 {
 /// How wide a card `card_width` wide draws `filename`'s type badge
 /// (`padding: 0 6px; max-width: calc(100% - 20px)` in the card's 8px padding); 0 without an
 /// extension.
-pub fn attachment_badge_width(painter: &egui::Painter, filename: &str, card_width: f32) -> f32 {
+pub(crate) fn attachment_badge_width(
+    painter: &egui::Painter,
+    filename: &str,
+    card_width: f32,
+) -> f32 {
     let kind = extension(filename).to_uppercase();
     if kind.is_empty() {
         return 0.0;

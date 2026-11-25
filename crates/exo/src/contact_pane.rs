@@ -47,17 +47,28 @@ pub enum ContactAction {
     Copied(String),
 }
 
+/// Context for the contact card on screen.
+pub struct PaneContext<'a> {
+    /// The signed-in account showing the pane.
+    pub account: &'a str,
+    /// The conversation the cursor or thread view is on, left out of Mail.
+    pub current: Option<&'a str>,
+    /// Whether the card is for the account's own address, which hides Mail.
+    pub is_me: bool,
+    /// Whether the message on screen for this sender allows showing a brand logo.
+    pub allow_brand: bool,
+    pub now: jiff::Timestamp,
+}
+
 /// Paints `card` in `pane` (the right pane inside its border, above the footer), leaving out
-/// `current` (the thread the cursor is on) from its conversations, which say how long ago they
-/// were before `now` while hovered. `is_me` hides the Mail section for the account's own address.
+/// `cx.current` from its conversations, which say how long ago they were before `cx.now` while
+/// hovered.
 pub fn show(
     ui: &mut Ui,
     pane: Rect,
     rem: f32,
     card: &ContactCard,
-    current: Option<&str>,
-    is_me: bool,
-    now: jiff::Timestamp,
+    cx: PaneContext<'_>,
 ) -> Option<ContactAction> {
     // What's under the name scrolls (`.ContactPane-overlay`), clipped to its box.
     let overlay = Rect::from_min_max(pos2(pane.left(), pane.top() + NAME_ROW), pane.max);
@@ -123,9 +134,12 @@ pub fn show(
     // (else the logo), with the address 13px beside it in the pane's ink. Otherwise the contact
     // details are the address alone, in `rgba(0, 0, 0, .55)` (Carbon `hsla(0, 0%, 100%, .65)`).
     // Either way it's 4px below the overlay's top.
-    let person = crate::people::person(ui.ctx(), &card.person.email);
-    let has_header =
-        person.is_some() || crate::brands::logo(ui.ctx(), &card.person.email).is_some();
+    let person = crate::people::person_for(ui.ctx(), cx.account, &card.person.email);
+    let brand = cx
+        .allow_brand
+        .then(|| crate::brands::logo(ui.ctx(), cx.account, &card.person.email))
+        .flatten();
+    let has_header = person.is_some() || brand.is_some();
     let (email_left, details_ink, details_bottom) = if has_header {
         (left + PHOTO + 13.0, ink, 140.0)
     } else {
@@ -179,7 +193,14 @@ pub fn show(
     if has_header {
         // The photo, 4px down, over the default avatar, which shows until it loads.
         let photo = Rect::from_min_size(pos2(left, top + 84.0), Vec2::splat(PHOTO));
-        crate::people::paint_avatar(&painter, photo, &card.person.email, false);
+        crate::people::paint_avatar_with_brand_for(
+            &painter,
+            photo,
+            cx.account,
+            &card.person.email,
+            brand.as_ref(),
+            false,
+        );
         // The header's 60px and its 16px bottom padding.
         section_top = top + 156.0;
     }
@@ -191,10 +212,10 @@ pub fn show(
     let recent: Vec<_> = card
         .recent
         .iter()
-        .filter(|thread| Some(thread.id.as_str()) != current)
+        .filter(|thread| Some(thread.id.as_str()) != cx.current)
         .take(MAIL_ROWS)
         .collect();
-    if !is_me && !recent.is_empty() {
+    if !cx.is_me && !recent.is_empty() {
         // The header, which spans the section, searches their address.
         let header = Rect::from_min_size(pos2(left, section_top), vec2(width, 16.0));
         section_header(
@@ -217,7 +238,7 @@ pub fn show(
             let row = Rect::from_min_size(pos2(left, top), vec2(width, 16.0));
             let mut title_width = width;
             if ui.rect_contains_pointer(row) {
-                let ago = crate::format::dates::relative(thread.date, now);
+                let ago = crate::format::dates::relative(thread.date, cx.now);
                 let ago_width = DATA.width(ui.ctx(), &ago);
                 DATA.paint_line(
                     &painter,

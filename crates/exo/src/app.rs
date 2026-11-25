@@ -47,7 +47,7 @@ use crate::{
 
 /// What Exo starts with.
 pub enum Start {
-    /// This account's mail, signed in by the caller (screenshots and tests on gmail-mock).
+    /// This account's mail, signed in by the caller (screenshots and tests on mock-servers).
     Mail(Box<Account>),
     /// Whatever sign-in says: the last used account's mail, or the sign-in screen.
     SignIn(SignIn),
@@ -161,7 +161,44 @@ impl Away {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        self.flush_open_accounts_for_quit();
+    }
+}
+
 impl App {
+    /// Saves unsaved drafts across every open page and flushes held Undo-Send and Calendar changes
+    /// across all open accounts concurrently instead of sequentially.
+    fn flush_open_accounts_for_quit(&mut self) {
+        if let Screen::Mail(mail) = &mut self.screen {
+            mail.save_drafts();
+        }
+        for page in self.tabs.pages_mut() {
+            page.save_drafts();
+        }
+        for away in &mut self.background {
+            if let Away::Mail(page) = away {
+                page.save_drafts();
+            }
+        }
+        let flushes: Vec<_> = self
+            .handles()
+            .filter_map(Account::take_quit_flush)
+            .collect();
+        if flushes.len() == 1 {
+            for flush in flushes {
+                flush.run();
+            }
+        } else if flushes.len() > 1 {
+            std::thread::scope(|scope| {
+                for flush in flushes {
+                    scope.spawn(move || flush.run());
+                }
+            });
+        }
+    }
+
     /// Sets up `cc`'s context to draw Exo, with the images in `assets`, and shows what
     /// `start` says, dated relative to `clock`. Reads the Keychain for every account's grant.
     ///
@@ -176,18 +213,27 @@ impl App {
     ) -> Result<Self, LaunchError> {
         let ctx = &cc.egui_ctx;
         exo_ui::install(ctx)?;
-        let (launch, sign_in) = match start {
-            Start::Mail(account) => (
-                Launch::screen(Screen::Mail(Box::new(Mail::new(
-                    ctx,
-                    assets,
-                    *account,
-                    clock.clone(),
-                )))),
-                None,
-            ),
+        let (launch, sign_in, runtime) = match start {
+            Start::Mail(account) => {
+                let runtime = account.runtime().clone();
+                (
+                    Launch::screen(Screen::Mail(Box::new(Mail::new(
+                        ctx,
+                        assets,
+                        *account,
+                        clock.clone(),
+                    )))),
+                    None,
+                    runtime,
+                )
+            }
             Start::SignIn(mut sign_in) => {
-                (launch(&mut sign_in, ctx, assets, &clock)?, Some(sign_in))
+                let runtime = sign_in.runtime().clone();
+                (
+                    launch(&mut sign_in, ctx, assets, &clock)?,
+                    Some(sign_in),
+                    runtime,
+                )
             }
         };
         let mut app = Self {
@@ -201,7 +247,7 @@ impl App {
             notifier: None,
             frames: Frames::default(),
             quit_warning: None,
-            pictures: ProfilePictures::new(ctx),
+            pictures: ProfilePictures::with_runtime(ctx, runtime),
             zoom: Zoom::default(),
             tabs: Tabs::default(),
             tabs_file: None,
@@ -744,6 +790,7 @@ impl App {
             drop(self.unopened(ctx, email, &OpenError::Store(error)));
             return;
         }
+        crate::brands::forget(ctx, email);
         remove_previews(email);
         self.switch(ctx, email);
     }
@@ -757,9 +804,7 @@ impl App {
                 "clearing the cache needs Examail's sign-in, which this app wasn't started with"
             );
         }
-        if let Screen::Mail(mail) = &mut self.screen {
-            mail.save_drafts();
-        }
+        self.flush_open_accounts_for_quit();
         let placeholder = Screen::LogIn(self.log_in_screen(ctx));
         drop(std::mem::replace(&mut self.screen, placeholder));
         self.background.clear();
@@ -772,7 +817,10 @@ impl App {
         };
         for account in listed {
             match sign_in.clear_cache(&account.email) {
-                Ok(()) => remove_previews(&account.email),
+                Ok(()) => {
+                    crate::brands::forget(ctx, &account.email);
+                    remove_previews(&account.email);
+                }
                 Err(error) => log::error!("clearing an account's cache: {error}"),
             }
         }
@@ -789,9 +837,9 @@ impl App {
 
     /// View ▸ `Reload`, which starts what's on screen over where it is. The page on screen closes,
     /// saving its drafts, and a new one opens at the list and conversation it showed (the page's
-    /// URL). Its account closes, sending what it holds as quitting does, and opens again from its
-    /// store only when no other tab has it. An alert in the page's place tries opening the account
-    /// again. The sign-in screen stays.
+    /// URL). When no other tab has the account, its account closes and opens again from its store
+    /// without prematurely flushing Undo-Send or Calendar holds. An alert in the page's place tries
+    /// opening the account again. The sign-in screen stays.
     fn reload(&mut self, ctx: &egui::Context) {
         if self.sign_in.is_none() {
             return log::warn!(
@@ -799,16 +847,22 @@ impl App {
             );
         }
         let route = match &self.screen {
-            Screen::Mail(mail) => Route {
-                view: tabs::View::List,
-                ..mail.route()
-            },
+            Screen::Mail(mail) => {
+                mail.account().set_reload_close(true);
+                Route {
+                    view: tabs::View::List,
+                    ..mail.route()
+                }
+            }
             Screen::SignedOut(alert) => Route::home(alert.email().to_owned()),
             Screen::Unopened(alert) => Route::home(alert.email().to_owned()),
             Screen::LogIn(_) => return,
         };
         let placeholder = Screen::LogIn(self.log_in_screen(ctx));
         drop(std::mem::replace(&mut self.screen, placeholder));
+        if let Some(account) = self.account_of(&route.email) {
+            account.set_reload_close(false);
+        }
         drop(self.go(ctx, route));
     }
 
@@ -996,6 +1050,7 @@ impl App {
                 self.switch(ctx, &next.email);
             }
         }
+        crate::brands::forget(ctx, email);
         if let Some(sign_in) = &self.sign_in {
             sign_in.delete_store(email);
         }
@@ -1076,11 +1131,9 @@ impl App {
         other.map(|account| Back::SignedIn(account.email))
     }
 
-    /// The sign-in screen, ready to draw.
+    /// The sign-in screen, decoding its photo off the UI thread and repainting `ctx` when ready.
     fn log_in_screen(&self, ctx: &egui::Context) -> LogIn {
-        let mut log_in = LogIn::new(ctx, &self.assets.join("images"), None);
-        log_in.wait();
-        log_in
+        LogIn::new(ctx, &self.assets.join("images"), None)
     }
 
     /// Tells the mail on screen the account list, for its switchers, and shows the accounts'
@@ -1207,7 +1260,10 @@ impl App {
             login_screen: matches!(parked, Parked::SignIn),
             account_color: None,
         };
-        let index = self.tabs.push(pill, parked);
+        let (index, evicted) = self.tabs.push(pill, parked);
+        if let Some(Parked::Page(page)) = evicted {
+            self.closed(page);
+        }
         self.activate(ctx, index);
     }
 
@@ -1457,24 +1513,26 @@ fn launch(
     let Some(first) = auth.default_account() else {
         return Ok(log_in_screen(None));
     };
-    // Every grant before any store, so the Keychain asks for them all at once.
+    // Every grant before any store, so the Keychain asks for them all at once, without reading
+    // any grant twice.
     let first_grant = auth.tokens(&first.email);
-    let others: Vec<String> = auth
+    let others: Vec<(String, exo_auth::Tokens)> = auth
         .accounts()
         .into_iter()
         .filter(|account| !account.signed_out && account.email != first.email)
-        .map(|account| account.email)
-        .filter(|email| {
-            auth.tokens(email)
-                .inspect_err(|error| log::warn!("reading an account's grant: {error}"))
-                .is_ok()
+        .filter_map(|account| match auth.tokens(&account.email) {
+            Ok(tokens) => Some((account.email, tokens)),
+            Err(error) => {
+                log::warn!("reading an account's grant: {error}");
+                None
+            }
         })
         .collect();
     let mut grants = Vec::new();
-    let screen = match first_grant
-        .map_err(MailError::from)
-        .and_then(|_| sign_in.open_mail(&first.email, ctx))
-    {
+    let screen = match first_grant.map_err(MailError::from).and_then(|tokens| {
+        let account = sign_in.open_mail_with_tokens(&first.email, tokens.clone(), ctx)?;
+        Ok((account, tokens))
+    }) {
         Ok((account, tokens)) => {
             grants.push((first.email, tokens));
             Screen::Mail(Box::new(Mail::new(ctx, assets, account, clock.clone())))
@@ -1499,9 +1557,9 @@ fn launch(
         Err(error) => return Err(error.into()),
     };
     let mut background = Vec::new();
-    for email in others {
-        match sign_in.open_mail(&email, ctx) {
-            Ok((account, tokens)) => {
+    for (email, tokens) in others {
+        match sign_in.open_mail_with_tokens(&email, tokens.clone(), ctx) {
+            Ok(account) => {
                 background.push(Away::opened(account, clock));
                 grants.push((email, tokens));
             }
@@ -1528,5 +1586,108 @@ fn remove_previews(email: &str) {
         {
             log::error!("deleting an account's attachment cache: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::account::{Account, Credentials};
+
+    #[test]
+    fn evicting_twenty_first_tab_keeps_sole_account_in_background() {
+        let ctx = egui::Context::default();
+        exo_ui::install(&ctx).expect("fonts");
+        let root = std::env::temp_dir().join(format!(
+            "exo-app-tab-evict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let endpoints =
+            gmail::Endpoints::mock(&"http://127.0.0.1:9/".parse().expect("mock origin"));
+        let tokens = Arc::new(gmail::StaticToken("dev".into()));
+        let open = |name: &str, email: &str| {
+            Account::open(
+                &root.join(name),
+                Credentials {
+                    email: email.into(),
+                    endpoints: endpoints.clone(),
+                    tokens: tokens.clone(),
+                },
+                ctx.clone(),
+            )
+            .expect("opens")
+        };
+        let maya = open("maya", "maya@brightmoor.co");
+        let sam = open("sam", "sam@brightmoor.co");
+        let assets = crate::assets_dir();
+        let clock = Clock::system();
+        let maya_page = Box::new(Mail::new(&ctx, &assets, maya, clock.clone()));
+        let sam_page = Box::new(Mail::new(&ctx, &assets, sam, clock.clone()));
+
+        let mut app = App {
+            screen: Screen::Mail(maya_page),
+            sign_in: None,
+            grants: Vec::new(),
+            background: Vec::new(),
+            assets,
+            clock,
+            desktop: None,
+            notifier: None,
+            frames: Frames::default(),
+            quit_warning: None,
+            pictures: ProfilePictures::new(&ctx),
+            zoom: Zoom::default(),
+            tabs: Tabs::default(),
+            tabs_file: None,
+            kept_week: None,
+            updates: None,
+            receipt: None,
+        };
+        app.tabs.shown(chrome::Pill {
+            title: "Inbox - maya@brightmoor.co".into(),
+            email: Some("maya@brightmoor.co".into()),
+            ..chrome::Pill::default()
+        });
+        // Tab 1 is Sam's sole tab, parked with its live Mail page; tabs 2..20 are sign-in tabs.
+        let _ = app.tabs.push(
+            chrome::Pill {
+                title: "Inbox - sam@brightmoor.co".into(),
+                email: Some("sam@brightmoor.co".into()),
+                ..chrome::Pill::default()
+            },
+            Parked::Page(sam_page),
+        );
+        for _ in 2..20 {
+            let _ = app.tabs.push(
+                chrome::Pill {
+                    title: "Exo".into(),
+                    login_screen: true,
+                    ..chrome::Pill::default()
+                },
+                Parked::SignIn,
+            );
+        }
+        assert!(app.background.is_empty());
+        assert!(app.account_of("sam@brightmoor.co").is_some());
+
+        // With tab 0 active, opening a 21st tab evicts neighbour tab 1 (Sam's sole tab).
+        app.open_tab(&ctx, Parked::SignIn);
+
+        assert!(
+            !app.tabs.shows("sam@brightmoor.co"),
+            "Sam's tab was evicted at the 20-tab limit"
+        );
+        assert!(
+            app.background
+                .iter()
+                .any(|away| away.account().email() == "sam@brightmoor.co"),
+            "Sam's sole page moved to background instead of dropping its Account runtime"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -12,19 +12,18 @@ use std::collections::HashSet;
 
 use futures::{StreamExt, stream};
 use toasty::Executor;
-use toasty::stmt::Value;
 
 use super::backfill::ON_SCREEN_AHEAD;
 use super::{ATTEMPTS, Rows, fetch_message, fetch_thread};
 use crate::api::{Api, Failure};
-use crate::db::{self, BodyRow, DraftRow, EVICTED_BEFORE, MessageRow, query_i64};
+use crate::db::{self, BodyRow, EVICTED_BEFORE, MessageRow, query_col, query_i64};
 use crate::error::{Error, Result};
 use crate::evict::Eviction;
 use crate::ids::ThreadId;
 use crate::ids::labels::{INBOX, SH_IMPORTANT, SH_OTHER};
 use crate::provider;
 use crate::quota::Lane;
-use crate::store::{Inner, Store, reindex};
+use crate::store::{Inner, Store, reindex, reindex_many};
 
 /// Threads a sync round fetches the bodies of.
 const PAGE: usize = 10;
@@ -55,18 +54,16 @@ impl Inner {
             .clone();
         let mut wanted: Vec<String> = Vec::new();
         for (list, depth) in self.prefetched_lists() {
-            let rows = toasty::sql::query(WANTING)
-                .bind(list)
-                .bind(i64::from(depth))
-                .exec(&mut db)
-                .await?;
-            for row in &rows {
-                if let Value::Record(row) = row
-                    && let Some(Value::String(thread)) = row.fields.first()
-                    && !skipped.contains(thread)
-                    && !wanted.contains(thread)
-                {
-                    wanted.push(thread.clone());
+            let threads = query_col::<String>(
+                &mut db,
+                toasty::sql::query(WANTING)
+                    .bind(list)
+                    .bind(i64::from(depth)),
+            )
+            .await?;
+            for thread in threads {
+                if !skipped.contains(&thread) && !wanted.contains(&thread) {
+                    wanted.push(thread);
                 }
             }
         }
@@ -89,12 +86,13 @@ impl Inner {
         let router = self.router();
         let mut write = self.begin(&mut db).await?;
         let mut tried = Vec::new();
+        let mut reindexed = Vec::new();
         let mut halted = None;
         for (thread, fetched) in results {
             match fetched {
                 Ok(messages) => {
                     provider::save_bodies(write.exec(), &messages).await?;
-                    reindex(write.exec(), &thread, &router).await?;
+                    reindexed.push(thread.clone());
                 }
                 // Retrying soon won't fix this, so the thread waits to be opened.
                 Err(failure @ (Failure::Transient(_) | Failure::Permanent(_))) => {
@@ -111,6 +109,7 @@ impl Inner {
             }
             tried.push(thread);
         }
+        reindex_many(write.exec(), &reindexed, &router).await?;
         // A thread still missing some bodies (because a message is gone since, say) waits to be
         // opened rather than being fetched again every round.
         let mut stuck = Vec::new();
@@ -266,11 +265,13 @@ impl Store {
                 .await?
                 .unwrap_or(i64::MIN),
         );
-        let rows = toasty::sql::query(UNRENDERED)
-            .bind(since)
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .exec(&mut db)
-            .await?;
+        let rows = query_col::<String>(
+            &mut db,
+            toasty::sql::query(UNRENDERED)
+                .bind(since)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX)),
+        )
+        .await?;
         let skipped = inner
             .skipped_bodies
             .lock()
@@ -278,13 +279,6 @@ impl Store {
             .clone();
         let threads: Vec<String> = rows
             .into_iter()
-            .filter_map(|row| match row {
-                Value::Record(row) => match row.fields.into_iter().next() {
-                    Some(Value::String(thread)) => Some(thread),
-                    _ => None,
-                },
-                _ => None,
-            })
             .filter(|thread| !skipped.contains(thread))
             .collect();
         let mut fetched = 0;
@@ -292,10 +286,13 @@ impl Store {
             if query_i64(&mut db, BODY_BYTES).await? >= target {
                 break;
             }
-            let _sync = inner.sync.lock().await;
+            let _sync = inner.lock_sync().await?;
             // Nothing on screen changes, except for the open conversation.
             let open = inner.reading.lock().await.as_deref() == Some(thread.as_str());
-            match inner.fetch_missing(&thread, Lane::Sync, open).await {
+            match inner
+                .fetch_missing_bootstrapped(&thread, Lane::Sync, open)
+                .await
+            {
                 Ok(()) => fetched += 1,
                 // Gmail wouldn't give it, so it waits to be opened.
                 Err(error @ Error::Gmail(_)) => {
@@ -315,10 +312,20 @@ impl Store {
 
 impl Inner {
     /// Fetches the bodies `thread` lacks in `lane`, and tells the store's subscribers when
-    /// `notify` is set. Either the store must have bootstrapped, or the caller must not hold the
-    /// sync lock.
+    /// `notify` is set. Bootstraps first if needed; callers must not hold the sync lock.
     async fn fetch_missing(&self, thread: &str, lane: Lane, notify: bool) -> Result<()> {
         self.bootstrapped().await?;
+        self.fetch_missing_bootstrapped(thread, lane, notify).await
+    }
+
+    /// Fetches the bodies `thread` lacks in `lane`, assuming the store is already bootstrapped
+    /// (for callers holding the sync lock via [`Self::lock_sync`]).
+    async fn fetch_missing_bootstrapped(
+        &self,
+        thread: &str,
+        lane: Lane,
+        notify: bool,
+    ) -> Result<()> {
         let mut db = self.db.clone();
         let missing = bodiless(&mut db, thread).await?;
         if missing.is_empty() {
@@ -349,20 +356,28 @@ async fn bodiless(exec: &mut dyn Executor, thread: &str) -> Result<Vec<String>> 
         .select(MessageRow::fields().id())
         .exec(exec)
         .await?;
-    let stored: HashSet<String> =
-        BodyRow::filter(BodyRow::fields().message_id().in_list(ids.as_slice()))
-            .select(BodyRow::fields().message_id())
-            .exec(exec)
-            .await?
-            .into_iter()
-            .collect();
-    let drafts: HashSet<String> = DraftRow::all()
-        .exec(exec)
-        .await?
-        .into_iter()
-        .filter(|draft| draft.failure.is_none() && crate::drafts::scheduled(draft).is_none())
-        .filter_map(|draft| draft.message_id)
-        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stored = HashSet::new();
+    for chunk in ids.chunks(500) {
+        stored.extend(
+            BodyRow::filter(BodyRow::fields().message_id().in_list(chunk))
+                .select(BodyRow::fields().message_id())
+                .exec(exec)
+                .await?,
+        );
+    }
+    let drafts: HashSet<String> = query_col::<String>(
+        exec,
+        toasty::sql::query(
+            "SELECT message_id FROM drafts WHERE thread_id = ?1 AND message_id IS NOT NULL AND failure IS NULL AND (send_at IS NULL OR discarded != 0 OR json_extract(record, '$.send_later') IS NULL)",
+        )
+        .bind(thread),
+    )
+    .await?
+    .into_iter()
+    .collect();
     Ok(ids
         .into_iter()
         .filter(|id| !stored.contains(id) && !drafts.contains(id))
@@ -389,4 +404,154 @@ async fn fetch_bodies(
             .map(|thread| thread.messages)
             .unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::Options;
+    use crate::drafts::{Draft, DraftAction, DraftRecord, SendLater};
+    use crate::ids::labels::INBOX;
+
+    struct FailingToken;
+
+    impl gmail::TokenProvider for FailingToken {
+        fn access_token(&self) -> gmail::TokenFuture<'_> {
+            Box::pin(async {
+                Err(gmail::Error::Token(Box::new(std::io::Error::other(
+                    "signed out",
+                ))))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn prerender_does_not_deadlock_when_bootstrapped_resets_before_iteration() {
+        let dir = std::env::temp_dir().join(format!(
+            "exo-store-prerender-deadlock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open_with(
+            &dir,
+            "maya@brightmoor.co",
+            gmail::Endpoints::google(),
+            FailingToken,
+            Options {
+                backoff: Duration::from_millis(1),
+                quota: None,
+                ..Options::default()
+            },
+        )
+        .await
+        .expect("opens");
+        let mut db = store.inner.db.clone();
+        let now_ms = jiff::Timestamp::now().as_millisecond();
+        let msg = gmail::Message {
+            id: Some("m1".into()),
+            thread_id: Some("t1".into()),
+            internal_date: Some(now_ms),
+            label_ids: vec![INBOX.into()],
+            ..Default::default()
+        };
+        {
+            let mut write = store.inner.begin(&mut db).await.expect("tx");
+            let parsed = crate::parse::parse(&msg, false).expect("parses");
+            provider::save_message(write.exec(), parsed)
+                .await
+                .expect("saves");
+            write.commit().await.expect("commits");
+        }
+
+        // Start prerender while bootstrapped, but hold the sync lock so it blocks at the
+        // iteration boundary; then simulate a bankruptcy reset setting `bootstrapped = false`.
+        store.inner.bootstrapped.store(true, Ordering::Release);
+        let sync_guard = store.inner.sync.lock().await;
+        let prerender_store = store.clone();
+        let task =
+            tokio::spawn(async move { prerender_store.prerender(&Eviction::default(), 10).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.inner.bootstrapped.store(false, Ordering::Release);
+        drop(sync_guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prerender must not self-deadlock on concurrent bankruptcy reset")
+            .expect("task joins");
+        assert!(
+            result.is_err(),
+            "lock_sync re-bootstraps instead of deadlocking (failing cleanly on FailingToken)"
+        );
+
+        // Also check `bodiless` filters out editable Exo drafts without loading `raw`,
+        // while keeping scheduled drafts.
+        let mut record = DraftRecord {
+            action: DraftAction::Reply,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Hi".into(),
+            body: "<div>hello</div>".into(),
+            quoted_content: None,
+            quoted_inlined: false,
+            in_reply_to: None,
+            in_reply_to_rfc822: None,
+            references: Vec::new(),
+            rfc822_id: "d1@exo".into(),
+            fingerprint: String::new(),
+            attachments: Vec::new(),
+            send_later: None,
+            reminder: None,
+        };
+        store
+            .save_draft(Draft {
+                id: "draft00000000000001".into(),
+                thread: Some(ThreadId::new("t1")),
+                adopted: Some("m1".into()),
+                record: record.clone(),
+                raw: "x".repeat(1024),
+                complete: true,
+                sending: false,
+            })
+            .await
+            .expect("saves editable draft");
+        assert!(
+            bodiless(&mut db, "t1").await.expect("bodiless").is_empty(),
+            "editable Exo draft is excluded from bodiless"
+        );
+        record.send_later = Some(SendLater {
+            at: jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            abort_on_reply: false,
+            current_message_ids: Vec::new(),
+        });
+        store
+            .save_draft(Draft {
+                id: "draft00000000000001".into(),
+                thread: Some(ThreadId::new("t1")),
+                adopted: Some("m1".into()),
+                record,
+                raw: "x".repeat(1024),
+                complete: true,
+                sending: false,
+            })
+            .await
+            .expect("saves scheduled draft");
+        store
+            .schedule_draft("draft00000000000001")
+            .await
+            .expect("schedules draft");
+        assert_eq!(
+            bodiless(&mut db, "t1").await.expect("bodiless"),
+            vec!["m1".to_owned()],
+            "scheduled draft still counts as bodiless"
+        );
+
+        drop(db);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

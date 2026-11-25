@@ -9,28 +9,18 @@ use std::{sync::LazyLock, time::Duration};
 
 use jiff::Timestamp;
 use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime, pem::PemObject};
+use sha2::{Digest, Sha256};
+use x509_parser::{
+    asn1_rs::{Any, Class, FromDer as _, Oid, Tag},
+    extensions::{DistributionPointName, GeneralName, ParsedExtension},
+    oid_registry::OID_NIST_HASH_SHA256,
+};
 
 /// `id-kp-BrandIndicatorforMessageIdentification` (1.3.6.1.5.5.7.3.31), the extended key usage of
 /// mark certificates and of the CAs that issue them.
 const BRAND_INDICATOR: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x1f];
 /// `id-pe-logotype` (1.3.6.1.5.5.7.1.12), the extension that carries the mark.
-const LOGOTYPE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x0c];
-/// `id-ce-cRLDistributionPoints` (2.5.29.31), the extension that says where the CA's revocation
-/// list is.
-const CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1d, 0x1f];
-
-/// The DER tags read here.
-const OCTET_STRING: u8 = 0x04;
-const OID: u8 = 0x06;
-const UTC_TIME: u8 = 0x17;
-const GENERALIZED_TIME: u8 = 0x18;
-const SEQUENCE: u8 = 0x30;
-/// Context-specific constructed tags `[0]`, `[2]` and `[3]`.
-const CONTEXT_0: u8 = 0xa0;
-const CONTEXT_2: u8 = 0xa2;
-const CONTEXT_3: u8 = 0xa3;
-/// A GeneralName's `uniformResourceIdentifier [6]`.
-const URI: u8 = 0x86;
+const LOGOTYPE_OID: Oid<'static> = x509_parser::der_parser::oid!(1.3.6.1.5.5.7.1.12);
 
 /// The roots Gmail trusts for mark certificates: the issuers the BIMI Group lists.
 static ROOTS: LazyLock<Vec<TrustAnchor<'static>>> = LazyLock::new(|| {
@@ -96,15 +86,22 @@ fn validate_against(
     if !names(&certificate, domain) {
         return Err(Invalid::Domain(domain.to_owned()));
     }
-    let leaf = Leaf::read(&chain[0]).ok_or(Invalid::Malformed)?;
-    let vouched = leaf
-        .hashes
-        .iter()
-        .any(|&(algorithm, hash)| digest(algorithm, svg).is_some_and(|svg| svg.as_ref() == hash));
+    let (_, x509) =
+        x509_parser::parse_x509_certificate(&chain[0]).map_err(|_| Invalid::Malformed)?;
+    let not_after = Timestamp::from_second(x509.validity().not_after.timestamp())
+        .map_err(|_| Invalid::Malformed)?;
+    let logotype = x509
+        .get_extension_unique(&LOGOTYPE_OID)
+        .map_err(|_| Invalid::Malformed)?
+        .ok_or(Invalid::Malformed)?;
+    let expected = Sha256::digest(svg);
+    let vouched = svg_hashes(logotype.value)
+        .into_iter()
+        .any(|(algorithm, hash)| algorithm == OID_NIST_HASH_SHA256 && hash == expected.as_slice());
     if !vouched {
         return Err(Invalid::Logo);
     }
-    Ok(leaf.not_after)
+    Ok(not_after)
 }
 
 /// Whether `crl`, a revocation list, says the CA revoked the certificate in `pem` (as
@@ -143,20 +140,31 @@ fn revoked_against(
 /// Where the certificate in `pem` says its CA's revocation list is: its CRL distribution points'
 /// URLs, in order.
 pub(super) fn revocation_lists(pem: &[u8]) -> Vec<String> {
-    let chain = chain(pem).unwrap_or_default();
-    let points = chain
-        .first()
-        .and_then(|der| extension(der, CRL_DISTRIBUTION_POINTS))
-        .and_then(|points| first(points, SEQUENCE))
-        .unwrap_or_default();
-    // DistributionPoint ::= SEQUENCE { distributionPoint [0] DistributionPointName, … }, whose
-    // `fullName [0]` holds GeneralNames.
-    elements(points)
-        .filter_map(|point| first(point.contents, CONTEXT_0))
-        .filter_map(|name| first(name, CONTEXT_0))
-        .flat_map(elements)
-        .filter(|name| name.tag == URI)
-        .filter_map(|uri| String::from_utf8(uri.contents.to_vec()).ok())
+    let Ok(chain) = chain(pem) else {
+        return Vec::new();
+    };
+    let Some(der) = chain.first() else {
+        return Vec::new();
+    };
+    let Ok((_, x509)) = x509_parser::parse_x509_certificate(der) else {
+        return Vec::new();
+    };
+    x509.extensions()
+        .iter()
+        .filter_map(|ext| match ext.parsed_extension() {
+            ParsedExtension::CRLDistributionPoints(points) => Some(&points.points),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|point| match point.distribution_point.as_ref()? {
+            DistributionPointName::FullName(names) => Some(names),
+            DistributionPointName::NameRelativeToCRLIssuer(_) => None,
+        })
+        .flatten()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some((*uri).to_owned()),
+            _ => None,
+        })
         .collect()
 }
 
@@ -203,140 +211,49 @@ fn names(certificate: &webpki::EndEntityCert<'_>, domain: &str) -> bool {
         .any(|name| certificate.verify_is_valid_for_subject_name(&name).is_ok())
 }
 
-/// `data`'s digest by the hash algorithm the OID `algorithm` names, of those mark certificates use.
-fn digest(algorithm: &[u8], data: &[u8]) -> Option<ring::digest::Digest> {
-    let algorithm = match algorithm {
-        // 1.3.14.3.2.26
-        [0x2b, 0x0e, 0x03, 0x02, 0x1a] => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-        // 2.16.840.1.101.3.4.2.1, .2 and .3
-        [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01] => &ring::digest::SHA256,
-        [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02] => &ring::digest::SHA384,
-        [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03] => &ring::digest::SHA512,
-        _ => return None,
-    };
-    Some(ring::digest::digest(algorithm, data))
-}
-
-/// What a certificate says that its chain doesn't prove: when it expires, and the hashes of the
-/// SVG logo it carries, each with its algorithm's OID.
-struct Leaf<'a> {
-    not_after: Timestamp,
-    hashes: Vec<(&'a [u8], &'a [u8])>,
-}
-
-impl<'a> Leaf<'a> {
-    fn read(der: &'a [u8]) -> Option<Self> {
-        let tbs = first(first(der, SEQUENCE)?, SEQUENCE)?;
-        // An optional version, then the serial number, signature algorithm, issuer and validity.
-        let validity = elements(tbs)
-            .skip_while(|field| field.tag == CONTEXT_0)
-            .nth(3)?;
-        let not_after = time(elements(validity.contents).nth(1)?)?;
-        Some(Self {
-            not_after,
-            hashes: svg_hashes(extension(der, LOGOTYPE)?),
-        })
-    }
-}
-
-/// The value of the certificate `der`'s extension `oid`.
-fn extension<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
-    let tbs = first(first(der, SEQUENCE)?, SEQUENCE)?;
-    let extensions = first(first(tbs, CONTEXT_3)?, SEQUENCE)?;
-    elements(extensions).find_map(|extension| {
-        let mut parts = elements(extension.contents);
-        let id = parts.next()?;
-        if (id.tag, id.contents) != (OID, oid) {
-            return None;
-        }
-        // Past an optional `critical`.
-        parts
-            .find(|part| part.tag == OCTET_STRING)
-            .map(|value| value.contents)
-    })
-}
-
 /// The hashes of the SVG images of a logotype extension's subject logo, each with its algorithm.
-fn svg_hashes(logotype: &[u8]) -> Vec<(&[u8], &[u8])> {
+fn svg_hashes(logotype: &[u8]) -> Vec<(Oid<'_>, &[u8])> {
     // LogotypeExtn ::= SEQUENCE { …, subjectLogo [2] EXPLICIT LogotypeInfo, … }, whose
     // `direct [0] IMPLICIT LogotypeData` starts with `image SEQUENCE OF LogotypeImage`.
-    let images = first(logotype, SEQUENCE)
-        .and_then(|logotype| first(logotype, CONTEXT_2))
-        .and_then(|subject| first(subject, CONTEXT_0))
-        .and_then(|direct| first(direct, SEQUENCE))
+    let images = first_tag(logotype, Class::Universal, Tag::Sequence)
+        .and_then(|extn| first_tag(extn, Class::ContextSpecific, Tag(2)))
+        .and_then(|subject| first_tag(subject, Class::ContextSpecific, Tag(0)))
+        .and_then(|direct| first_tag(direct, Class::Universal, Tag::Sequence))
         .unwrap_or_default();
     // LogotypeImage ::= SEQUENCE { imageDetails LogotypeDetails, … }, and
     // LogotypeDetails ::= SEQUENCE { mediaType IA5String, logotypeHash SEQUENCE OF HashAlgAndValue,
     // logotypeURI … }.
-    elements(images)
-        .filter_map(|image| first(image.contents, SEQUENCE))
+    der_items(images)
+        .filter_map(|image| first_tag(image.data, Class::Universal, Tag::Sequence))
         .filter_map(|details| {
-            let mut fields = elements(details);
+            let mut fields = der_items(details);
             let media = fields.next()?;
-            (media.contents == b"image/svg+xml").then(|| fields.next())?
+            (media.tag() == Tag::Ia5String && media.data == b"image/svg+xml")
+                .then(|| fields.next())?
         })
-        .flat_map(|hashes| elements(hashes.contents))
+        .flat_map(|hashes| der_items(hashes.data))
         .filter_map(|hash| {
             // HashAlgAndValue ::= SEQUENCE { hashAlg AlgorithmIdentifier, hashValue OCTET STRING }
-            let mut parts = elements(hash.contents);
-            let algorithm = first(parts.next()?.contents, OID)?;
-            Some((algorithm, parts.next()?.contents))
+            let mut parts = der_items(hash.data);
+            let (_, algorithm) = Oid::from_der(parts.next()?.data).ok()?;
+            let value = parts.next()?;
+            (value.tag() == Tag::OctetString).then_some((algorithm, value.data))
         })
         .collect()
 }
 
-/// A certificate's UTCTime or GeneralizedTime.
-fn time(element: Element<'_>) -> Option<Timestamp> {
-    let text = std::str::from_utf8(element.contents).ok()?;
-    let text = match element.tag {
-        // Two-digit years from 50 are the 1900s (RFC 5280).
-        UTC_TIME if text.get(..2)? >= "50" => format!("19{text}"),
-        UTC_TIME => format!("20{text}"),
-        GENERALIZED_TIME => text.to_owned(),
-        _ => return None,
-    };
-    let time = jiff::civil::DateTime::strptime("%Y%m%d%H%M%SZ", &text).ok()?;
-    Some(time.to_zoned(jiff::tz::TimeZone::UTC).ok()?.timestamp())
-}
-
-/// A DER element: its tag (in the short form, as all of those read here are) and contents.
-#[derive(Clone, Copy)]
-struct Element<'a> {
-    tag: u8,
-    contents: &'a [u8],
-}
-
-/// The DER elements of `input` in order, up to the first that doesn't parse.
-fn elements(mut input: &[u8]) -> impl Iterator<Item = Element<'_>> {
+fn der_items(mut input: &[u8]) -> impl Iterator<Item = Any<'_>> {
     std::iter::from_fn(move || {
-        let (&tag, rest) = input.split_first()?;
-        if tag & 0x1f == 0x1f {
-            return None;
-        }
-        let (&length, rest) = rest.split_first()?;
-        let (length, rest) = match length {
-            0..=0x7f => (usize::from(length), rest),
-            // The long form: that many bytes of length, big-endian.
-            0x81..=0x84 => {
-                let (bytes, rest) = rest.split_at_checked(usize::from(length & 0x7f))?;
-                let length = bytes
-                    .iter()
-                    .fold(0, |length, &byte| length << 8 | usize::from(byte));
-                (length, rest)
-            }
-            _ => return None,
-        };
-        let (contents, rest) = rest.split_at_checked(length)?;
+        let (rest, item) = Any::from_der(input).ok()?;
         input = rest;
-        Some(Element { tag, contents })
+        Some(item)
     })
 }
 
-/// The contents of the first of `input`'s elements tagged `tag`.
-fn first(input: &[u8], tag: u8) -> Option<&[u8]> {
-    elements(input)
-        .find(|element| element.tag == tag)
-        .map(|element| element.contents)
+fn first_tag(input: &[u8], class: Class, tag: Tag) -> Option<&[u8]> {
+    der_items(input)
+        .find(|item| item.class() == class && item.tag() == tag)
+        .map(|item| item.data)
 }
 
 #[cfg(test)]
@@ -360,6 +277,12 @@ mod tests {
     /// The serial number of the certificates the CA issues here.
     const SERIAL: &[u8] = &[0x42];
 
+    const OCTET_STRING: u8 = 0x04;
+    const OID: u8 = 0x06;
+    const SEQUENCE: u8 = 0x30;
+    const CONTEXT_0: u8 = 0xa0;
+    const CONTEXT_2: u8 = 0xa2;
+
     fn now() -> Timestamp {
         "2026-06-01T00:00:00Z".parse().expect("a time")
     }
@@ -378,9 +301,8 @@ mod tests {
         element
     }
 
-    /// A logotype extension carrying `svg` with its hash by `algorithm`, as mark certificates do.
-    fn logotype(svg: &[u8], algorithm: &[u8]) -> Vec<u8> {
-        let hash = digest(algorithm, svg).expect("a hash we know");
+    /// A logotype extension carrying `svg` with `hash` tagged by `algorithm`.
+    fn logotype_with_hash(svg: &[u8], algorithm: &[u8], hash: &[u8]) -> Vec<u8> {
         let uri = format!(
             "data:image/svg+xml;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(svg)
@@ -395,7 +317,7 @@ mod tests {
                         SEQUENCE,
                         &[
                             &der(SEQUENCE, &[&der(OID, &[algorithm])]),
-                            &der(OCTET_STRING, &[hash.as_ref()]),
+                            &der(OCTET_STRING, &[hash]),
                         ],
                     )],
                 ),
@@ -404,6 +326,12 @@ mod tests {
         );
         let images = der(SEQUENCE, &[&der(SEQUENCE, &[&details])]);
         der(SEQUENCE, &[&der(CONTEXT_2, &[&der(CONTEXT_0, &[&images])])])
+    }
+
+    /// A logotype extension carrying `svg` with its SHA-256 hash, as BIMI mark certificates do.
+    fn logotype(svg: &[u8]) -> Vec<u8> {
+        let hash = Sha256::digest(svg);
+        logotype_with_hash(svg, SHA256, hash.as_slice())
     }
 
     /// A mark root, the CA it issued, and what the CA issues.
@@ -481,7 +409,7 @@ mod tests {
         fn brand(&self, names: &[&str]) -> String {
             self.pem(
                 names,
-                logotype(SVG, SHA1),
+                logotype(SVG),
                 vec![ExtendedKeyUsagePurpose::Other(BRAND_INDICATOR.to_vec())],
             )
         }
@@ -550,18 +478,30 @@ mod tests {
                 .validate(&pem, SVG, "news.brand.example", now())
                 .is_ok()
         );
-        // The hash may be any of those certificates use.
-        let pem = marks.pem(
-            &["brand.example"],
-            logotype(SVG, SHA256),
-            vec![ExtendedKeyUsagePurpose::Other(BRAND_INDICATOR.to_vec())],
-        );
-        assert!(marks.validate(&pem, SVG, "brand.example", now()).is_ok());
         // Past its end, it vouches for nothing.
         let later = "2027-02-01T00:00:00Z".parse().expect("a time");
         assert!(matches!(
             marks.validate(&pem, SVG, "brand.example", later),
             Err(Invalid::Chain(webpki::Error::CertExpired { .. }))
+        ));
+    }
+
+    #[test]
+    fn sha1_logotype_hashes_are_rejected() {
+        /// SHA-1 digest of [`SVG`], confirming even a matching SHA-1 hash is rejected.
+        const SVG_SHA1: [u8; 20] = [
+            0x27, 0xe7, 0x6c, 0x92, 0xfb, 0x68, 0xbf, 0xa2, 0xd4, 0xb4, 0x3e, 0x44, 0x73, 0xa1,
+            0xa6, 0xe6, 0xc7, 0x2a, 0x36, 0xef,
+        ];
+        let marks = Marks::new();
+        let pem = marks.pem(
+            &["brand.example"],
+            logotype_with_hash(SVG, SHA1, &SVG_SHA1),
+            vec![ExtendedKeyUsagePurpose::Other(BRAND_INDICATOR.to_vec())],
+        );
+        assert!(matches!(
+            marks.validate(&pem, SVG, "brand.example", now()),
+            Err(Invalid::Logo)
         ));
     }
 
@@ -604,7 +544,7 @@ mod tests {
         // A certificate for TLS isn't one for BIMI.
         let tls = marks.pem(
             &["brand.example"],
-            logotype(SVG, SHA1),
+            logotype(SVG),
             vec![ExtendedKeyUsagePurpose::ServerAuth],
         );
         assert!(matches!(
@@ -648,15 +588,23 @@ mod tests {
 
     #[test]
     fn certificate_times_read_both_forms() {
-        let utc = Element {
-            tag: UTC_TIME,
-            contents: b"270901235959Z",
-        };
-        assert_eq!(time(utc), "2027-09-01T23:59:59Z".parse().ok());
-        let generalized = Element {
-            tag: GENERALIZED_TIME,
-            contents: b"20510101000000Z",
-        };
-        assert_eq!(time(generalized), "2051-01-01T00:00:00Z".parse().ok());
+        // Dates through 2049 encode as UTCTime; 2050 and beyond encode as GeneralizedTime.
+        let marks = Marks::new();
+        let mut params = CertificateParams::new(vec!["brand.example".to_owned()]).expect("params");
+        params.not_before = date_time_ymd(2026, 1, 1);
+        params.not_after = date_time_ymd(2051, 1, 1);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::Other(BRAND_INDICATOR.to_vec())];
+        params.custom_extensions = vec![CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 5, 5, 7, 1, 12],
+            logotype(SVG),
+        )];
+        let leaf = params
+            .signed_by(&KeyPair::generate().expect("a key"), &marks.ca)
+            .expect("the certificate");
+        let pem = format!("{}{}", leaf.pem(), marks.ca.pem());
+        assert_eq!(
+            marks.validate(&pem, SVG, "brand.example", now()).ok(),
+            "2051-01-01T00:00:00Z".parse().ok()
+        );
     }
 }

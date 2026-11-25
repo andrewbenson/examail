@@ -8,18 +8,11 @@
 //!
 //! Hovering a link in the focused message, as hover intent has it, hints at `⌘O`.
 
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{
-        Arc,
-        mpsc::{Receiver, Sender, channel},
-    },
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use exo_commands::{Command, Commands, Hint, Region, SubPalette, command_score};
 use exo_mail::Link;
-use exo_store::{Attachment, MessageDetail, ThreadDetail, ThreadId};
+use exo_store::{Attachment, MessageDetail, ThreadDetail};
 
 use crate::{Mail, commands, mailbox::ThreadSummary};
 
@@ -70,9 +63,6 @@ struct Found {
     priority: bool,
 }
 
-/// A conversation read for the list: its id and what the store has of it.
-type Read = (String, Option<Arc<ThreadDetail>>);
-
 /// Open Links & Attachments' state between frames.
 pub(crate) struct OpenLinks {
     /// Shared with the open sub-palette's rows, which fill in as the messages arrive.
@@ -81,8 +71,6 @@ pub(crate) struct OpenLinks {
     target: Option<Target>,
     /// The link under the pointer, for hover intent: its message and `href`.
     hover: exo_ui::HoverIntent<(String, String)>,
-    /// Conversations the store read for the list.
-    read: (Sender<Read>, Receiver<Read>),
 }
 
 impl Default for OpenLinks {
@@ -91,7 +79,6 @@ impl Default for OpenLinks {
             found: Rc::default(),
             target: None,
             hover: exo_ui::HoverIntent::new(INTENT_INTERVAL),
-            read: channel(),
         }
     }
 }
@@ -193,16 +180,6 @@ fn can_show(text: &str, url: &str) -> bool {
         && !INVITATION_TEXTS.iter().any(|said| text.contains(said))
 }
 
-/// A URL as the list shows it, without its scheme, `www.` or final `/`.
-fn display_url(url: &str) -> String {
-    let url = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let url = url.strip_prefix("www.").unwrap_or(url);
-    url.strip_suffix('/').unwrap_or(url).to_owned()
-}
-
 /// Whether a link's text says nothing but "click here" and the like, so that nothing is left
 /// once the first of each of those words is gone (`click` and `visit` with their `ing`, if any).
 fn is_ambiguous(title: &str) -> bool {
@@ -261,11 +238,11 @@ fn link_rows(actions: &[exo_mail::Action], links: &[Link]) -> Vec<LinkRow> {
         .chain(links)
         .filter(|(text, url, ..)| can_show(text, url))
     {
-        let mut title = display_url(text);
+        let mut title = crate::format::urls::display(text);
         if is_ambiguous(&title) {
-            title = display_url(url);
+            title = crate::format::urls::display(url);
         }
-        let shown = display_url(url);
+        let shown = crate::format::urls::display(url);
         let description = (shown.to_lowercase() != title.to_lowercase()).then_some(shown);
         let key = format!("{url}{title}").to_lowercase();
         if !rows
@@ -390,22 +367,10 @@ impl Mail {
                 // An image or a message opens in Exo's viewer over the list's others;
                 // anything else in Quick Look, or downloads.
                 if preview && crate::attachment_files::is_previewable(&attachment) {
-                    let files: Vec<Attachment> = self
-                        .open_links
-                        .found
-                        .borrow()
-                        .attachments
-                        .iter()
-                        .filter(|file| crate::attachment_files::is_previewable(file))
-                        .cloned()
-                        .collect();
-                    let start = files
-                        .iter()
-                        .position(|file| {
-                            file.message_id == attachment.message_id
-                                && file.part_id == attachment.part_id
-                        })
-                        .unwrap_or(0);
+                    let (files, start) = crate::attachment_files::preview_selection(
+                        &self.open_links.found.borrow().attachments,
+                        &attachment,
+                    );
                     self.preview_attachments(files, start);
                 } else {
                     self.attachment_files
@@ -447,35 +412,17 @@ impl Mail {
 
     /// Reads conversation `id` for the list, fetching the bodies Gmail has and the store doesn't.
     fn open_links_read(&self, id: String) {
-        let (sender, ctx) = (self.open_links.read.0.clone(), self.ctx.clone());
-        self.account.loader().run(
-            move |store| async move {
-                let thread = ThreadId::new(id.clone());
-                if let Err(error) = store.load_bodies(&thread).await {
-                    log::info!("fetching the bodies of {id} for its links: {error}");
-                }
-                let detail = store
-                    .thread(&thread)
-                    .await
-                    .inspect_err(|error| log::error!("reading thread {id}: {error}"))
-                    .ok()
-                    .flatten();
-                (id, detail.map(Arc::new))
-            },
-            move |read| {
-                let _ = sender.send(read);
-                ctx.request_repaint();
-            },
-        );
+        let ui = self.ui_sender();
+        self.account
+            .loader()
+            .read_thread_with_bodies(id, "for its links", move |id, detail| {
+                ui.send(move |mail| mail.open_links_thread_read(&id, detail.as_ref()));
+            });
     }
 
     /// Keeps the open list in step with what it's for, which is the focused message (whose
-    /// rendered links may arrive after the list opened) or the conversation being read. Call
-    /// every frame.
+    /// rendered links may arrive after the list opened). Call every frame.
     pub(crate) fn open_links_frame(&mut self) {
-        while let Ok((id, detail)) = self.open_links.read.1.try_recv() {
-            self.open_links_thread_read(&id, detail.as_ref());
-        }
         if self.commands.is_sub_palette_open(PALETTE) {
             self.open_links_fill();
         }

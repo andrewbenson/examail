@@ -1,17 +1,11 @@
 //! Out of Office Reply's alerts: offline, Gmail not answering, a save that didn't take, changes to
 //! discard, a pasted image, and the nudge to set a reply for out-of-office days on the calendar.
 
-use egui::{Color32, Rect, Sense, Ui, pos2, text::LayoutJob, vec2};
+use egui::{Color32, Context, Rect, Sense, pos2, vec2};
 use exo_store::OutOfOfficeDays;
-use exo_ui::{
-    ALERT_PARAGRAPH_GAP, ALERT_TEXT, ALERT_TEXT_INK, ALERT_TEXT_WIDTH, Family, Font, TextStyle,
-};
+use exo_ui::{ALERT_PARAGRAPH_GAP, ALERT_TEXT, AlertClick, AlertRun, PARAGRAPH};
 use jiff::tz::TimeZone;
 
-/// `<b>` in the alert's text.
-const BOLD: TextStyle = TextStyle::new(Font::new(Family::Sans, 700), 14.0, 20.0);
-/// A link in an alert's text: `#54acdc`.
-const LINK: Color32 = Color32::from_rgb(0x54, 0xac, 0xdc);
 /// The opt-out row has `margin: 20px 0 24px` and `rgba(0, 0, 0, .55)`, with its label 8px after
 /// the 14px box and 1px up. The row is 21px tall.
 const OPT_OUT_ABOVE: f32 = 20.0;
@@ -156,90 +150,69 @@ impl Alert {
     /// The Gmail settings link of a pasted file's alert.
     pub fn link(&self) -> Option<String> {
         match self {
-            Self::PastedFile { email } => Some(format!(
-                "https://mail.google.com/?shxr=0&authuser={email}#settings/general"
-            )),
+            Self::PastedFile { email } => Some(crate::settings::gmail_settings_url(email)),
             _ => None,
         }
     }
 
     /// Paints the alert with `selected` filled over `page`. Returns the action clicked, and
     /// whether the link was.
-    pub fn show(
+    pub fn show_modal(
         &mut self,
-        ui: &mut Ui,
+        ctx: &Context,
         page: Rect,
         selected: usize,
         tz: &TimeZone,
     ) -> (Option<usize>, bool) {
-        let ctx = ui.ctx().clone();
-        let paragraphs: Vec<Vec<Vec<(String, Run)>>> = self
-            .paragraphs(tz)
-            .iter()
-            .map(|runs| wrap(&ctx, runs, ALERT_TEXT_WIDTH))
-            .collect();
-        let lines: usize = paragraphs.iter().map(Vec::len).sum();
-        let mut height = lines as f32 * ALERT_TEXT.line_height
-            + paragraphs.len().saturating_sub(1) as f32 * ALERT_PARAGRAPH_GAP;
-        let nudge = matches!(self, Self::Nudge { .. });
-        if nudge {
-            height += OPT_OUT_ABOVE + OPT_OUT_HEIGHT + OPT_OUT_BELOW;
+        let paragraphs = self.paragraphs(tz);
+        let separator = PARAGRAPH.to_string();
+        let mut runs = Vec::new();
+        for (index, paragraph) in paragraphs.iter().enumerate() {
+            if index > 0 {
+                runs.push(AlertRun::Text(&separator));
+            }
+            for (text, kind) in paragraph {
+                runs.push(match kind {
+                    Run::Text => AlertRun::Text(text),
+                    Run::Bold => AlertRun::Strong(text),
+                    Run::Link => AlertRun::Link(text),
+                });
+            }
         }
-        let title = self.title();
-        let actions = self.actions();
-        let mut link_clicked = false;
-        let mut toggled = false;
+        let extra_height = if matches!(self, Self::Nudge { .. }) {
+            OPT_OUT_ABOVE + OPT_OUT_HEIGHT + OPT_OUT_BELOW
+        } else {
+            0.0
+        };
         let alert = exo_ui::Alert {
-            title,
+            title: self.title(),
             text: "",
-            actions,
+            actions: self.actions(),
             selected,
         };
-        let clicked = alert.show_body(ui, page, height, |ui, text| {
-            let mut y = text.top();
-            for (index, lines) in paragraphs.iter().enumerate() {
-                for line in lines {
-                    let mut job = LayoutJob::default();
-                    let mut x = text.left();
-                    for (part, run) in line {
-                        let style = if *run == Run::Bold { BOLD } else { ALERT_TEXT };
-                        let ink = if *run == Run::Link {
-                            LINK
-                        } else {
-                            ALERT_TEXT_INK
-                        };
-                        job.append(part, 0.0, style.format(ink));
-                        let width = style.width(&ctx, part);
-                        if *run == Run::Link {
-                            let hit = Rect::from_min_size(
-                                pos2(x, y),
-                                vec2(width, ALERT_TEXT.line_height),
-                            );
-                            link_clicked |= ui
-                                .interact(
-                                    hit,
-                                    ui.id().with(("out-of-office-alert-link", index)),
-                                    Sense::click(),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked();
-                        }
-                        x += width;
-                    }
-                    exo_ui::paint_job(ui.painter(), pos2(text.left(), y), job, &ALERT_TEXT);
-                    y += ALERT_TEXT.line_height;
-                }
-                y += ALERT_PARAGRAPH_GAP;
-            }
-            if let Self::Nudge { opt_out, .. } = self {
+        let mut toggled = false;
+        let current_opt_out = match self {
+            Self::Nudge { opt_out, .. } => Some(*opt_out),
+            _ => None,
+        };
+        let (clicked, _) = alert.show_runs_modal_with(
+            ctx,
+            "out-of-office-alert",
+            page,
+            &runs,
+            extra_height,
+            |ui, extra| {
+                let Some(checked) = current_opt_out else {
+                    return;
+                };
                 let row = Rect::from_min_size(
-                    pos2(text.left(), y - ALERT_PARAGRAPH_GAP + OPT_OUT_ABOVE),
-                    vec2(text.width(), OPT_OUT_HEIGHT),
+                    pos2(extra.left(), extra.top() + OPT_OUT_ABOVE),
+                    vec2(extra.width(), OPT_OUT_HEIGHT),
                 );
                 exo_ui::paint_checkbox(
                     ui.painter(),
                     row.min,
-                    *opt_out,
+                    checked,
                     exo_ui::Theme::Snow.palette(),
                 );
                 let label_width = ALERT_TEXT.paint_line(
@@ -257,81 +230,17 @@ impl Alert {
                     .interact(hit, ui.id().with("out-of-office-opt-out"), Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked();
-            }
-        });
+            },
+        );
         if toggled && let Self::Nudge { opt_out, .. } = self {
             *opt_out = !*opt_out;
         }
-        (clicked, link_clicked)
-    }
-}
-
-/// Breaks `runs` into lines no wider than `width`, at spaces, as the alert's text wraps
-/// (`text-wrap: pretty`: a last line of one word takes the word before it when it fits).
-fn wrap(ctx: &egui::Context, runs: &[(String, Run)], width: f32) -> Vec<Vec<(String, Run)>> {
-    let style = |run: Run| if run == Run::Bold { BOLD } else { ALERT_TEXT };
-    // Words, each with the space after it, in their run's style.
-    let mut words: Vec<(String, Run)> = Vec::new();
-    for (text, run) in runs {
-        let mut word = String::new();
-        for ch in text.chars() {
-            word.push(ch);
-            if ch == ' ' {
-                words.push((std::mem::take(&mut word), *run));
-            }
-        }
-        if !word.is_empty() {
-            words.push((word, *run));
+        match clicked {
+            Some(AlertClick::Action(index)) => (Some(index), false),
+            Some(AlertClick::Link(_)) => (None, true),
+            None => (None, false),
         }
     }
-    let measure = |line: &[(String, Run)]| -> f32 {
-        let last = line.len().saturating_sub(1);
-        line.iter()
-            .enumerate()
-            .map(|(index, (word, run))| {
-                style(*run).width(ctx, if index == last { word.trim_end() } else { word })
-            })
-            .sum()
-    };
-    let mut lines: Vec<Vec<(String, Run)>> = vec![Vec::new()];
-    for word in words {
-        let line = lines.last_mut().expect("a line");
-        line.push(word);
-        if line.len() > 1 && measure(line) > width {
-            let word = line.pop().expect("just pushed");
-            lines.push(vec![word]);
-        }
-    }
-    if let [.., before, last] = lines.as_mut_slice()
-        && last.len() == 1
-        && before.len() > 1
-    {
-        let joined = vec![before[before.len() - 1].clone(), last[0].clone()];
-        if measure(&joined) <= width {
-            before.pop();
-            *last = joined;
-        }
-    }
-    // Merge each line's words back into runs.
-    lines
-        .into_iter()
-        .map(|line| {
-            let mut merged: Vec<(String, Run)> = Vec::new();
-            let count = line.len();
-            for (index, (word, run)) in line.into_iter().enumerate() {
-                let word = if index + 1 == count {
-                    word.trim_end().to_owned()
-                } else {
-                    word
-                };
-                match merged.last_mut() {
-                    Some((text, last)) if *last == run => text.push_str(&word),
-                    _ => merged.push((word, run)),
-                }
-            }
-            merged
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -394,7 +303,16 @@ mod tests {
         );
         assert_eq!(
             alert.link().as_deref(),
-            Some("https://mail.google.com/?shxr=0&authuser=maya@brightmoor.co#settings/general")
+            Some("https://mail.google.com/?shxr=0&authuser=maya%40brightmoor.co#settings/general")
+        );
+        let plus = Alert::PastedFile {
+            email: "alice+work@example.com".into(),
+        };
+        assert_eq!(
+            plus.link().as_deref(),
+            Some(
+                "https://mail.google.com/?shxr=0&authuser=alice%2Bwork%40example.com#settings/general"
+            )
         );
     }
 }
