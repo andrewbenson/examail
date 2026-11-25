@@ -99,6 +99,19 @@ mod tests {
     }
 
     #[test]
+    fn a_sanitized_quote_is_still_a_quote() {
+        let draft = "<div>Yes</div><div class=\"gmail_quote\">On Tue, Tom wrote:\
+            <blockquote class=\"gmail_quote\"><a href=\"https://x.io\" target=\"_blank\">x</a>\
+            <script>bad()</script></blockquote></div>";
+        let (body, quote) = split_draft_quote(draft).expect("has a quote");
+        let quote = crate::sanitize_fragment(&quote);
+        assert!(!quote.contains("script") && quote.contains("class=\"gmail_quote\""));
+        // Saved and opened again, the draft splits the same way.
+        let (again, _) = split_draft_quote(&format!("{body}{quote}")).expect("still a quote");
+        assert_eq!(again, body);
+    }
+
+    #[test]
     fn apple_mail_cites_and_new_mail_has_none() {
         let apple = "<div>Yes</div><br><blockquote type=\"cite\">Can you?</blockquote>";
         assert_eq!(
