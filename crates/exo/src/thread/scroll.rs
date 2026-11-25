@@ -181,16 +181,10 @@ impl ThreadView {
         self.action.admitted.insert(id.to_owned());
     }
 
-    /// Where a newly opened thread scrolls: past all but four of the collapsed messages above the
-    /// first expanded one. When the only expanded message is the last, the scroll puts that
-    /// message `IDEAL_TOP` below the top instead.
+    /// Where a newly opened thread scrolls: past all but one of the collapsed messages above the
+    /// first expanded one, so that message starts just under the subject.
     pub(super) fn initial_scroll(&self, collapsed_scroll: f32) -> f32 {
-        let first_expanded = self.items.iter().position(|item| item.expanded);
-        let target = match first_expanded {
-            Some(at) if at + 1 == self.items.len() => self.scroll_state.tops[at].0 - IDEAL_TOP,
-            _ => collapsed_scroll,
-        };
-        self.clamp_scroll(target)
+        self.clamp_scroll(collapsed_scroll)
     }
 
     /// Scrolls to what an in-message link pointed at, `top` CSS px down message `id`'s body, so

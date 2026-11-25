@@ -591,11 +591,9 @@ impl ThreadView {
         // away, and the end can scroll a little past.
         let table_top = MESSAGES_PADDING_TOP + CARD_MARGIN_TOP;
         let natural = y - table_top;
-        let collapsed_scroll = if collapsed_before > 4 {
-            (collapsed_before - 4) as f32 * STEP
-        } else {
-            0.0
-        };
+        // A thread opens with its first expanded (unread) message just under the subject, after
+        // one collapsed row for context.
+        let collapsed_scroll = collapsed_before.saturating_sub(1) as f32 * STEP;
         let viewport = self.scroll_state.viewport;
         let bottom_scroll = (natural - viewport + 2.0 * MESSAGES_PADDING_TOP).max(0.0);
         let max_top = collapsed_scroll.max(bottom_scroll);
