@@ -240,7 +240,7 @@ pub struct Seen {
 
 /// Whether `thread` has a reply the job wasn't set on: a message that isn't the user's (sent)
 /// or a draft.
-fn replied(job: &Job, thread: &[Seen]) -> bool {
+pub(crate) fn replied(job: &Job, thread: &[Seen]) -> bool {
     let known: HashSet<&str> = job.message_ids.iter().map(String::as_str).collect();
     thread.iter().any(|message| {
         !known.contains(message.id.as_str())
@@ -422,7 +422,7 @@ async fn claim(app: &App, document: &Document, now: Timestamp) -> Result<Option<
 
 /// A Gmail client acting as `sub`, from the service's sealed grant. `None` when the account
 /// isn't connected, or Google no longer honors the grant (it's then marked revoked).
-async fn account_gmail(app: &App, sub: &str) -> Result<Option<gmail::Client>> {
+pub(crate) async fn account_gmail(app: &App, sub: &str) -> Result<Option<gmail::Client>> {
     let Some(grant) = app.store.grant(sub).await? else {
         return Ok(None);
     };
@@ -653,7 +653,7 @@ async fn sent_message(gmail: &gmail::Client, rfc822_id: &str) -> Result<Option<S
     Ok(found.messages.into_iter().find_map(|message| message.id))
 }
 
-fn not_found(error: &gmail::Error) -> bool {
+pub(crate) fn not_found(error: &gmail::Error) -> bool {
     matches!(error, gmail::Error::Api(api) if api.code == 404)
 }
 

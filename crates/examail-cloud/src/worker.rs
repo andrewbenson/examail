@@ -2,7 +2,7 @@
 //! and Pub/Sub service accounts invoke it, so these routes check nothing themselves.
 //!
 //! - `POST /internal/tick`, every minute from Cloud Scheduler: fires due jobs ([`crate::jobs`]).
-//! - `POST /hooks/gmail`, from the Gmail push subscription: new mail (phase 4).
+//! - `POST /hooks/gmail`, from the Gmail push subscription: new mail ([`crate::watch`]).
 
 use std::sync::Arc;
 
@@ -20,7 +20,16 @@ pub fn router(app: Arc<App>) -> axum::Router {
 }
 
 async fn tick(axum::extract::State(app): axum::extract::State<Arc<App>>) -> StatusCode {
-    match crate::jobs::tick(&app).await {
+    // Jobs first, so mail reading never makes a send late; the watcher and split labels have
+    // their own troubles, which don't fail the tick.
+    let jobs = crate::jobs::tick(&app).await;
+    if let Err(error) = crate::watch::sweep(&app).await {
+        log::error!("watching mail: {error:#}");
+    }
+    if let Err(error) = crate::splits::tick(&app).await {
+        log::error!("split labels: {error:#}");
+    }
+    match jobs {
         Ok(0) => StatusCode::NO_CONTENT,
         Ok(finished) => {
             log::info!("tick finished {finished} jobs");
@@ -34,7 +43,18 @@ async fn tick(axum::extract::State(app): axum::extract::State<Arc<App>>) -> Stat
     }
 }
 
-async fn gmail(body: axum::body::Bytes) -> StatusCode {
-    log::info!("gmail push ({} bytes)", body.len());
+/// A push always answers success: what it couldn't do, the tick's sweep does within a minute,
+/// and a failure would only have Pub/Sub send it again and again.
+async fn gmail(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    let Some(email) = crate::watch::pushed_email(&body) else {
+        log::warn!("a push that doesn't read ({} bytes)", body.len());
+        return StatusCode::NO_CONTENT;
+    };
+    if let Err(error) = crate::watch::pushed(&app, &email).await {
+        log::warn!("acting on a push: {error:#}");
+    }
     StatusCode::NO_CONTENT
 }

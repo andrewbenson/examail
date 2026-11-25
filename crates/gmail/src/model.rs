@@ -487,6 +487,34 @@ pub enum HistoryType {
     LabelRemoved,
 }
 
+/// `users.watch` request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchRequest {
+    /// `projects/{project}/topics/{topic}`, which `gmail-api-push@system.gserviceaccount.com`
+    /// may publish to.
+    pub topic_name: String,
+    /// Only changes to messages with these labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_ids: Vec<String>,
+    /// `include` (the default) or `exclude` the labels above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_filter_behavior: Option<String>,
+}
+
+/// `users.watch` response.
+#[serde_with::serde_as]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchResponse {
+    /// The mailbox's history ID as the watch starts.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub history_id: Option<u64>,
+    /// When the watch ends, in milliseconds since the epoch.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub expiration: Option<i64>,
+}
+
 /// `history.list`.
 #[serde_as]
 #[skip_serializing_none]

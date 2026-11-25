@@ -26,6 +26,9 @@ pub struct Config {
     pub oauth_client_secret: String,
     /// The API's public URL, which the consent's redirect comes back to.
     pub public_url: String,
+    /// The Pub/Sub topic Gmail publishes mailbox changes to (`projects/…/topics/…`). Unset, the
+    /// mail watcher is off ([`crate::watch`]).
+    pub gmail_topic: Option<String>,
 }
 
 impl Config {
@@ -40,7 +43,9 @@ impl Config {
             .map(|port| port.parse().context("PORT isn't a port"))
             .transpose()?
             .unwrap_or(8080);
-        let iap_audience = std::env::var("IAP_AUDIENCE").ok().filter(|aud| !aud.is_empty());
+        let iap_audience = std::env::var("IAP_AUDIENCE")
+            .ok()
+            .filter(|aud| !aud.is_empty());
         if iap_audience.is_none() && role == Role::Api && std::env::var("K_SERVICE").is_ok() {
             bail!("IAP_AUDIENCE must be set on Cloud Run");
         }
@@ -57,6 +62,9 @@ impl Config {
                 .unwrap_or_default()
                 .trim_end_matches('/')
                 .to_owned(),
+            gmail_topic: std::env::var("GMAIL_TOPIC")
+                .ok()
+                .filter(|topic| !topic.is_empty()),
         })
     }
 }

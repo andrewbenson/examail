@@ -324,6 +324,17 @@ impl<'a> Gmail<'a> {
             .query_opt("pageToken", query.page_token.as_ref())
     }
 
+    /// `users.watch`: Gmail publishes the mailbox's changes to a Pub/Sub topic, for about a
+    /// week; call it again before [`WatchResponse::expiration`].
+    pub fn watch(&self, request: &WatchRequest) -> Call<'a, WatchResponse> {
+        self.call(Method::POST, &["watch"]).json(request)
+    }
+
+    /// `users.stop`: Gmail stops publishing the mailbox's changes.
+    pub fn stop_watch(&self) -> Call<'a, serde_json::Value> {
+        self.call(Method::POST, &["stop"])
+    }
+
     // Settings
 
     /// `settings.sendAs.list`: addresses the user can send as, with signatures.

@@ -80,7 +80,10 @@ impl Store {
     }
 
     pub async fn put_job(&self, id: &str, job: &Job) -> Result<()> {
-        Ok(self.db.set(jobs::COLLECTION, id, job, Precondition::None).await?)
+        Ok(self
+            .db
+            .set(jobs::COLLECTION, id, job, Precondition::None)
+            .await?)
     }
 
     pub async fn delete_job(&self, id: &str) -> Result<()> {
@@ -103,7 +106,10 @@ impl Store {
     }
 
     pub async fn put_account(&self, sub: &str, account: &Account) -> Result<()> {
-        Ok(self.db.set(ACCOUNTS, sub, account, Precondition::None).await?)
+        Ok(self
+            .db
+            .set(ACCOUNTS, sub, account, Precondition::None)
+            .await?)
     }
 
     pub async fn grant(&self, sub: &str) -> Result<Option<Grant>> {
@@ -119,7 +125,10 @@ impl Store {
     }
 
     pub async fn put_device(&self, token_hash: &str, device: &Device) -> Result<()> {
-        Ok(self.db.set(DEVICES, token_hash, device, Precondition::Missing).await?)
+        Ok(self
+            .db
+            .set(DEVICES, token_hash, device, Precondition::Missing)
+            .await?)
     }
 
     pub async fn delete_device(&self, token_hash: &str) -> Result<()> {
@@ -127,7 +136,10 @@ impl Store {
     }
 
     pub async fn put_connect(&self, state: &str, connect: &Connect) -> Result<()> {
-        Ok(self.db.set(CONNECTS, state, connect, Precondition::Missing).await?)
+        Ok(self
+            .db
+            .set(CONNECTS, state, connect, Precondition::Missing)
+            .await?)
     }
 
     /// The consent `state` named, taken so it can only be used once.
@@ -137,7 +149,8 @@ impl Store {
         Ok(connect)
     }
 
-    /// Forgets everything about `sub`: its account, grant, devices and jobs.
+    /// Forgets everything about `sub`: its account, grant, devices, jobs, settings, watch and
+    /// split labels' records (the labels themselves stay in Gmail).
     pub async fn forget(&self, sub: &str) -> Result<()> {
         for job in self
             .db
@@ -153,6 +166,15 @@ impl Store {
         {
             self.db.delete(DEVICES, &device).await?;
         }
+        for route in self
+            .db
+            .ids_where(crate::splits::ROUTES, "sub", &serde_json::Value::from(sub))
+            .await?
+        {
+            self.db.delete(crate::splits::ROUTES, &route).await?;
+        }
+        self.db.delete(crate::splits::LABELS, sub).await?;
+        self.db.delete(crate::watch::COLLECTION, sub).await?;
         self.db.delete(SETTINGS, sub).await?;
         self.db.delete(GRANTS, sub).await?;
         self.db.delete(ACCOUNTS, sub).await

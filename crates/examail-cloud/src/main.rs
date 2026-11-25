@@ -18,7 +18,9 @@ mod google;
 mod iap;
 mod jobs;
 mod settings;
+mod splits;
 mod store;
+mod watch;
 mod worker;
 
 use std::sync::Arc;
@@ -68,7 +70,10 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("listening on port {port}"))?;
-    log::info!("examail-cloud {} ({role:?}) on port {port}", env!("CARGO_PKG_VERSION"));
+    log::info!(
+        "examail-cloud {} ({role:?}) on port {port}",
+        env!("CARGO_PKG_VERSION")
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }
