@@ -236,6 +236,12 @@ pub struct SearchResults {
 /// Something the UI should tell the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// The stored settings changed from `from` to `to` other than through the UI (Examail Cloud
+    /// brought another Mac's changes). [`Account::events`] applies it to the UI's copy itself.
+    SettingsChanged {
+        from: serde_json::Value,
+        to: serde_json::Value,
+    },
     /// A mutation (or its undo) couldn't be applied or sent, and its effect is gone.
     Failed {
         /// What the user did.
@@ -373,6 +379,12 @@ enum Request {
     Refresh,
     /// Boxed, because the settings document is several times the size of the other requests.
     SaveSettings(Box<Settings>),
+    /// Examail Cloud merged the settings as they were (`from`) with its own (`to`): apply what
+    /// it changed, keeping what changed here since ([`crate::cloud`]).
+    MergeSettings {
+        from: serde_json::Value,
+        to: serde_json::Value,
+    },
     SaveDeviceSettings(DeviceSettings),
     /// Save a draft as `email` with its attachments' bytes added.
     SaveDraft {
@@ -1125,8 +1137,12 @@ impl Account {
 
     /// Hands the account's reminders and scheduled sends to Examail Cloud, and keeps them
     /// there, while the account is open ([`crate::cloud`]).
-    pub fn start_cloud(&self, access: crate::cloud::Access) {
+    pub fn start_cloud(&self, mut access: crate::cloud::Access) {
         let loader = &self.shared.loader;
+        let requests = loader.requests.clone();
+        access.merge_settings = Box::new(move |from, to| {
+            requests.post(Request::MergeSettings { from, to });
+        });
         loader.restarts.spawn_task(
             &loader.runtime,
             crate::cloud::run(loader.store.clone(), access),
@@ -1536,7 +1552,42 @@ impl Account {
             }
         }
         drop(events);
-        self.events.take()
+        let mut events = self.events.take();
+        events.retain(|event| match event {
+            Event::SettingsChanged { from, to } => {
+                self.settings_changed(from, to);
+                false
+            }
+            _ => true,
+        });
+        events
+    }
+
+    /// Applies settings changed elsewhere to the UI's copy, keeping what the UI changed since
+    /// they were read, and saves the result when that kept something.
+    fn settings_changed(&self, from: &serde_json::Value, to: &serde_json::Value) {
+        let mut latest = self.shared.settings.borrow_mut();
+        let Ok(current) = serde_json::to_value(&*latest.settings) else {
+            return;
+        };
+        let merged = exo_store::merge_settings(from, &current, to);
+        if merged == current {
+            return;
+        }
+        let settings: Settings = match serde_json::from_value(merged.clone()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                log::warn!("settings from Examail Cloud don't read: {error}");
+                return;
+            }
+        };
+        if merged != *to {
+            self.shared
+                .requests
+                .post(Request::SaveSettings(Box::new(settings.clone())));
+        }
+        latest.settings = Arc::new(settings);
+        latest.version += 1;
     }
 
     /// Whether nothing is in flight, meaning no request, sync, flush, backfill or fetch is running
@@ -1932,6 +1983,41 @@ pub fn snippet_tokens(window_width: f32) -> i64 {
 }
 
 impl Worker {
+    /// Merges Examail Cloud's settings into the stored ones (see [`Request::MergeSettings`]),
+    /// and tells the UI.
+    async fn merge_settings(&mut self, from: &serde_json::Value, to: &serde_json::Value) {
+        let stored: Settings = match self.store.settings().await {
+            Ok(settings) => settings,
+            Err(error) => {
+                log::error!("reading settings: {error}");
+                return;
+            }
+        };
+        let Ok(current) = serde_json::to_value(&stored) else {
+            return;
+        };
+        let merged = exo_store::merge_settings(from, &current, to);
+        if merged == current {
+            return;
+        }
+        let settings: Settings = match serde_json::from_value(merged.clone()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                log::warn!("settings from Examail Cloud don't read: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.store.save_settings(&settings).await {
+            log::error!("saving settings: {error}");
+            return;
+        }
+        let _ = self.events.send(Event::SettingsChanged {
+            from: current,
+            to: merged,
+        });
+        self.repaint.ctx.request_repaint();
+    }
+
     /// Keeps the rows that `mutation` stars or unstars in Starred where they are in `view`, the
     /// view it was applied from (starring sticks them and doesn't dismiss them). Any other mutation
     /// but marking read or unread lets go of the held rows it acts on, in every view, because such
@@ -2341,6 +2427,7 @@ impl Worker {
                     log::error!("saving settings: {error}");
                 }
             }
+            Request::MergeSettings { from, to } => self.merge_settings(&from, &to).await,
             Request::SaveDeviceSettings(settings) => {
                 if let Err(error) = self.store.save_settings(&settings).await {
                     log::error!("saving device settings: {error}");

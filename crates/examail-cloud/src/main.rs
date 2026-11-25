@@ -17,6 +17,7 @@ mod firestore;
 mod google;
 mod iap;
 mod jobs;
+mod settings;
 mod store;
 mod worker;
 

@@ -75,7 +75,9 @@ pub use calendar::outbox::{
 };
 pub use calendar::recurrence::{End as RecurrenceEnd, Frequency, Nth, Recurrence};
 pub use calendar::{AccountCalendar, StoredEvent};
-pub use cloud::{CLOUD_GRACE, CloudJob, WaitingReminder, remind_key, send_key};
+pub use cloud::{
+    CLOUD_GRACE, CloudJob, SyncedSettings, WaitingReminder, merge_settings, remind_key, send_key,
+};
 pub use connection::{Connection, Debounce, Outage};
 pub use drafts::{
     Address, AttachmentSource, Draft, DraftAction, DraftAttachment, DraftFailure, DraftRecord,

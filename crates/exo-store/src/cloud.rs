@@ -251,3 +251,143 @@ impl Store {
         Ok(rows)
     }
 }
+
+/// Where the account settings as last synced with Examail Cloud are kept in `kv`: the version
+/// and document both sides agreed on, which a merge compares each side with.
+const SYNCED_SETTINGS: &str = "cloud_settings_synced";
+/// This Mac's account settings as they were before the first sync replaced them.
+const SETTINGS_BEFORE_SYNC: &str = "cloud_settings_before_sync";
+
+/// The account settings both this Mac and Examail Cloud last had ([`Store::synced_settings`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SyncedSettings {
+    pub version: i64,
+    pub document: Value,
+}
+
+impl Store {
+    /// The account settings as last synced, if they ever were.
+    ///
+    /// # Errors
+    /// On database failures.
+    pub async fn synced_settings(&self) -> Result<Option<SyncedSettings>> {
+        let mut db = self.inner.db.clone();
+        db::kv_get(&mut db, SYNCED_SETTINGS).await
+    }
+
+    /// Records the account settings both sides now have.
+    ///
+    /// # Errors
+    /// On database failures.
+    pub async fn set_synced_settings(&self, synced: &SyncedSettings) -> Result<()> {
+        let mut db = self.inner.db.clone();
+        let mut write = self.inner.begin(&mut db).await?;
+        db::kv_set(write.exec(), SYNCED_SETTINGS, synced).await?;
+        write.commit().await
+    }
+
+    /// Keeps `document`, this Mac's settings, before a first sync replaces them, unless an
+    /// earlier first sync already kept some.
+    ///
+    /// # Errors
+    /// On database failures.
+    pub async fn keep_settings_before_sync(&self, document: &Value) -> Result<()> {
+        let mut db = self.inner.db.clone();
+        if db::kv_get::<Value>(&mut db, SETTINGS_BEFORE_SYNC)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut write = self.inner.begin(&mut db).await?;
+        db::kv_set(write.exec(), SETTINGS_BEFORE_SYNC, document).await?;
+        write.commit().await
+    }
+
+    /// What Examail Cloud needs to act on the settings that they don't say: the account's
+    /// addresses (`email` and its send-as aliases) and its labels' names by id.
+    ///
+    /// # Errors
+    /// On database failures.
+    pub async fn cloud_context(&self, email: &str) -> Result<Value> {
+        let mut addresses: Vec<String> = vec![email.to_lowercase()];
+        for alias in self.aliases().await? {
+            let address = alias.email.to_lowercase();
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+        let labels: serde_json::Map<String, Value> = self
+            .labels()
+            .await?
+            .into_iter()
+            .map(|label| (label.id, Value::String(label.name)))
+            .collect();
+        Ok(json!({ "addresses": addresses, "labels": labels }))
+    }
+}
+
+/// Merges two copies of a settings document that each changed since `base`, the copy both last
+/// had, key by key: a key `local` changed keeps `local`'s value, and any other key takes
+/// `remote`'s. A key both changed keeps `local`'s. Keys missing from a copy are at their defaults.
+#[must_use]
+pub fn merge_settings(base: &Value, local: &Value, remote: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let (base, local, remote) = (
+        base.as_object().unwrap_or(&empty),
+        local.as_object().unwrap_or(&empty),
+        remote.as_object().unwrap_or(&empty),
+    );
+    let mut merged = serde_json::Map::new();
+    let keys: BTreeSet<&String> = local
+        .keys()
+        .chain(remote.keys())
+        .chain(base.keys())
+        .collect();
+    for key in keys {
+        let value = if local.get(key) == base.get(key) {
+            remote.get(key)
+        } else {
+            local.get(key)
+        };
+        if let Some(value) = value {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_settings;
+    use serde_json::json;
+
+    #[test]
+    fn each_side_keeps_what_it_changed() {
+        let base = json!({ "theme": "snow", "snippets": [1], "unifiedInbox": false });
+        let local = json!({ "theme": "carbon", "snippets": [1], "unifiedInbox": false });
+        let remote = json!({ "theme": "snow", "snippets": [1, 2] });
+        assert_eq!(
+            merge_settings(&base, &local, &remote),
+            json!({ "theme": "carbon", "snippets": [1, 2] })
+        );
+    }
+
+    #[test]
+    fn a_key_both_changed_keeps_this_macs_and_a_new_key_arrives() {
+        let base = json!({ "theme": "snow" });
+        let local = json!({ "theme": "carbon" });
+        let remote = json!({ "theme": "classic", "blockedSenders": ["x@example.com"] });
+        assert_eq!(
+            merge_settings(&base, &local, &remote),
+            json!({ "theme": "carbon", "blockedSenders": ["x@example.com"] })
+        );
+    }
+
+    #[test]
+    fn with_this_mac_as_the_base_the_service_wins() {
+        let local = json!({ "theme": "carbon", "nudges": {"a": 1} });
+        let remote = json!({ "theme": "snow" });
+        assert_eq!(merge_settings(&local, &local, &remote), remote);
+    }
+}

@@ -13,6 +13,8 @@
 //! | `GET /v1/jobs` | app | The account's reminders and scheduled sends, and how each stands |
 //! | `PUT /v1/jobs/{key}` | app | Records a reminder or scheduled send, or replaces it ([`crate::jobs`]) |
 //! | `DELETE /v1/jobs/{key}` | app | Calls one off |
+//! | `GET /v1/settings` | app | The account's synced settings and their version ([`crate::settings`]) |
+//! | `PUT /v1/settings` | app | Replaces them, if they're still the version the app read |
 
 use std::sync::Arc;
 
@@ -53,6 +55,10 @@ pub fn router(app: Arc<App>) -> axum::Router {
         .route("/v1/check", get(check))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/{key}", put(put_job).delete(delete_job))
+        .route(
+            "/v1/settings",
+            get(crate::settings::get).put(crate::settings::put),
+        )
         .with_state(app)
 }
 
@@ -60,7 +66,7 @@ pub fn router(app: Arc<App>) -> axum::Router {
 pub struct Error(StatusCode, anyhow::Error);
 
 impl Error {
-    fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
+    pub(crate) fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
         Self(status, error.into())
     }
 }
@@ -86,7 +92,7 @@ impl IntoResponse for Error {
     }
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 async fn identify(app: &App, headers: &HeaderMap) -> Result<Identity> {
     app.iap.identify(headers).await.map_err(|error| {
@@ -97,7 +103,7 @@ async fn identify(app: &App, headers: &HeaderMap) -> Result<Identity> {
 }
 
 /// The caller's identity, after checking the device token is theirs.
-async fn identify_device(app: &App, headers: &HeaderMap) -> Result<(Identity, String)> {
+pub(crate) async fn identify_device(app: &App, headers: &HeaderMap) -> Result<(Identity, String)> {
     let identity = identify(app, headers).await?;
     let token = headers
         .get(DEVICE_HEADER)

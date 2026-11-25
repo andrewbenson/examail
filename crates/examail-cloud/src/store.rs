@@ -11,6 +11,7 @@ const ACCOUNTS: &str = "accounts";
 const GRANTS: &str = "grants";
 const DEVICES: &str = "devices";
 const CONNECTS: &str = "connects";
+pub const SETTINGS: &str = "settings";
 
 /// A Google account that connected Examail Cloud.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +43,21 @@ pub struct Connect {
     pub sub: String,
     pub verifier: String,
     pub expires_at: String,
+}
+
+/// An account's synced settings ([`crate::settings`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Settings {
+    /// The app's account settings document, as JSON text (Firestore's own maps can't hold every
+    /// key the document may have).
+    pub document: String,
+    /// Counts the writes: a write names the version it read, and loses when another came first.
+    pub version: i64,
+    /// What the service needs to act on the settings that the settings don't say, as JSON text:
+    /// the account's addresses and its labels' ids and names ([`crate::settings::Context`]).
+    #[serde(default)]
+    pub context: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone)]
@@ -137,6 +153,7 @@ impl Store {
         {
             self.db.delete(DEVICES, &device).await?;
         }
+        self.db.delete(SETTINGS, sub).await?;
         self.db.delete(GRANTS, sub).await?;
         self.db.delete(ACCOUNTS, sub).await
     }

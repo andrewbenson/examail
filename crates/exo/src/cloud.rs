@@ -143,6 +143,9 @@ pub struct Access {
     pub config: Config,
     pub email: String,
     pub tokens: exo_auth::Tokens,
+    /// Hands the account a settings merge: the settings as read, and as merged
+    /// ([`crate::account::Account::start_cloud`] queues it behind the UI's own saves).
+    pub merge_settings: Box<dyn Fn(Value, Value) + Send + Sync>,
 }
 
 /// Why a call to the service didn't go.
@@ -156,6 +159,10 @@ enum Failure {
     NotConnected,
     /// The service's gateway doesn't admit the account (it isn't one of the service's users).
     NotAllowed,
+    /// A write named a version the service has moved past.
+    Stale,
+    /// The service doesn't have this route (it's older than the app).
+    Missing,
     /// Anything else: offline, the service down, a refusal.
     Other(String),
 }
@@ -167,6 +174,8 @@ impl std::fmt::Display for Failure {
             Self::UnknownDevice => write!(f, "the service doesn't know this Mac"),
             Self::NotConnected => write!(f, "the account hasn't connected Examail Cloud"),
             Self::NotAllowed => write!(f, "Examail Cloud doesn't admit the account"),
+            Self::Stale => write!(f, "another Mac wrote first"),
+            Self::Missing => write!(f, "Examail Cloud doesn't have that yet"),
             Self::Other(message) => write!(f, "{message}"),
         }
     }
@@ -219,6 +228,8 @@ impl Client {
         Err(match status.as_u16() {
             401 if self.device.is_some() && message.contains("device") => Failure::UnknownDevice,
             409 => Failure::NotConnected,
+            412 => Failure::Stale,
+            404 => Failure::Missing,
             // IAP's refusal, which is a page rather than the service's JSON.
             403 if !message.starts_with('{') && !text.trim_start().starts_with('{') => {
                 Failure::NotAllowed
@@ -373,9 +384,9 @@ pub async fn run(store: Store, access: Access) {
                 checked = None;
                 SETTLE
             }
-            Err(Failure::Other(message)) => {
+            Err(failure @ (Failure::Other(_) | Failure::Stale | Failure::Missing)) => {
                 // What the service holds it still holds; Exo does those itself after the grace.
-                log::warn!("Examail Cloud: {message}");
+                log::warn!("Examail Cloud: {failure}");
                 RECHECK
             }
         };
@@ -486,7 +497,93 @@ async fn round(
         .set_handed_off(held.collect::<Vec<_>>())
         .await
         .map_err(|error| Failure::Other(format!("recording the hand-off: {error}")))?;
-    Ok(())
+    match sync_settings(store, client).await {
+        Ok(()) | Err(Failure::Missing) => Ok(()),
+        Err(Failure::Other(message)) => {
+            log::warn!("syncing settings with Examail Cloud: {message}");
+            Ok(())
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// Syncs the account's settings with Examail Cloud's copy ([`exo_store::merge_settings`]).
+///
+/// A merge that changes this Mac's settings goes to the account to apply, and is written to the
+/// service only once it has been (a later round), so the copy both sides agree on is only ever
+/// one this Mac has stored. With none agreed on yet, the service's settings win, and this Mac's
+/// are kept aside first.
+async fn sync_settings(store: &Store, client: &mut Client) -> Result<(), Failure> {
+    let other = |what: &str, error: exo_store::Error| Failure::Other(format!("{what}: {error}"));
+    let local: exo_store::Settings = store
+        .settings()
+        .await
+        .map_err(|error| other("reading the settings", error))?;
+    let local = serde_json::to_value(&local).map_err(|error| Failure::Other(error.to_string()))?;
+    let synced = store
+        .synced_settings()
+        .await
+        .map_err(|error| other("reading the synced settings", error))?;
+    let answer = client
+        .call(reqwest::Method::GET, "v1/settings", None)
+        .await?;
+    let version = answer["version"].as_i64().unwrap_or(0);
+    let remote = &answer["document"];
+    let merged = if remote.is_object() {
+        match &synced {
+            Some(synced) => exo_store::merge_settings(&synced.document, &local, remote),
+            None => {
+                store
+                    .keep_settings_before_sync(&local)
+                    .await
+                    .map_err(|error| other("keeping the settings", error))?;
+                remote.clone()
+            }
+        }
+    } else {
+        // The service has none (a first Mac, or after a disconnect): this Mac's are the start.
+        local.clone()
+    };
+    if merged != local {
+        (client.access.merge_settings)(local, merged);
+        return Ok(());
+    }
+    if *remote == merged {
+        let agreed = exo_store::SyncedSettings {
+            version,
+            document: merged,
+        };
+        if synced.as_ref() != Some(&agreed) {
+            store
+                .set_synced_settings(&agreed)
+                .await
+                .map_err(|error| other("recording the synced settings", error))?;
+        }
+        return Ok(());
+    }
+    let context = store
+        .cloud_context(&client.access.email)
+        .await
+        .map_err(|error| other("reading the addresses and labels", error))?;
+    let body = json!({ "base": version, "document": merged, "context": context });
+    match client
+        .call(reqwest::Method::PUT, "v1/settings", Some(&body))
+        .await
+    {
+        Ok(answer) => {
+            let agreed = exo_store::SyncedSettings {
+                version: answer["version"].as_i64().unwrap_or(version + 1),
+                document: merged,
+            };
+            store
+                .set_synced_settings(&agreed)
+                .await
+                .map_err(|error| other("recording the synced settings", error))
+        }
+        // Another Mac wrote first: the next round merges with what it wrote.
+        Err(Failure::Stale) => Ok(()),
+        Err(failure) => Err(failure),
+    }
 }
 
 /// Whether the service's `job` is the one last sent for `key` (same time), rather than an older

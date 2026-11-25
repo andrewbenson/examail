@@ -63,6 +63,20 @@ impl Firestore {
         Ok(Some(serde_json::from_value(decode_document(&document))?))
     }
 
+    /// The document `collection/id` with its update time, for [`Firestore::set_if_unchanged`].
+    pub async fn get_document(&self, collection: &str, id: &str) -> Result<Option<Document>> {
+        let response = self.request(Method::GET, &format!("{collection}/{id}"), None).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let document = checked(response).await?;
+        Ok(Some(Document {
+            id: id.to_owned(),
+            fields: decode_document(&document),
+            update_time: document["updateTime"].as_str().unwrap_or_default().to_owned(),
+        }))
+    }
+
     /// Writes `value` as the document `collection/id`.
     pub async fn set<T: Serialize>(
         &self,
