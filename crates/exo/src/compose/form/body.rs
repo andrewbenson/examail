@@ -578,8 +578,10 @@ pub(in crate::compose) fn reveal_quote(open: &mut Open, aliases: &[Alias], now: 
         return;
     }
     let quote = open.record.quoted_content.clone();
+    // A draft from another app has its own signature, with its quote.
+    let signature = (!open.record.quote_signed).then(|| signature::revealed(open, aliases));
     open.editor
-        .reveal_quoted(Some(&signature::revealed(open, aliases)), quote.as_deref());
+        .reveal_quoted(signature.as_deref(), quote.as_deref());
     open.record.quoted_inlined = true;
     open.state.field = Field::Body;
     open.touch(now);

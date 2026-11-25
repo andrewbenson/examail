@@ -18,7 +18,8 @@ fn body_html(open: &Open, aliases: &[Alias], skip_signature: bool) -> String {
     let parts = exo_editor::outgoing::Parts {
         signature: signature_html.as_deref(),
         include_signature_content: signature::includes_content(open),
-        skip_signature,
+        // A draft from another app has its own signature, with its quote.
+        skip_signature: skip_signature || open.record.quote_signed,
         quote: open.record.quoted_content.as_deref(),
         inlined: open.record.quoted_inlined,
     };
@@ -147,6 +148,7 @@ mod tests {
             body: String::new(),
             quoted_content: Some("<div class=\"gmail_quote\">On Tue, Tom wrote:<br/><blockquote class=\"gmail_quote\"><div>Heads up</div></blockquote></div>".into()),
             quoted_inlined: false,
+            quote_signed: false,
             in_reply_to: Some("m1".into()),
             in_reply_to_rfc822: Some("b@x".into()),
             references: vec!["a@x".into(), "b@x".into()],
@@ -200,6 +202,27 @@ mod tests {
                 .unwrap(),
         ));
         assert!(!new.contains("In-Reply-To"), "new mail starts a thread");
+    }
+
+    #[test]
+    fn a_draft_from_another_app_keeps_its_own_signature_and_gets_no_second() {
+        let aliases = alias("<div dir=\"ltr\">Maya</div>");
+        let mut adopted = open(DraftAction::Reply);
+        adopted.record.quoted_content = Some(
+            "<div class=\"gmail_quote\">On Tue, Tom wrote:<blockquote>Heads up</blockquote></div>\
+             <div class=\"gmail_signature\"><div>Maya, from her phone</div></div>"
+                .into(),
+        );
+        adopted.record.quote_signed = true;
+        let sent = html(&adopted, &aliases);
+        assert!(
+            sent.contains("Sounds good")
+                && sent.contains("Heads up")
+                && sent.contains("Maya, from her phone")
+                && !sent.contains(">Maya<"),
+            "{sent}"
+        );
+        assert_eq!(sent.matches("gmail_signature").count(), 1, "{sent}");
     }
 
     #[test]

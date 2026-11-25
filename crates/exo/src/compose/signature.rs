@@ -103,6 +103,7 @@ mod tests {
             body: String::new(),
             quoted_content: (action != DraftAction::Compose).then(|| "<div class=\"gmail_quote\">On Tue, Tom wrote:<blockquote class=\"gmail_quote\"><div>Heads up</div></blockquote></div>".into()),
             quoted_inlined: false,
+            quote_signed: false,
             in_reply_to: None,
             in_reply_to_rfc822: None,
             references: Vec::new(),

@@ -158,6 +158,7 @@ pub(crate) fn compose(account: &Account<'_>, fields: Fields, now: Timestamp) -> 
         body: fields.body,
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: None,
         in_reply_to_rfc822: None,
         references: Vec::new(),
@@ -240,6 +241,7 @@ pub(crate) fn reply(
         body: String::new(),
         quoted_content,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: Some(message.id.clone()),
         in_reply_to_rfc822: message.rfc822_id.clone(),
         references: references(message),
@@ -334,6 +336,8 @@ pub(crate) fn retarget(
     record.subject = subject(action, &message.subject);
     if !record.quoted_inlined {
         record.quoted_content = Some(quote(action, message, &sent, body));
+        // Examail's quote, which takes Examail's signature.
+        record.quote_signed = false;
     }
     record.from = Some(from);
     copy_attachments(record, message, action == DraftAction::Forward);

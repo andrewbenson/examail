@@ -207,6 +207,7 @@ fn draft(id: &str, thread: Option<&ThreadId>, send_later: Option<SendLater>) -> 
         body: "<div>Here it is</div>".into(),
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: None,
         in_reply_to_rfc822: None,
         references: Vec::new(),

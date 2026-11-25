@@ -559,6 +559,7 @@ async fn save_with_reminder(
         body: "<div>Thoughts?</div>".into(),
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: replied.as_ref().map(|message| message.id.clone()),
         in_reply_to_rfc822: None,
         references: Vec::new(),

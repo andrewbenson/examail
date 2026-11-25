@@ -465,6 +465,7 @@ async fn recheck_strips_html_decodes_entities_includes_drafts_and_quotes_fts_key
         body: format!("<div>{filler}unsaved velvet giraffe note</div>"),
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: None,
         in_reply_to_rfc822: None,
         references: Vec::new(),

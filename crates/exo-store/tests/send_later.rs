@@ -37,6 +37,7 @@ fn draft(id: &str, dated: Timestamp, send_later: Option<SendLater>) -> Draft {
         body: "<div>Here it is</div>".into(),
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: None,
         in_reply_to_rfc822: None,
         references: Vec::new(),

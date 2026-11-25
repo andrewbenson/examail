@@ -48,6 +48,10 @@ pub struct DraftRecord {
     pub quoted_content: Option<String>,
     /// The quote and signature are in the body (revealed with "…", or deleted).
     pub quoted_inlined: bool,
+    /// The quote carries the draft's own signature, as a draft written in another app does
+    /// ([`DraftRecord::quoted_content`] holds all that followed its text), so none is added.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quote_signed: bool,
     /// The Gmail message replied to or forwarded.
     pub in_reply_to: Option<String>,
     /// That message's `Message-ID`, without angle brackets.

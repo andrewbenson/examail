@@ -168,9 +168,11 @@ pub(super) fn save(
     open.sync.saved = Some(open.record.clone());
 }
 
-/// The draft record of a draft written elsewhere (Gmail web), from its message (`adopt`). The
-/// message's HTML is the body, quote and all, as with a revealed quote. Its files are its own,
-/// and the first save fetches them, since that save replaces the message they're in.
+/// The draft record of a draft written elsewhere (Gmail web, Superhuman), from its message
+/// (`adopt`). What was written is the body, and its quote, with all that follows it (the other
+/// app's signature too), waits behind the `…` as an Examail reply's does. A draft with no quote
+/// is all body. Its files are its own, and the first save fetches them, since that save replaces
+/// the message they're in.
 pub(super) fn adopted(message: &MessageDetail, thread: &ThreadDetail) -> Open {
     let address = |contact: &exo_store::Contact| Address {
         name: contact.name.clone(),
@@ -193,11 +195,16 @@ pub(super) fn adopted(message: &MessageDetail, thread: &ThreadDetail) -> Open {
     } else {
         DraftAction::Compose
     };
-    let body = match (&message.body.html, &message.body.text) {
+    let html = match (&message.body.html, &message.body.text) {
         (Some(html), _) => html.clone(),
         (None, Some(text)) => exo_mail::text_to_html(text),
         (None, None) => String::new(),
     };
+    let (body, quoted_content) = match exo_mail::split_draft_quote(&html) {
+        Some((body, quote)) => (body, Some(quote)),
+        None => (html, None),
+    };
+    let quote_signed = quoted_content.is_some();
     let mut record = exo_store::DraftRecord {
         action,
         from: message.from.as_ref().map(address),
@@ -206,8 +213,9 @@ pub(super) fn adopted(message: &MessageDetail, thread: &ThreadDetail) -> Open {
         bcc: message.bcc.iter().map(address).collect(),
         subject: message.subject.clone(),
         body,
-        quoted_content: None,
-        quoted_inlined: true,
+        quoted_inlined: quoted_content.is_none(),
+        quoted_content,
+        quote_signed,
         in_reply_to: answers.map(|answers| answers.id.clone()),
         in_reply_to_rfc822: message.in_reply_to.clone(),
         references: message.references.clone(),

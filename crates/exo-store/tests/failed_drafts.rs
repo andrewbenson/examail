@@ -38,6 +38,7 @@ fn draft(id: &str, rfc822_id: &str) -> Draft {
         body: "<div>Here it is</div>".into(),
         quoted_content: None,
         quoted_inlined: false,
+        quote_signed: false,
         in_reply_to: None,
         in_reply_to_rfc822: None,
         references: Vec::new(),
