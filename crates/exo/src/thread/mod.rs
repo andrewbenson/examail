@@ -849,7 +849,8 @@ impl ThreadView {
                     .is_some_and(|drafts| drafts.has_form(&item.id)),
                 offline: !self.action.online,
                 full_names: self.action.full_names,
-                reply_labels: is_focus && self.new_account(),
+                // Icons only, as for an account past its first week.
+                reply_labels: false,
             };
             let response = ui.interact(
                 card.intersect(messages),
@@ -1155,7 +1156,6 @@ mod tests {
         assert!(!view.items[0].trashed, "Trash view unfolds trashed marker");
         assert!(!view.action.online);
         assert!(view.action.full_names);
-        assert!(view.new_account());
         assert_eq!(view.action.pending.as_deref(), Some("Pending: Mark Done"));
         assert!(view.action.spam_view);
         assert_eq!(view.invite_state.calendar_accounts, ["team@brightmoor.co"]);

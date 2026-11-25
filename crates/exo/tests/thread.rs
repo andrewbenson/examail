@@ -613,11 +613,11 @@ fn a_body_too_wide_for_the_column_widens_it_and_the_column_scrolls_sideways() {
 }
 
 #[test]
-fn a_new_accounts_focused_message_labels_its_reply_buttons() {
+fn reply_buttons_are_icons_even_in_a_new_accounts_first_week() {
     let mut app = start("thread-reply-labels");
     app.key(Key::Enter);
-    // Tom to Me & Priya. With labels, Reply all's label sits where the participants' row ends
-    // without them (reply buttons have labels in the account's first week).
+    // Tom to Me & Priya. With labels, Reply all's label would sit where the participants' row
+    // ends. Examail shows the icons alone, as Superhuman does past an account's first week.
     let label = egui::pos2(725.0, 133.0);
     let replies = |app: &mut Fixture, joined: &str| {
         let joined: Option<jiff::Timestamp> =
@@ -648,8 +648,8 @@ fn a_new_accounts_focused_message_labels_its_reply_buttons() {
     );
     assert_eq!(
         replies(&mut app, "2026-11-11T15:00:00Z"),
-        Some(vec!["tom@brightmoor.co".to_owned()]),
-        "joined six days ago: Reply all"
+        None,
+        "joined six days ago: still no labels"
     );
     assert_eq!(
         replies(&mut app, "2026-11-09T13:00:00Z"),

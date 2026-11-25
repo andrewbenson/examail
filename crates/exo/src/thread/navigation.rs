@@ -134,16 +134,6 @@ impl ThreadView {
         }
     }
 
-    /// Whether the account is new: it joined in the last week, by Exo's first sign-in on this Mac.
-    /// Reply buttons have labels then, on the focused message.
-    pub(super) fn new_account(&self) -> bool {
-        let week_ago = self.action.now.checked_sub(jiff::Span::new().days(7));
-        self.action
-            .joined
-            .zip(week_ago.ok())
-            .is_some_and(|(joined, week_ago)| joined >= week_ago.timestamp())
-    }
-
     /// The header's controls, in tab order.
     pub(super) fn header_controls(&self) -> Vec<header::Control> {
         header::controls(self.action.status.as_ref(), !self.action.spam_view)
