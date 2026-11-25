@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 pub enum Role {
     Api,
     Worker,
+    /// `relay-mcp` ([`crate::mcp`]).
+    Mcp,
 }
 
 pub struct Config {
@@ -29,6 +31,8 @@ pub struct Config {
     /// The Pub/Sub topic Gmail publishes mailbox changes to (`projects/…/topics/…`). Unset, the
     /// mail watcher is off ([`crate::watch`]).
     pub gmail_topic: Option<String>,
+    /// `relay-mcp`'s URL, which minting a token answers with. Unset, there's no MCP server.
+    pub mcp_url: Option<String>,
 }
 
 impl Config {
@@ -36,7 +40,8 @@ impl Config {
         let role = match var("ROLE")?.as_str() {
             "api" => Role::Api,
             "worker" => Role::Worker,
-            other => bail!("ROLE is {other:?}, not api or worker"),
+            "mcp" => Role::Mcp,
+            other => bail!("ROLE is {other:?}, not api, worker or mcp"),
         };
         let port = std::env::var("PORT")
             .ok()
@@ -65,6 +70,10 @@ impl Config {
             gmail_topic: std::env::var("GMAIL_TOPIC")
                 .ok()
                 .filter(|topic| !topic.is_empty()),
+            mcp_url: std::env::var("MCP_URL")
+                .ok()
+                .filter(|url| !url.is_empty())
+                .map(|url| url.trim_end_matches('/').to_owned()),
         })
     }
 }

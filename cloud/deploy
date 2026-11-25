@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds Examail Cloud's image and deploys both services.
 #
-#   cloud/deploy            build, then deploy relay-api and relay-worker
+#   cloud/deploy            build, then deploy relay-api, relay-worker and relay-mcp
 #   cloud/deploy --no-build redeploy the last image (settings changes)
 #
 # Where it deploys comes from cloud/relay.env, which git ignores so the project and its URLs stay
@@ -25,6 +25,12 @@ NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 IMAGE="$REGION-docker.pkg.dev/$PROJECT/relay/relay:$(git rev-parse --short HEAD)$(git diff --quiet || echo -dirty)"
 LATEST="$REGION-docker.pkg.dev/$PROJECT/relay/relay:latest"
 API_URL="https://relay-api-$NUMBER.$REGION.run.app"
+MCP_URL="https://relay-mcp-$NUMBER.$REGION.run.app"
+# Gmail publishes mailbox changes here once it exists (cloud/README.md, "The mail watcher").
+TOPIC="projects/$PROJECT/topics/gmail-push"
+if ! gcloud pubsub topics describe gmail-push --project "$PROJECT" >/dev/null 2>&1; then
+    TOPIC=""
+fi
 
 if [[ "${1:-}" != --no-build ]]; then
     gcloud builds submit --project "$PROJECT" --region "$REGION" \
@@ -48,11 +54,18 @@ fi
 gcloud run deploy relay-api "${COMMON[@]}" ${secrets[@]+"${secrets[@]}"} \
     --service-account "relay-api@$PROJECT.iam.gserviceaccount.com" \
     --iap \
-    --set-env-vars "$ENV,ROLE=api,PUBLIC_URL=$API_URL,IAP_AUDIENCE=/projects/$NUMBER/locations/$REGION/services/relay-api"
+    --set-env-vars "$ENV,ROLE=api,PUBLIC_URL=$API_URL,MCP_URL=$MCP_URL,IAP_AUDIENCE=/projects/$NUMBER/locations/$REGION/services/relay-api"
 
 gcloud run deploy relay-worker "${COMMON[@]}" ${secrets[@]+"${secrets[@]}"} \
     --service-account "relay-worker@$PROJECT.iam.gserviceaccount.com" \
-    --set-env-vars "$ENV,ROLE=worker"
+    --set-env-vars "$ENV,ROLE=worker,GMAIL_TOPIC=$TOPIC"
+
+# Open to the internet: every request needs a token the app minted (crates/examail-cloud/src/mcp.rs).
+gcloud run deploy relay-mcp "${COMMON[@]/--no-allow-unauthenticated/--allow-unauthenticated}" \
+    ${secrets[@]+"${secrets[@]}"} \
+    --service-account "relay-worker@$PROJECT.iam.gserviceaccount.com" \
+    --set-env-vars "$ENV,ROLE=mcp"
 
 echo "relay-api:    $API_URL"
+echo "relay-mcp:    $MCP_URL"
 echo "relay-worker: $(gcloud run services describe relay-worker --project "$PROJECT" --region "$REGION" --format='value(status.url)')"

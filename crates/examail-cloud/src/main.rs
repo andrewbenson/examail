@@ -17,6 +17,7 @@ mod firestore;
 mod google;
 mod iap;
 mod jobs;
+mod mcp;
 mod settings;
 mod splits;
 mod store;
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
     let router = match role {
         Role::Api => api::router(app),
         Role::Worker => worker::router(app),
+        Role::Mcp => mcp::router(app),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await

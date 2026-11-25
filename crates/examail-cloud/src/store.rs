@@ -173,6 +173,13 @@ impl Store {
         {
             self.db.delete(crate::splits::ROUTES, &route).await?;
         }
+        for token in self
+            .db
+            .ids_where(crate::mcp::COLLECTION, "sub", &serde_json::Value::from(sub))
+            .await?
+        {
+            self.db.delete(crate::mcp::COLLECTION, &token).await?;
+        }
         self.db.delete(crate::splits::LABELS, sub).await?;
         self.db.delete(crate::watch::COLLECTION, sub).await?;
         self.db.delete(SETTINGS, sub).await?;

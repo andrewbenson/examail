@@ -15,6 +15,8 @@
 //! | `DELETE /v1/jobs/{key}` | app | Calls one off |
 //! | `GET /v1/settings` | app | The account's synced settings and their version ([`crate::settings`]) |
 //! | `PUT /v1/settings` | app | Replaces them, if they're still the version the app read |
+//! | `POST /v1/mcp-tokens` | app | Mints a token for `relay-mcp` ([`crate::mcp`]) |
+//! | `DELETE /v1/mcp-tokens` | app | Revokes the account's tokens |
 
 use std::sync::Arc;
 
@@ -55,6 +57,10 @@ pub fn router(app: Arc<App>) -> axum::Router {
         .route("/v1/check", get(check))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/{key}", put(put_job).delete(delete_job))
+        .route(
+            "/v1/mcp-tokens",
+            post(crate::mcp::mint).delete(crate::mcp::revoke),
+        )
         .route(
             "/v1/settings",
             get(crate::settings::get).put(crate::settings::put),
@@ -119,14 +125,14 @@ pub(crate) async fn identify_device(app: &App, headers: &HeaderMap) -> Result<(I
     }
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("the OS random source is available");
     URL_SAFE_NO_PAD.encode(bytes)
