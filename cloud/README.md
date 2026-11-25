@@ -63,19 +63,49 @@ gcloud iap web add-iam-policy-binding --project $P --resource-type cloud-run \
     --service relay-api --region $R --member user:<you> --role roles/iap.httpsResourceAccessor
 ```
 
-and let the app's desktop OAuth client's ID tokens through (`programmatic_clients`, which must be
-in the same organization as the project):
+IAP's own Google-managed sign-in admits only accounts in the project's organization, so give it
+the service's Web client instead (add `https://iap.googleapis.com/v1/oauth/clientIds/<client
+id>:handleRedirect` to that client's redirect URIs first), and let the app's desktop OAuth
+client's ID tokens through (`programmatic_clients`, which must be in the same organization as the
+project):
 
 ```sh
 cat > iap.yaml <<EOF
 access_settings:
   oauth_settings:
+    client_id: <the Web client's id>
+    client_secret: <its secret>
     programmatic_clients:
     - <the app's client id>
 EOF
 gcloud iap settings set iap.yaml --project $P --resource-type cloud-run --service relay-api \
     --region $R
+rm iap.yaml
 ```
+
+The consent screen must be **In production**: while it's Testing, Google drops the service's
+refresh tokens after 7 days.
+
+## The app
+
+Release builds take the `relay-api` URL from the `EXO_CLOUD_URL` secret at build time. A Mac's
+`~/Library/Application Support/Examail/cloud.json` overrides it with `{"url": "…"}`, or turns
+Examail Cloud off with `{"enabled": false}`. Until an account connects (in the browser, from the
+link in Examail's status bar, or `<relay-api URL>/v1/connect?login_hint=<address>`), its
+reminders and scheduled sends wait for Examail to open.
+
+## Alerts
+
+A log-based alert policy, "Relay job failed", emails when the worker logs `job <id> Failed` or
+either service logs an error, at most once an hour. It was made through the Monitoring API: an
+email notification channel, then an alert policy with a `conditionMatchedLog` on
+
+```
+resource.type="cloud_run_revision" AND resource.labels.service_name=("relay-worker" OR "relay-api")
+AND (severity>=ERROR OR textPayload=~"job \\S+ Failed")
+```
+
+and a `notificationRateLimit` of an hour.
 
 ## Running locally
 
