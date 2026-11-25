@@ -103,18 +103,23 @@ reminders and scheduled sends wait for Examail to open.
 
 Gmail publishes each connected inbox's changes to the Pub/Sub topic `gmail-push`, which pushes
 them to the worker. The tick renews each account's `users.watch` before it lapses (a week) and
-also reads what changed every minute, so a lost push only delays things. `cloud/deploy` turns the
-watcher on (`GMAIL_TOPIC`) once the topic exists:
+also reads what changed every minute, so a lost push only delays things.
+
+Gmail only publishes to a topic in the **OAuth client's** project (`C` below), which may not be
+the service's: the topic goes there, and the subscription in the service's project. Set
+`GMAIL_TOPIC=projects/$C/topics/gmail-push` in `cloud/relay.env` and `cloud/deploy` turns the
+watcher on:
 
 ```sh
-gcloud pubsub topics create gmail-push --project $P
-gcloud pubsub topics add-iam-policy-binding gmail-push --project $P \
+gcloud pubsub topics create gmail-push --project $C
+gcloud pubsub topics add-iam-policy-binding gmail-push --project $C \
     --member serviceAccount:gmail-api-push@system.gserviceaccount.com --role roles/pubsub.publisher
 gcloud iam service-accounts add-iam-policy-binding relay-scheduler@$P.iam.gserviceaccount.com \
     --project $P --member serviceAccount:service-$N@gcp-sa-pubsub.iam.gserviceaccount.com \
     --role roles/iam.serviceAccountTokenCreator
 W=$(gcloud run services describe relay-worker --project $P --region $R --format 'value(status.url)')
-gcloud pubsub subscriptions create gmail-push-worker --project $P --topic gmail-push \
+gcloud pubsub subscriptions create gmail-push-worker --project $P \
+    --topic projects/$C/topics/gmail-push \
     --push-endpoint $W/hooks/gmail --push-auth-service-account relay-scheduler@$P.iam.gserviceaccount.com \
     --push-auth-token-audience $W --ack-deadline 60 --message-retention-duration 1h \
     --expiration-period never

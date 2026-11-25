@@ -9,6 +9,7 @@
 #
 #   PROJECT=my-project
 #   REGION=us-west1
+#   GMAIL_TOPIC=projects/oauth-client-project/topics/gmail-push   (optional)
 #
 # The project needs the Firestore database `relay`, the KMS key relay/refresh-tokens, the Artifact
 # Registry repository `relay`, and the service accounts relay-api and relay-worker (see
@@ -26,11 +27,9 @@ IMAGE="$REGION-docker.pkg.dev/$PROJECT/relay/relay:$(git rev-parse --short HEAD)
 LATEST="$REGION-docker.pkg.dev/$PROJECT/relay/relay:latest"
 API_URL="https://relay-api-$NUMBER.$REGION.run.app"
 MCP_URL="https://relay-mcp-$NUMBER.$REGION.run.app"
-# Gmail publishes mailbox changes here once it exists (cloud/README.md, "The mail watcher").
-TOPIC="projects/$PROJECT/topics/gmail-push"
-if ! gcloud pubsub topics describe gmail-push --project "$PROJECT" >/dev/null 2>&1; then
-    TOPIC=""
-fi
+# The Pub/Sub topic Gmail publishes mailbox changes to, which must be in the OAuth client's project
+# (cloud/README.md, "The mail watcher"). Unset, the mail watcher is off.
+TOPIC="${GMAIL_TOPIC:-}"
 
 if [[ "${1:-}" != --no-build ]]; then
     gcloud builds submit --project "$PROJECT" --region "$REGION" \
