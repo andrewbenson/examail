@@ -752,6 +752,8 @@ async fn select_all_preserves_subsecond_arrivals_after_cutoff_and_filters_search
             "subject": "At cutoff",
             "text": "Should be archived",
             "labelIds": ["INBOX", "UNREAD"],
+            // Exactly, though the clock has moved on since it was set.
+            "internalDate": cutoff.to_string(),
         }))
         .await
         .thread_id
@@ -772,6 +774,7 @@ async fn select_all_preserves_subsecond_arrivals_after_cutoff_and_filters_search
             "subject": "Subsecond arrival",
             "text": "Arrived after cutoff within same second",
             "labelIds": ["INBOX", "UNREAD"],
+            "internalDate": later_same_second.to_string(),
         }))
         .await
         .thread_id

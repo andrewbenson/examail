@@ -1,0 +1,11 @@
+# The app's UI tests drive egui frames against deadlines, which a loaded machine can miss.
+# A test that fails is run again, up to twice; nextest still reports it as flaky.
+[profile.default]
+retries = 2
+failure-output = "final"
+
+# These two wait on a 60s deadline that they miss when other tests share the machine, so
+# each runs with the machine to itself.
+[[profile.default.overrides]]
+filter = "test(=an_invite_to_a_signed_out_calendar_account_signs_it_in_to_answer) | test(=signing_another_account_in_for_an_invite_says_so_and_no_thanks_puts_the_day_back)"
+threads-required = "num-test-threads"

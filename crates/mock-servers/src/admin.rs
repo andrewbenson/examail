@@ -226,6 +226,8 @@ struct Delivery {
     thread_id: Option<String>,
     /// Defaults to `INBOX`, `UNREAD`, `CATEGORY_PERSONAL`.
     label_ids: Option<Vec<String>>,
+    /// When it arrived, instead of the mock's clock (which runs on after it's set).
+    internal_date: Option<String>,
 }
 
 /// Simulates a message arriving by SMTP: threaded by headers, filters applied.
@@ -234,7 +236,10 @@ async fn deliver(
     Json(delivery): Json<Delivery>,
 ) -> Result<axum::Json<Message>> {
     let mut world = app.lock();
-    let now = world.clock.now();
+    let now = match &delivery.internal_date {
+        Some(at) => parse_time(at, &world.account.tz)?.timestamp(),
+        None => world.clock.now(),
+    };
     let raw = match &delivery.raw {
         Some(raw) => gmail::wire::decode_base64url(raw)
             .map_err(|error| Failure::invalid_argument(format!("Invalid raw: {error}")))?,
